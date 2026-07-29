@@ -108,6 +108,7 @@ from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.models import supports_lora, supports_multimodal
 from vllm_gaudi.extension.ops import LoraMask as LoraMask
+from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpBase
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiKVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl import NixlConnectorMetadata
@@ -4764,7 +4765,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             if self.compile_config.regional_compilation:
                 self._compile_methods()
-                self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
+                self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding,
+                                                         VllmMixtureOfExpertsOpBase]
                 self._regional_compilation(self.model)
                 self.sampler = self._compile(self.sampler)
             else:

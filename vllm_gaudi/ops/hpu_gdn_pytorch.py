@@ -138,6 +138,15 @@ def hpu_chunk_gdr_phase_a(
     device = qf.device
     tc = chunk_size
 
+    if tc <= 0:
+        return (
+            torch.empty(S, num_chunks, 0, H, Vdim, dtype=qf.dtype, device=device),
+            torch.empty(S, num_chunks, 0, H, Kdim, dtype=qf.dtype, device=device),
+            torch.empty(S, num_chunks, 0, H, Kdim, dtype=qf.dtype, device=device),
+            torch.empty(S, num_chunks, 0, H, Kdim, dtype=qf.dtype, device=device),
+            torch.empty(S, num_chunks, 0, H, dtype=qf.dtype, device=device),
+        )
+
     # Reshape to [S, seq_len, H, dim] then [S, C, tc, H, dim]
     q_seqs = qf.reshape(S, seq_len, H, Kdim)
     k_seqs = kf.reshape(S, seq_len, H, Kdim)
@@ -167,7 +176,7 @@ def hpu_chunk_gdr_phase_a(
     g_flat = g_chunks.reshape(SC, tc, H).permute(0, 2, 1).reshape(SC * H, tc)
     b_flat = b_chunks.reshape(SC, tc, H).permute(0, 2, 1).reshape(SC * H, tc)
 
-    eye = torch.eye(tc, dtype=qf.dtype, device=device)
+    eye = torch.diag_embed(torch.ones(tc, dtype=qf.dtype, device=device))
 
     # Stage 2: chunk_scaled_dot_kkt
     dot = torch.bmm(k_flat, k_flat.transpose(1, 2))
@@ -323,7 +332,7 @@ def _hpu_chunk_gdr_phase_b_optimized(
     N_t = N.transpose(-1, -2)  # [S,C,H,K,V]
 
     alpha = torch.exp(g_last).unsqueeze(-1).to(compute_dtype)
-    k_eye = torch.eye(Kdim, dtype=compute_dtype, device=device).view(1, 1, 1, Kdim, Kdim)
+    k_eye = torch.diag_embed(torch.ones(Kdim, dtype=compute_dtype, device=device)).view(1, 1, 1, Kdim, Kdim)
     M_full = alpha * k_eye - R.transpose(-1, -2)  # [S,C,H,K,K]
 
     state_t = init_state.to(compute_dtype).transpose(-1, -2)  # [S,H,K,V]
@@ -1062,7 +1071,7 @@ def _hpu_chunk_gated_delta_rule_legacy(
                 beta_chunk = bf[cs:ce]
 
                 if tc not in eye_cache:
-                    eye_cache[tc] = torch.eye(tc, dtype=qf.dtype, device=device)
+                    eye_cache[tc] = torch.diag_embed(torch.ones(tc, dtype=qf.dtype, device=device))
 
                 if use_vectorized_chunk:
                     out[cs:ce], state = _chunk_vectorized_body(
@@ -1333,7 +1342,7 @@ def _chunk_precomputed_pipeline(
     g_flat = g_chunks.reshape(SC, tc, H).permute(0, 2, 1).reshape(SC * H, tc)
     b_flat = b_chunks.reshape(SC, tc, H).permute(0, 2, 1).reshape(SC * H, tc)
 
-    eye = torch.eye(tc, dtype=qf.dtype, device=device)
+    eye = torch.diag_embed(torch.ones(tc, dtype=qf.dtype, device=device))
 
     # Stage 2: chunk_scaled_dot_kkt — all S*C*H chunks at once
     dot = torch.bmm(k_flat, k_flat.transpose(1, 2))  # [SC*H, tc, tc]

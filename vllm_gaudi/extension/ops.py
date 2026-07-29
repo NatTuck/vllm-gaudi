@@ -49,6 +49,141 @@ def _as_activation_str(activation):
     return activation
 
 
+_active_log_fd = None
+_active_log_count = 0
+
+
+_ACTIVE_BUFFERS = None
+_ACTIVE_BS_MAX = 16
+_ACTIVE_K_MAX = 16
+_HPU_MOE_ACTIVE = os.getenv("HPU_MOE_ACTIVE", "0") == "1"
+
+
+def _get_or_alloc_active_buffers(hidden_states, moe_op, K):
+    """Persistent shared active-path buffers, sized for BS=16 slots at the
+    given K. Allocated on first call; reused for all subsequent calls.
+
+    Concurrency: assumes _active_moe is never called concurrently in vllm.
+    Sequential layers within a forward overwrite the same memory safely.
+    """
+    global _ACTIVE_BUFFERS
+    if K > _ACTIVE_K_MAX:
+        raise ValueError(f"_active_moe called with K={K}, exceeds _ACTIVE_K_MAX={_ACTIVE_K_MAX}")
+
+    N_slots_max = _ACTIVE_BS_MAX * K
+
+    if _ACTIVE_BUFFERS is not None:
+        cur = _ACTIVE_BUFFERS
+        if (cur[0].shape[0] == N_slots_max
+                and cur[0].device == hidden_states.device
+                and cur[0].dtype == moe_op.w13_list[0].weight.dtype
+                and cur[2].dtype == moe_op.w13_list[0].scale_inv_fp8.dtype):
+            return cur
+        del _ACTIVE_BUFFERS
+
+    w13_shape = tuple(moe_op.w13_list[0].weight.shape)
+    w2_shape = tuple(moe_op.w2_list[0].weight.shape)
+    s13_shape = tuple(moe_op.w13_list[0].scale_inv_fp8.shape)
+    s2_shape = tuple(moe_op.w2_list[0].scale_inv_fp8.shape)
+
+    _ACTIVE_BUFFERS = (
+        torch.empty((N_slots_max, *w13_shape),
+                    dtype=moe_op.w13_list[0].weight.dtype,
+                    device=hidden_states.device),
+        torch.empty((N_slots_max, *w2_shape),
+                    dtype=moe_op.w13_list[0].weight.dtype,
+                    device=hidden_states.device),
+        torch.empty((N_slots_max, *s13_shape),
+                    dtype=moe_op.w13_list[0].scale_inv_fp8.dtype,
+                    device=hidden_states.device),
+        torch.empty((N_slots_max, *s2_shape),
+                    dtype=moe_op.w13_list[0].scale_inv_fp8.dtype,
+                    device=hidden_states.device),
+    )
+    return _ACTIVE_BUFFERS
+
+
+def _active_log_fmt(t):
+    if t is None:
+        return "empty"
+    return f"{tuple(t.shape)}_{t.dtype}_s{tuple(t.stride())}"
+
+
+@torch._dynamo.disable
+def _active_log_call(hidden_states, topk_ids, topk_weights, moe_op, flat,
+                     N_slots, x_fp8, x_scale, w12_buf, w3_buf, s12_buf,
+                     s3_buf):
+    global _active_log_fd, _active_log_count
+    if _active_log_fd is None:
+        _active_log_fd = open("/tmp/opencode/active_warmup.log", "w", buffering=1)
+    _active_log_count += 1
+    line = (
+        f"#{_active_log_count} "
+        f"BS={topk_ids.shape[0]} K={topk_ids.shape[1]} "
+        f"topk={flat} "
+        f"N_slots={N_slots} "
+        f"hs={_active_log_fmt(hidden_states)} "
+        f"topk_ids={_active_log_fmt(topk_ids)} "
+        f"topk_weights={_active_log_fmt(topk_weights)} "
+        f"x_fp8={_active_log_fmt(x_fp8)} x_scale={_active_log_fmt(x_scale)} "
+        f"w12_buf={_active_log_fmt(w12_buf)} w3_buf={_active_log_fmt(w3_buf)} "
+        f"s12_buf={_active_log_fmt(s12_buf)} s3_buf={_active_log_fmt(s3_buf)} "
+        f"src_w13_0={_active_log_fmt(moe_op.w13_list[0].weight)} "
+        f"src_w2_0={_active_log_fmt(moe_op.w2_list[0].weight)} "
+        f"src_s13_0={_active_log_fmt(moe_op.w13_list[0].scale_inv_fp8)} "
+        f"src_s2_0={_active_log_fmt(moe_op.w2_list[0].scale_inv_fp8)}\n"
+    )
+    _active_log_fd.write(line)
+    _active_log_fd.flush()
+
+
+@torch.compile(
+    backend="hpu_backend",
+    fullgraph=False,
+    options={"force_static_compile": True},
+)
+def _active_moe(hidden_states, topk_ids, topk_weights, moe_op):
+    """Active MoE path for BS==1. Reads stacked FP8 weights/scales from
+    moe_op (set by fp8_channel_moe_prepare_weights). Fully-compiled region:
+    dynamic_quant + advanced-indexing gather + mixture_of_experts.
+    """
+    x_fp8, x_scale = dynamic_quant(hidden_states)
+    K = topk_ids.shape[-1]
+
+    sel_w13 = moe_op._w13_stacked[topk_ids]
+    sel_w2  = moe_op._w2_stacked[topk_ids]
+    sel_s13 = moe_op._w13_scales_stacked[topk_ids]
+    sel_s2  = moe_op._w2_scales_stacked[topk_ids]
+
+    sel_w13 = sel_w13.squeeze(0)
+    sel_w2  = sel_w2.squeeze(0)
+    sel_s13 = sel_s13.squeeze(0)
+    sel_s2  = sel_s2.squeeze(0)
+
+    w12_list = list(sel_w13)
+    w3_list  = list(sel_w2)
+    s12_list = list(sel_s13)
+    s3_list  = list(sel_s2)
+
+    local_routing = torch.arange(K, device=x_fp8.device,
+                                 dtype=torch.int64).reshape(1, K)
+
+    return torch.ops.hpu.mixture_of_experts(
+        hidden_states=x_fp8,
+        expert_routing_table=local_routing,
+        router_weights=topk_weights,
+        w12=w12_list,
+        w3=w3_list,
+        d_scale_hidden_states=x_scale,
+        d_scale_w12=s12_list,
+        d_scale_w3=s3_list,
+        permuted_weights=True,
+        activation="silu",
+        experts_min=0,
+        experts_max=K - 1,
+    )
+
+
 def get_inc_quant_method(layer):
     return layer
 
@@ -1062,6 +1197,21 @@ def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
 
 
 def fp8_channel_moe_prepare_weights(layer):
+    # Stash parent stacked Parameters on the moe_op so _active_moe can
+    # gather via experts[topk_ids] inside a compiled region. These point to
+    # the same Parameter objects already on `layer`; no new allocation.
+    if hasattr(layer, 'w13_weight') and isinstance(layer.w13_weight, torch.Tensor) \
+            and layer.w13_weight.dim() >= 1 \
+            and layer.w13_weight.shape[0] == layer.moe_op.num_experts:
+        layer.moe_op._w13_stacked = layer.w13_weight
+        layer.moe_op._w2_stacked = layer.w2_weight
+        if hasattr(layer, 'w13_weight_scale_inv'):
+            layer.moe_op._w13_scales_stacked = layer.w13_weight_scale_inv
+            layer.moe_op._w2_scales_stacked = layer.w2_weight_scale_inv
+        elif hasattr(layer, 'w13_weight_scale'):
+            layer.moe_op._w13_scales_stacked = layer.w13_weight_scale
+            layer.moe_op._w2_scales_stacked = layer.w2_weight_scale
+
     for index in range(layer.moe_op.num_experts):
         layer.moe_op.w13_list[index].set_weight(layer.w13_weight[index])
         if hasattr(layer, "w13_weight_scale_inv"):
@@ -1195,6 +1345,7 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
         tokens_num, _ = x.shape
         activation = _as_activation_str(activation)
         kwargs = self._get_extra_kwargs(tokens_num)
+
         w13_list = []
         w2_list = []
         for j in range(self.num_experts):
@@ -1285,6 +1436,11 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         tokens_num, _ = x.shape
         activation = _as_activation_str(activation)
         kwargs = self._get_extra_kwargs(tokens_num)
+
+        if (_HPU_MOE_ACTIVE
+                and self.moe_n_slice == 1
+                and tokens_num == 1):
+            return _active_moe(x, topk_ids, topk_weights, self)
 
         if self._cached_w13_views is None or self._cached_w2_views is None:
             self._cache_weight_lists()
