@@ -95,6 +95,15 @@ def register_utils():
 
     _hpu_patches.patch_hf3fs_mock_client()
 
+    # FastQwen snapshot restore: install the worker-side load_model
+    # replacement so the byte-exact snapshot restore runs inside the
+    # (spawned) EngineCore worker, enabling multiprocessing (full decode
+    # speed) alongside fast restore. No-op unless the gate is set.
+    if os.environ.get("FASTQWEN_RESTORE_SNAPSHOT") == "1":
+        from load_and_decode.worker_restore import install
+
+        install()
+
 
 def register_ops():
     """Register custom PluggableLayers for the HPU platform"""
