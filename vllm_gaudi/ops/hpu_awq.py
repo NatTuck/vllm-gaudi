@@ -116,7 +116,15 @@ class AWQHPUConfig(QuantizationConfig):
 
 
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: list[str]):
-    return any(module_name in prefix for module_name in modules_to_not_convert)
+    # modules_to_not_convert entries are keyed with an HF-style "model." root
+    # (e.g. "model.visual.blocks.0.mlp.linear_fc2"), but vLLM's layer prefix
+    # omits that root (e.g. "visual.blocks.0.mlp.linear_fc2"). Normalize both
+    # sides so the substring match works regardless of the leading "model.".
+    prefix_plain = prefix.removeprefix("model.")
+    for module_name in modules_to_not_convert:
+        if module_name in prefix or module_name.removeprefix("model.") in prefix_plain:
+            return True
+    return False
 
 
 class AWQHPULinearMethod:
