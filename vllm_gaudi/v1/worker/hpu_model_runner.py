@@ -27,6 +27,14 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 import torch.nn as nn
+
+# Diagnostic worker-side profiler: when FASTQWEN_WORKER_PROFILE=<path> is set,
+# wrap each non-warmup decode forward in the EngineCore worker with torch.profiler
+# and export a chrome trace to that path (each decode step overwrites it, so the
+# final file is the last decode step's kernel trace). No-op when unset (stock
+# path untouched). Used to confirm the custom MoE combine eliminates the Habana
+# router_stage* kernel pipeline.
+_FASTQWEN_WORKER_PROFILE = os.environ.get("FASTQWEN_WORKER_PROFILE")
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
@@ -1260,7 +1268,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # on env vars... this should be fixed in the future
         self.enable_bucketing = get_config().use_bucketing
         self.use_contiguous_pa = get_config().use_contiguous_pa
-        self.skip_warmup = get_config().skip_warmup
+        # Allow VLLM_SKIP_WARMUP=1 to skip the (large) startup bucket warmup so a
+        # server boots fast and compiles graphs lazily on first use. Env-gated
+        # no-op by default (matches the config default).
+        self.skip_warmup = get_config().skip_warmup or bool(os.environ.get("VLLM_SKIP_WARMUP"))
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -3621,15 +3632,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
-        with self.profiler.record_event('internal', model_event_name):
-            hidden_states = self.model.forward(input_ids=token_ids,
-                                               positions=position_ids,
-                                               attn_metadata=trimmed_attn_metadata,
-                                               kv_caches=kv_caches,
-                                               inputs_embeds=inputs_embeds,
-                                               model_mm_kwargs=model_mm_kwargs,
-                                               lora_mask=lora_mask,
-                                               **additional_kwargs)
+        if _FASTQWEN_WORKER_PROFILE and not warmup_mode:
+            _fw_prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.HPU],
+                record_shapes=False)
+            with _fw_prof, self.profiler.record_event('internal', model_event_name):
+                hidden_states = self.model.forward(input_ids=token_ids,
+                                                   positions=position_ids,
+                                                   attn_metadata=trimmed_attn_metadata,
+                                                   kv_caches=kv_caches,
+                                                   inputs_embeds=inputs_embeds,
+                                                   model_mm_kwargs=model_mm_kwargs,
+                                                   lora_mask=lora_mask,
+                                                   **additional_kwargs)
+            torch.hpu.synchronize()
+            _fw_prof.export_chrome_trace(_FASTQWEN_WORKER_PROFILE)
+        else:
+            with self.profiler.record_event('internal', model_event_name):
+                hidden_states = self.model.forward(input_ids=token_ids,
+                                                   positions=position_ids,
+                                                   attn_metadata=trimmed_attn_metadata,
+                                                   kv_caches=kv_caches,
+                                                   inputs_embeds=inputs_embeds,
+                                                   model_mm_kwargs=model_mm_kwargs,
+                                                   lora_mask=lora_mask,
+                                                   **additional_kwargs)
         # NOTE(kzawora): returning hidden_states is required in prompt logprobs
         # scenarios, as they will do logit processing on their own
         if self.use_aux_hidden_state_outputs:

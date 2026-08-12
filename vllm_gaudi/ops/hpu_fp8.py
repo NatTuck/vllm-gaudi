@@ -42,6 +42,12 @@ else:
 # (see experiments/moe_combine/).
 _HPU_MOE_GATHER = bool(os.environ.get("HPU_MOE_GATHER"))
 _HPU_MOE_GATHER_VERIFY = bool(os.environ.get("HPU_MOE_GATHER_VERIFY"))
+# Max tokens*topk (== gathered-expert count g) for which the custom gather path
+# is used. The gathered pure-PyTorch path wins below ~g=64 and LOSES to the stock
+# fused op once g approaches E (the dense gather + fp32 bmm path is slower than
+# the Habana op). Measured crossover for Qwen3.6-35B-A3B (E=256, K=8): custom
+# wins at T<=8 (g<=64), loses at T=16 (g=128). Default 64 keeps the win regime.
+_HPU_MOE_GATHER_MAX_TP = int(os.environ.get("HPU_MOE_GATHER_MAX_TP", "64"))
 if _HPU_MOE_GATHER:
     try:
         from experiments.moe_combine.moe_combine import gather_silu_fp8_moe  # noqa: E402
@@ -332,7 +338,16 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
         activation = _normalize_moe_activation(layer.activation)
-        if _HPU_MOE_GATHER and activation == "silu":
+        # Use the custom gathered-expert combine only when it wins: g = tokens*K
+        # must stay small (below the dense crossover). Beyond that (large batch /
+        # long prefill) fall back to the stock fused op, which is faster and keeps
+        # the graph shapes fixed. `tokens`/`K` are static (T, K from x/topk_ids).
+        use_gather = (
+            _HPU_MOE_GATHER
+            and activation == "silu"
+            and x.shape[0] * topk_ids.shape[-1] <= _HPU_MOE_GATHER_MAX_TP
+        )
+        if use_gather:
             # EXPERIMENTAL custom combine: gather only the routed experts
             # (bypasses the Habana op's fixed ~47-kernel/layer pipeline).
             if _HPU_MOE_GATHER_VERIFY:
