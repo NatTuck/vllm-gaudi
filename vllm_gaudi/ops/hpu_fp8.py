@@ -65,24 +65,44 @@ _HPU_MOE_GATHER_VERIFY_DIR = os.environ.get("HPU_MOE_GATHER_VERIFY_DIR")
 _HPU_MOE_GATHER_VERIFY_LAYERS = int(os.environ.get("HPU_MOE_GATHER_VERIFY_LAYERS", "40"))
 
 
+def _verify_rank() -> int:
+    """TP/expert-parallel rank for namespacing VERIFY captures (multi-rank runs
+    would otherwise collide on identical filenames). Falls back to env, then 0."""
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+    except Exception:
+        pass
+    for _k in ("LOCAL_RANK", "RANK"):
+        _v = os.environ.get(_k)
+        if _v is not None:
+            try:
+                return int(_v)
+            except ValueError:
+                pass
+    return 0
+
+
 def _record_moe_combine_ulp(stock, custom, topk_ids):
     """Save (stock, custom) output pairs for offline FP8-ULP comparison.
 
     Only called in verify mode (HPU_MOE_GATHER_VERIFY=1). The outputs are tiny
     ([T,H] bf16), so torch.save here is cheap; the dynamo graph-break it causes
     is acceptable for a validation run. All env values are module-level constants
-    so the non-verify compiled path stays fully specializable.
+    so the non-verify compiled path stays fully specializable. Filenames are
+    rank-scoped so TP/expert-parallel ranks don't overwrite each other.
     """
     if not _HPU_MOE_GATHER_VERIFY_DIR:
         return
     _n = topk_ids.shape[0]
+    _r = _verify_rank()
     _cnt = getattr(_record_moe_combine_ulp, "_cnt", {})
     if _cnt.get(_n, 0) < _HPU_MOE_GATHER_VERIFY_LAYERS:
         os.makedirs(_HPU_MOE_GATHER_VERIFY_DIR, exist_ok=True)
         _c = _cnt.get(_n, 0)
         torch.save({"stock": stock.detach().cpu(), "custom": custom.detach().cpu(),
-                    "T": _n},
-                   os.path.join(_HPU_MOE_GATHER_VERIFY_DIR, f"moecomb_T{_n}_n{_c}.pt"))
+                    "T": _n, "rank": _r},
+                   os.path.join(_HPU_MOE_GATHER_VERIFY_DIR, f"moecomb_T{_n}_n{_c}_r{_r}.pt"))
         _cnt[_n] = _c + 1
         _record_moe_combine_ulp._cnt = _cnt
 
