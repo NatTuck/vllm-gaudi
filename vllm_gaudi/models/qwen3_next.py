@@ -36,15 +36,24 @@ class HpuQwen3NextModel(UpstreamQwen3NextModel):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        _fw_profiler = getattr(self, '_fw_profiler', None)
         for layer_idx, layer in enumerate(
                 islice(self.layers, self.start_layer, self.end_layer),
                 start=self.start_layer,
         ):
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            if _fw_profiler is not None:
+                with _fw_profiler.record_event('internal', f"layer{layer_idx}_forward"):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                    )
+            else:
+                hidden_states, residual = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
             self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:

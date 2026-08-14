@@ -35,6 +35,7 @@ import torch.nn as nn
 # path untouched). Used to confirm the custom MoE combine eliminates the Habana
 # router_stage* kernel pipeline.
 _FASTQWEN_WORKER_PROFILE = os.environ.get("FASTQWEN_WORKER_PROFILE")
+_FASTQWEN_WORKER_PROFILE_SKIP = type("_ProfSkip", (), {"_n": 0})
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
@@ -3633,21 +3634,38 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             model_event_name = 'model_executable'
         if _FASTQWEN_WORKER_PROFILE and not warmup_mode:
-            _fw_prof = torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.HPU],
-                record_shapes=False)
-            with _fw_prof, self.profiler.record_event('internal', model_event_name):
-                hidden_states = self.model.forward(input_ids=token_ids,
-                                                   positions=position_ids,
-                                                   attn_metadata=trimmed_attn_metadata,
-                                                   kv_caches=kv_caches,
-                                                   inputs_embeds=inputs_embeds,
-                                                   model_mm_kwargs=model_mm_kwargs,
-                                                   lora_mask=lora_mask,
-                                                   **additional_kwargs)
-            torch.hpu.synchronize()
-            _fw_prof.export_chrome_trace(_FASTQWEN_WORKER_PROFILE)
+            # Skip the first few non-warmup forwards so the sampled step runs the
+            # compiled (cached-recipe) decode, not the eager/compile-on-the-fly
+            # warmup forward. Count via a module attr (fine for a diagnostic
+            # profiler).
+            _fw_count = getattr(_FASTQWEN_WORKER_PROFILE_SKIP, "_n", 0)
+            _FASTQWEN_WORKER_PROFILE_SKIP._n = _fw_count + 1
+            if _fw_count >= 2:
+                _fw_prof = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.HPU],
+                    record_shapes=False)
+                with _fw_prof, self.profiler.record_event('internal', model_event_name):
+                    hidden_states = self.model.forward(input_ids=token_ids,
+                                                       positions=position_ids,
+                                                       attn_metadata=trimmed_attn_metadata,
+                                                       kv_caches=kv_caches,
+                                                       inputs_embeds=inputs_embeds,
+                                                       model_mm_kwargs=model_mm_kwargs,
+                                                       lora_mask=lora_mask,
+                                                       **additional_kwargs)
+                torch.hpu.synchronize()
+                _fw_prof.export_chrome_trace(_FASTQWEN_WORKER_PROFILE)
+            else:
+                with self.profiler.record_event('internal', model_event_name):
+                    hidden_states = self.model.forward(input_ids=token_ids,
+                                                       positions=position_ids,
+                                                       attn_metadata=trimmed_attn_metadata,
+                                                       kv_caches=kv_caches,
+                                                       inputs_embeds=inputs_embeds,
+                                                       model_mm_kwargs=model_mm_kwargs,
+                                                       lora_mask=lora_mask,
+                                                       **additional_kwargs)
         else:
             with self.profiler.record_event('internal', model_event_name):
                 hidden_states = self.model.forward(input_ids=token_ids,
