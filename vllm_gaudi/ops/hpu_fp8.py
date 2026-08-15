@@ -83,6 +83,13 @@ def _verify_rank() -> int:
     return 0
 
 
+# Module-level counter keyed by (num_tokens, rank). Function attributes don't
+# survive torch.compile re-specialization (each graph build re-reads the initial
+# empty dict), so the verify capture previously only ever wrote n0. A module
+# global is stable for the process lifetime, so we get a real multi-layer sample.
+_VERIFY_CNT: dict[tuple[int, int], int] = {}
+
+
 def _record_moe_combine_ulp(stock, custom, topk_ids):
     """Save (stock, custom) output pairs for offline FP8-ULP comparison.
 
@@ -96,15 +103,14 @@ def _record_moe_combine_ulp(stock, custom, topk_ids):
         return
     _n = topk_ids.shape[0]
     _r = _verify_rank()
-    _cnt = getattr(_record_moe_combine_ulp, "_cnt", {})
-    if _cnt.get(_n, 0) < _HPU_MOE_GATHER_VERIFY_LAYERS:
+    _k = (_n, _r)
+    _c = _VERIFY_CNT.get(_k, 0)
+    if _c < _HPU_MOE_GATHER_VERIFY_LAYERS:
         os.makedirs(_HPU_MOE_GATHER_VERIFY_DIR, exist_ok=True)
-        _c = _cnt.get(_n, 0)
         torch.save({"stock": stock.detach().cpu(), "custom": custom.detach().cpu(),
                     "T": _n, "rank": _r},
                    os.path.join(_HPU_MOE_GATHER_VERIFY_DIR, f"moecomb_T{_n}_n{_c}_r{_r}.pt"))
-        _cnt[_n] = _c + 1
-        _record_moe_combine_ulp._cnt = _cnt
+        _VERIFY_CNT[_k] = _c + 1
 
 
 

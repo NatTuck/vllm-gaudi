@@ -95,11 +95,12 @@ def register_utils():
 
     _hpu_patches.patch_hf3fs_mock_client()
 
-    # FastQwen snapshot restore: install the worker-side load_model
-    # replacement so the byte-exact snapshot restore runs inside the
-    # (spawned) EngineCore worker, enabling multiprocessing (full decode
-    # speed) alongside fast restore. No-op unless the gate is set.
-    if os.environ.get("FASTQWEN_RESTORE_SNAPSHOT") == "1":
+    # FastQwen snapshot capture/restore: install the worker-side load_model
+    # replacement so the byte-exact per-rank snapshot capture/restore runs
+    # inside the (spawned) EngineCore worker, enabling multiprocessing (full
+    # decode speed) alongside fast restore. No-op unless a gate is set.
+    if (os.environ.get("FASTQWEN_RESTORE_SNAPSHOT") == "1"
+            or os.environ.get("FASTQWEN_CAPTURE_SNAPSHOT") == "1"):
         from load_and_decode.worker_restore import install
 
         install()

@@ -35,6 +35,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory as FusedMoE
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.minimax_rms_norm import MiniMaxText01RMSNormTP
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear, ReplicatedLinear, RowParallelLinear)
@@ -343,7 +344,7 @@ class HpuMiniMaxM2Model(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return FusedMoE.make_expert_params_mapping(
+        return RoutedExperts.make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
