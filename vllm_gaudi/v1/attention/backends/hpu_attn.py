@@ -66,6 +66,21 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     seqlens_offsets_for_blocks: Optional[torch.Tensor] = None
     window_block_list: Optional[torch.Tensor] = None
 
+    # Speculative-decode fields (GDN/hybrid). Mirrors the fields of stock
+    # GDNAttentionMetadata (vllm/v1/attention/backends/gdn_attn.py) so the
+    # GDN forward can split spec vs non-spec tokens, process each group, and
+    # reassemble with index_copy_.
+    spec_query_start_loc: Optional[torch.Tensor] = None
+    non_spec_query_start_loc: Optional[torch.Tensor] = None
+    spec_sequence_masks: Optional[torch.Tensor] = None
+    spec_token_indx: Optional[torch.Tensor] = None
+    non_spec_token_indx: Optional[torch.Tensor] = None
+    spec_state_indices_tensor: Optional[torch.Tensor] = None
+    non_spec_state_indices_tensor: Optional[torch.Tensor] = None
+    num_accepted_tokens: Optional[torch.Tensor] = None
+    num_spec_decodes: int = 0
+    num_actual_tokens: int = 0
+
     def seq_len(self):
         return self.slot_mapping.size(-1)
 
@@ -135,7 +150,17 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              load_indices_tensor=None,
                              store_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             spec_query_start_loc=None,
+                             non_spec_query_start_loc=None,
+                             spec_sequence_masks=None,
+                             spec_token_indx=None,
+                             non_spec_token_indx=None,
+                             spec_state_indices_tensor=None,
+                             non_spec_state_indices_tensor=None,
+                             num_accepted_tokens=None,
+                             num_spec_decodes=0,
+                             num_actual_tokens=0):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -158,4 +183,14 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   spec_query_start_loc=spec_query_start_loc,
+                   non_spec_query_start_loc=non_spec_query_start_loc,
+                   spec_sequence_masks=spec_sequence_masks,
+                   spec_token_indx=spec_token_indx,
+                   non_spec_token_indx=non_spec_token_indx,
+                   spec_state_indices_tensor=spec_state_indices_tensor,
+                   non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+                   num_accepted_tokens=num_accepted_tokens,
+                   num_spec_decodes=num_spec_decodes,
+                   num_actual_tokens=num_actual_tokens)

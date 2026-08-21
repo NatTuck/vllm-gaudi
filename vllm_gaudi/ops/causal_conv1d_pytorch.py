@@ -350,6 +350,122 @@ def hpu_causal_conv1d_fn(
     return seq_out.squeeze(0).to(original_dtype)
 
 
+def _hpu_causal_conv1d_update_spec(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_state_indices: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> torch.Tensor:
+    """Speculative-decode sliding-window conv1d update.
+
+    Mirrors the CUDA ``_causal_conv1d_update_kernel`` IS_SPEC_DECODING path
+    exactly (see causal_conv1d.py).  For each spec sequence:
+      - ``offset = num_accepted_tokens[seq] - 1`` selects where the current
+        conv history begins inside the running state block.
+      - The conv history of ``width - 1`` values is read starting at ``offset``.
+      - The ``seql`` draft tokens are convolved against it.
+      - The state is rolled left by 1 (relative to ``offset``) and the draft
+        tokens are appended at the end, producing the new ``state_len`` state
+        (kernel writes ``[history[offset+1:], tokens]`` into the block).
+    Runs in eager mode (@torch._dynamo.disable) since the per-sequence loop
+    is data-dependent; correctness is the priority for the spec path.
+
+    ``x`` is token-first ``[num_tokens, dim]`` (all spec tokens concatenated).
+    ``conv_state`` is ``[num_cache_lines, state_len, dim]`` (SD layout, the
+    HPU/stock default), where ``state_len = conv_kernel - 1 + num_spec``.
+    """
+    qsl = _ensure_query_start_loc(query_start_loc)
+    num_spec_decodes = qsl.numel() - 1
+    _, width = weight.shape
+    state_len = conv_state.shape[1]
+
+    original_dtype = x.dtype
+    work_dtype = conv_state.dtype if conv_state is not None else x.dtype
+    x_work = x.to(work_dtype)
+    weight_work = weight.to(work_dtype)
+    bias_work = bias.to(work_dtype) if bias is not None else None
+    device = x_work.device
+
+    if num_spec_decodes == 0 or conv_state_indices is None:
+        return x.to(original_dtype)
+
+    starts = qsl[:-1].long()
+    ends = qsl[1:].long()
+    counts = ends - starts  # [S]
+    S = num_spec_decodes
+
+    num_slots = conv_state.shape[0]
+    safe_idx = torch.remainder(conv_state_indices, num_slots).long()
+    offset = torch.clamp(num_accepted_tokens - 1, min=0).long()  # [S]
+
+    # Per-request history: gather width-1 rows at [offset, offset+width-1).
+    hist_idx = offset.unsqueeze(1) + torch.arange(width - 1, device=device).unsqueeze(0)  # [S, width-1]
+    hist = torch.gather(conv_state[safe_idx], 1,
+                        hist_idx.unsqueeze(-1).expand(-1, -1, x_work.shape[1]))  # [S, width-1, dim]
+
+    # Per-request tokens: each spec request has num_spec+1 tokens.
+    # state_len = width-1 + num_spec  =>  num_spec = state_len-(width-1)  =>  spec_len = num_spec+1.
+    max_len = state_len - (width - 1) + 1
+    tok_idx = starts.unsqueeze(1) + torch.arange(max_len, device=device).unsqueeze(0)  # [S, max_len]
+    valid_tok = (tok_idx < ends.unsqueeze(1))
+    safe_tok = torch.where(valid_tok, tok_idx, torch.zeros_like(tok_idx)).clamp(min=0, max=x_work.shape[0] - 1)
+    toks = x_work[safe_tok]  # [S, max_len, dim]
+
+    # Depthwise conv over [hist (width-1), tokens (max_len)].
+    conv_in = torch.cat([hist, toks], dim=1).transpose(1, 2).unsqueeze(0)  # [1, S, dim, L]
+    seq_out = torch.zeros((1, S, x_work.shape[1], max_len), device=device, dtype=work_dtype)
+    for k in range(width):
+        w_k = weight_work[:, k].view(1, 1, -1, 1)
+        seq_out = seq_out + conv_in[:, :, :, k:k + max_len] * w_k
+    if bias_work is not None:
+        seq_out = seq_out + bias_work.view(1, 1, -1, 1)
+    if activation is not None:
+        seq_out = _apply_activation(seq_out, activation)
+    seq_out = seq_out.squeeze(0).transpose(1, 2)  # [S, max_len, dim]
+
+    # Scatter outputs back to token positions (valid tokens only). The invalid
+    # grid cells (beyond a spec request's token count) are redirected to a
+    # trailing dummy row so the write is a fixed-shape scatter (no data-dependent
+    # nonzero) and stays inside the compiled graph; the dummy row is dropped.
+    out = torch.zeros((x_work.shape[0] + 1, x_work.shape[1]), device=device, dtype=work_dtype)
+    dummy = torch.full_like(safe_tok.reshape(-1), x_work.shape[0])
+    scatter_idx = torch.where(valid_tok.reshape(-1), safe_tok.reshape(-1), dummy)
+    out.scatter_(0, scatter_idx.unsqueeze(1).expand(-1, x_work.shape[1]),
+                 seq_out.reshape(-1, seq_out.shape[-1]))
+    out = out[:x_work.shape[0]]
+
+    # New state per request: [history[offset+1 : offset+1+tail_len], tokens] length state_len.
+    tail_len = state_len - counts  # [S]
+    tail_idx = offset.unsqueeze(1) + 1 + torch.arange(state_len, device=device).unsqueeze(0)  # [S, state_len]
+    keep_mask = torch.arange(state_len, device=device).unsqueeze(0) < tail_len.unsqueeze(1)  # [S, state_len]
+    keep_idx = torch.where(keep_mask, tail_idx, torch.zeros_like(tail_idx)).clamp(min=0, max=state_len - 1)
+    kept = torch.gather(conv_state[safe_idx], 1,
+                        keep_idx.unsqueeze(-1).expand(-1, -1, x_work.shape[1]))  # [S, state_len, dim]
+    kept = torch.where(keep_mask.unsqueeze(-1), kept, torch.zeros_like(kept))
+
+    # tokens into trailing positions [state_len-counts : state_len]. Fixed-shape
+    # scatter with a dummy column for masked-out cells (kept as zeros in `kept`).
+    tok_pos = (state_len - counts).unsqueeze(1) + torch.arange(max_len, device=device).unsqueeze(0)  # [S, max_len]
+    tok_mask = tok_pos < state_len
+    tok_pos_safe = tok_pos.clamp(max=state_len - 1)
+    new_states = kept.clone()
+    write = valid_tok & tok_mask
+    row = torch.arange(S, device=device).unsqueeze(1).expand(-1, max_len).reshape(-1)
+    col = tok_pos_safe.reshape(-1)
+    src = toks.reshape(-1, toks.shape[-1])
+    col_safe = torch.where(write.reshape(-1), col, torch.zeros_like(col))
+    new_states[row, col_safe] = torch.where(write.reshape(-1).unsqueeze(1), src,
+                                            new_states[row, col_safe])
+
+    conv_state[safe_idx] = new_states
+
+    return out.to(original_dtype)
+
+
 def hpu_causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -365,15 +481,25 @@ def hpu_causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
 ):
-    if num_accepted_tokens is not None:
-        raise NotImplementedError("Speculative decoding updates are not supported in the reference implementation.")
     if block_idx_last_scheduled_token is not None or initial_state_idx is not None:
         raise NotImplementedError("Prefix caching metadata is not supported in the reference implementation.")
-    if max_query_len not in (-1, None):  # Provided only for Triton helper parity
-        raise NotImplementedError("'max_query_len' is not used in the reference implementation.")
 
     activation = _normalize_activation(activation)
     dim = weight.size(0)
+
+    if num_accepted_tokens is not None:
+        if query_start_loc is None:
+            raise ValueError("'query_start_loc' must be provided for the spec path.")
+        return _hpu_causal_conv1d_update_spec(
+            x,
+            conv_state,
+            weight,
+            bias,
+            activation,
+            conv_state_indices,
+            num_accepted_tokens,
+            query_start_loc,
+        )
 
     flat_x, qsl, reshape_spec = _flatten_inputs_for_update(x, query_start_loc, dim)
     result = hpu_causal_conv1d_fn_update(

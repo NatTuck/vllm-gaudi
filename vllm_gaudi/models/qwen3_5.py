@@ -75,6 +75,16 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             indices = indices.index_select(0, cg.view(1)).squeeze(0)
         return indices
 
+    def _resolve_spec_state_indices(self, attn_metadata):
+        """Resolve 3-D spec state indices [num_groups, n_spec_decodes, num_spec+1]
+        to 2-D [n_spec_decodes, num_spec+1] for this layer's cache group."""
+        indices = attn_metadata.spec_state_indices_tensor
+        if indices is None or indices.dim() != 3:
+            return None
+        cg = self.cache_group_idx
+        assert cg is not None
+        return indices.index_select(0, cg.view(1)).squeeze(0)
+
     def _extract_metadata(self, num_tokens):
         """Extract forward-context metadata into plain tensors.
 
@@ -95,6 +105,19 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         query_start_loc = attn_metadata.query_start_loc_p
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
+
+        # Speculative-decode metadata.
+        spec_query_start_loc = attn_metadata.spec_query_start_loc
+        spec_state_indices = self._resolve_spec_state_indices(attn_metadata)
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+        # Derive counts from STATIC shape info only (no .item()/device reads,
+        # which would graph-break the compiled forward). In the spec-only path
+        # every real request contributes num_spec+1 tokens (1 real + num_spec
+        # drafts), so num_actual_tokens = num_spec_decodes * (num_spec+1).
+        # num_spec_decodes == spec_state_indices.shape[0] (a static shape).
+        num_spec_decodes = (int(spec_state_indices.shape[0])
+                            if spec_state_indices is not None else 0)
+        num_actual_tokens = num_spec_decodes * (self.num_spec + 1)
 
         if not is_prompt:
             num_decodes = (state_indices.numel() if state_indices is not None else
@@ -118,7 +141,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 initial_state = initial_state * mask
 
         return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
-                num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state)
+                num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state,
+                spec_query_start_loc, spec_state_indices, num_accepted_tokens, num_spec_decodes, num_actual_tokens)
 
     def forward(
         self,
@@ -141,7 +165,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # === Metadata extraction (natural graph break) ===============
         (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
          num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-         initial_state) = self._extract_metadata(num_tokens)
+         initial_state, spec_query_start_loc, spec_state_indices, num_accepted_tokens, num_spec_decodes,
+         num_actual_tokens) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         if hasattr(self, 'in_proj_qkv'):
@@ -251,39 +276,83 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
             conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            mixed_qkv_conv = hpu_causal_conv1d_update(
-                x=mixed_qkv,
-                conv_state=conv_state,
-                weight=conv_weights,
-                bias=self.conv1d.bias,
-                activation=self.activation,
-                conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
-                block_idx_last_scheduled_token=None,
-                initial_state_idx=None,
-                query_start_loc=query_start_loc,
-                validate_data=False,
-            )
 
-            query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+            if spec_state_indices is not None and num_accepted_tokens is not None and num_spec_decodes > 0:
+                # === Speculative-decode path =========================
+                # The decode batch is the spec-only group: every real request
+                # contributes num_spec+1 tokens (1 real + num_spec drafts),
+                # laid out contiguously for the first num_actual_tokens rows.
+                n_spec = num_spec_decodes
+                mixed_qkv_spec = mixed_qkv[:num_actual_tokens]
+                g_spec = g[:num_actual_tokens]
+                beta_spec = beta[:num_actual_tokens]
+                spec_qsl = spec_query_start_loc[:n_spec + 1]
+                spec_si = spec_state_indices[:n_spec]
+                n_acc = num_accepted_tokens[:n_spec]
 
-            core_attn_out_result, _ = \
-                hpu_fused_recurrent_gated_delta_rule(
-                    q=query, k=key, v=value, g=g, beta=beta,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=(
-                        query_start_loc[:num_decodes + 1]
-                        if query_start_loc is not None else None),
-                    ssm_state_indices=state_indices,
-                    use_qk_l2norm_in_kernel=True,
+                mixed_qkv_conv = hpu_causal_conv1d_update(
+                    x=mixed_qkv_spec,
+                    conv_state=conv_state,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=spec_si[:, 0],
+                    num_accepted_tokens=n_acc,
+                    query_start_loc=spec_qsl,
+                    max_query_len=spec_state_indices.shape[1],
+                    validate_data=False,
                 )
 
-            non_spec_out = core_attn_out_result.squeeze(0)
-            if non_spec_out.shape[0] == core_attn_out.shape[0]:
-                core_attn_out.copy_(non_spec_out)
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+
+                core_attn_out_result, _ = \
+                    hpu_fused_recurrent_gated_delta_rule(
+                        q=query, k=key, v=value, g=g_spec.unsqueeze(0), beta=beta_spec.unsqueeze(0),
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_qsl,
+                        ssm_state_indices=spec_si,
+                        num_accepted_tokens=n_acc,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                spec_out = core_attn_out_result.squeeze(0)
+                n = min(spec_out.shape[0], core_attn_out.shape[0])
+                core_attn_out[:n] = spec_out[:n]
             else:
-                n = min(non_spec_out.shape[0], core_attn_out.shape[0])
-                core_attn_out[:n] = non_spec_out[:n]
+                # === Non-spec decode =================================
+                mixed_qkv_conv = hpu_causal_conv1d_update(
+                    x=mixed_qkv,
+                    conv_state=conv_state,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
+                    block_idx_last_scheduled_token=None,
+                    initial_state_idx=None,
+                    query_start_loc=query_start_loc,
+                    validate_data=False,
+                )
+
+                query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
+
+                core_attn_out_result, _ = \
+                    hpu_fused_recurrent_gated_delta_rule(
+                        q=query, k=key, v=value, g=g, beta=beta,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=(
+                            query_start_loc[:num_decodes + 1]
+                            if query_start_loc is not None else None),
+                        ssm_state_indices=state_indices,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+
+                non_spec_out = core_attn_out_result.squeeze(0)
+                if non_spec_out.shape[0] == core_attn_out.shape[0]:
+                    core_attn_out.copy_(non_spec_out)
+                else:
+                    n = min(non_spec_out.shape[0], core_attn_out.shape[0])
+                    core_attn_out[:n] = non_spec_out[:n]
 
         # === Part 3: Output Projection ===============================
         z_shape_og = z.shape

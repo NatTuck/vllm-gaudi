@@ -834,8 +834,52 @@ def apply() -> None:
         _patch_mamba_bind_kv_cache()
         _patch_free_blocks()
         _patch_sdpa_attention_forward()
+        _patch_rejection_sampler_expand()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
+
+
+def _patch_rejection_sampler_expand() -> None:
+    """Provide a pure-PyTorch ``expand_batch_to_tokens`` for the rejection
+    sampler when Triton is unavailable (e.g. HPU).
+
+    The stock ``RejectionSampler`` (vllm/v1/sample/rejection_sampler.py) uses a
+    Triton kernel ``expand_kernel`` to expand a ``[batch_size]`` tensor to
+    ``[num_tokens]`` based on cumulative token counts. With the Triton
+    placeholder (no active driver) the kernel is a plain function, so
+    ``expand_kernel[(batch_size,)]`` raises ``TypeError: 'function' object is
+    not subscriptable``. This only triggers once spec-decode reaches the
+    rejection-sampling step (num_draft_tokens > 0), which is why it surfaced
+    only after GDN + MTP were enabled. The fallback matches the kernel exactly:
+    each request's value (after replace_from->replace_to) is repeated by its
+    token count.
+    """
+    try:
+        from vllm.triton_utils import HAS_TRITON
+    except Exception:  # pragma: no cover - defensive
+        return
+    if HAS_TRITON:
+        return
+    try:
+        import vllm.v1.sample.rejection_sampler as _rs
+
+        if getattr(_rs.expand_batch_to_tokens, "_hpu_patched", False):
+            return
+        _orig = _rs.expand_batch_to_tokens
+
+        def _expand_batch_to_tokens_hpu(x, cu_num_tokens, num_tokens, replace_from=0, replace_to=0):
+            counts = cu_num_tokens.diff(prepend=cu_num_tokens.new_zeros(1))
+            replaced = torch.where(x == replace_from, replace_to, x)
+            expanded = replaced.repeat_interleave(counts)
+            if expanded.numel() != num_tokens:
+                raise ValueError(
+                    f"expand_batch_to_tokens produced {expanded.numel()} tokens, expected {num_tokens}")
+            return expanded
+
+        _expand_batch_to_tokens_hpu._hpu_patched = True  # type: ignore[attr-defined]
+        _rs.expand_batch_to_tokens = _expand_batch_to_tokens_hpu
+    except Exception:  # pragma: no cover - defensive
+        return
 
 
 def patch_hf3fs_mock_client():

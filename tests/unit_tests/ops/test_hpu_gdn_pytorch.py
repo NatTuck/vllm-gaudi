@@ -469,6 +469,75 @@ class TestFusedRecurrentGatedDeltaRule:
         assert out.shape == (1, N, HV, V)
         assert final_state.shape == (5, HV, V, K)
 
+    def _spec_reference(self, q, k, v, g, beta, cu_seqlens, ssm_idx, num_accepted):
+        """Manual sequential reference for the spec path.
+
+        Resume from slot ``num_accepted[seq] - 1``; after processing token t
+        (0-indexed within the sequence) store state into slot ``t``.
+        """
+        H, K, HV, V = q.shape[2], q.shape[3], v.shape[2], v.shape[3]
+        scale = K ** -0.5
+        num_slots = ssm_idx.max().item() + 1
+        state = torch.zeros(num_slots, HV, V, K)
+        out = torch.zeros(q.shape[1], HV, V)
+        seqs = cu_seqlens.tolist()
+        for seq_id in range(len(seqs) - 1):
+            bos, eos = seqs[seq_id], seqs[seq_id + 1]
+            resume_col = max(int(num_accepted[seq_id]) - 1, 0)
+            h = state[int(ssm_idx[seq_id, resume_col])].clone()
+            for t in range(bos, eos):
+                col = t - bos
+                qt = q[0, t] * scale
+                kt = k[0, t]
+                gt = g[0, t]
+                bt = beta[0, t]
+                vt = v[0, t]
+                h = h * torch.exp(gt).view(HV, 1, 1)
+                proj = torch.sum(h * kt.view(H, 1, K), dim=-1)
+                v_new = (vt - proj) * bt.view(HV, 1)
+                h = h + v_new.unsqueeze(-1) * kt.view(H, 1, K)
+                out[t] = torch.sum(h * qt.view(H, 1, K), dim=-1)
+                if col < ssm_idx.shape[1]:
+                    state[int(ssm_idx[seq_id, col])] = h
+        return out, state
+
+    def test_spec_path_matches_sequential(self, gdn):
+        """Spec path should equal the manual sequential per-draft recurrence."""
+        num_spec, num_seqs = 2, 3  # each seq has num_spec+1 tokens
+        H, K, HV, V = 2, 8, 2, 8
+        seq_len = num_spec + 1
+        N = num_seqs * seq_len
+        torch.manual_seed(1)
+        q = torch.randn(1, N, H, K)
+        k = torch.randn(1, N, H, K)
+        v = torch.randn(1, N, HV, V)
+        g = -torch.abs(torch.randn(1, N, HV)) * 0.1
+        beta = torch.sigmoid(torch.randn(1, N, HV))
+        cu_seqlens = torch.tensor([0, seq_len, 2 * seq_len, 3 * seq_len], dtype=torch.long)
+        # 2D state indices: [num_seqs, num_spec+1], unique slots per (seq, col)
+        ssm_idx = torch.arange(num_seqs * (num_spec + 1), dtype=torch.long).view(num_seqs, num_spec + 1)
+        num_accepted = torch.tensor([1, 2, 1], dtype=torch.long)
+        num_slots = num_seqs * (num_spec + 1)
+        init_state = torch.zeros(num_slots, HV, V, K)
+
+        out, final_state = gdn.hpu_fused_recurrent_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=init_state,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_idx,
+            num_accepted_tokens=num_accepted,
+        )
+
+        ref_out, ref_state = self._spec_reference(
+            q, k, v, g, beta, cu_seqlens, ssm_idx, num_accepted
+        )
+        torch.testing.assert_close(out.squeeze(0), ref_out, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(final_state, ref_state, atol=1e-4, rtol=1e-4)
+
 
 # ===================================================================
 # 4. Chunk GDR pipeline tests

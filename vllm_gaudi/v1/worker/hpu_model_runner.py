@@ -102,7 +102,8 @@ from vllm.model_executor.models.interfaces import (supports_eagle3, supports_tra
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.v1.worker.utils import (AttentionGroup, prepare_kernel_block_sizes, sanity_check_mm_encoder_outputs)
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import RejectionSampler, PLACEHOLDER_TOKEN_ID
+from vllm_gaudi.v1.sample.hpu_rejection_sampler import HpuRejectionSampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -1163,7 +1164,10 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
         'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks'
+        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks',
+        'spec_query_start_loc', 'non_spec_query_start_loc', 'spec_sequence_masks', 'spec_token_indx',
+        'non_spec_token_indx', 'spec_state_indices_tensor', 'non_spec_state_indices_tensor',
+        'num_accepted_tokens'
     ])
     return attention_metadata
 
@@ -1258,6 +1262,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
+        if self.speculative_config and self.speculative_config.num_speculative_tokens:
+            self._gdn_spec_factor = self.speculative_config.num_speculative_tokens + 1
+        else:
+            self._gdn_spec_factor = 1
         self.observability_config = vllm_config.observability_config
         self.is_driver_worker = is_driver_worker
         self.use_aux_hidden_state_outputs = False
@@ -1442,6 +1450,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._num_gdn_groups = 0  # set during initialize_kv_cache
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
+        # Spec decode: each request needs num_spec+1 state columns (one per
+        # draft position). The compact slot index for (request base_slot s,
+        # group g, spec column c) is s * (num_spec+1) * num_gdn_groups +
+        # c * num_gdn_groups + g + 1. Column 0 is the running state (used by
+        # non-spec decode and as the resume point for spec decode).
+        self._gdn_spec_factor = 1
+        # num_accepted_tokens per request (spec decode sliding-window offset).
+        # Kept as an HPU tensor so it never round-trips through the host.
+        # Indexed by req_id_to_index; init 1 (neutral); updated on-device after
+        # each rejection step. Sized to max_num_reqs.
+        self._gdn_num_accepted_tokens = None  # set after device known
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -1468,11 +1487,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
-            self.rejection_sampler = RejectionSampler(self.sampler)
+            self.rejection_sampler = HpuRejectionSampler(self.sampler)
 
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # HPU accepted-token-count buffer for GDN spec decode (indexed by
+        # req_id_to_index). Init 1 (neutral); updated on-device each step.
+        self._gdn_num_accepted_tokens = torch.ones(
+            self.max_num_reqs, dtype=torch.int32, device=self.device)
 
         # Keep in int64 to avoid overflow with long context
         self.arange_np = np.arange(max(self.max_num_reqs + 1, self.max_model_len, self.max_num_tokens), dtype=np.int64)
@@ -1611,7 +1634,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 for i, req_idx in enumerate(req_indices):
                     req_id = self.input_batch.req_ids[req_idx]
                     base_slot = self._gdn_req_to_base_slot[req_id]
-                    state_indices_cpu[i] = base_slot * self._num_gdn_groups + g_offset + 1
+                    state_indices_cpu[i] = base_slot * self._gdn_spec_factor * self._num_gdn_groups + g_offset + 1
             else:
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
@@ -1624,6 +1647,44 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             all_state_indices_cpu.append(state_indices_cpu)
 
         return torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
+
+    def prepare_spec_mamba_state_idxs(self, req_indices, num_spec, target_bs):
+        """Build 2D spec state indices [num_groups, num_spec_decodes, num_spec+1].
+
+        Entry ``[g, i, c]`` is the compact-GDN slot index for request ``i``'s
+        spec column ``c`` in group ``g``. Column 0 is the running state
+        (matches ``prepare_mamba_state_idxs``); columns 1..num_spec are the
+        per-draft states. Padded requests use -1.
+        """
+        spec_cols = num_spec + 1
+        all_state_indices_cpu = []
+        for group_idx in range(len(self.input_batch.block_table.block_tables)):
+            if group_idx in self._compact_gdn_group_ids:
+                g_offset = self._compact_gdn_group_offset[group_idx]
+                table = torch.full((len(req_indices), spec_cols), -1, dtype=torch.int32)
+                for i, req_idx in enumerate(req_indices):
+                    req_id = self.input_batch.req_ids[req_idx]
+                    base_slot = self._gdn_req_to_base_slot[req_id]
+                    for c in range(spec_cols):
+                        table[i, c] = base_slot * self._gdn_spec_factor * self._num_gdn_groups + \
+                            c * self._num_gdn_groups + g_offset + 1
+                if len(req_indices) < target_bs:
+                    padding = torch.full((target_bs - len(req_indices), spec_cols), -1, dtype=torch.int32)
+                    table = torch.cat([table, padding], dim=0)
+                all_state_indices_cpu.append(table)
+            else:
+                # Non-compact GDN groups: reuse block-table state indices for
+                # column 0 and mirror across spec columns (each draft position
+                # shares the request's running state block).
+                block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
+                col0 = block_table_cpu_tensor[req_indices, [0] * len(req_indices)].clone()
+                table = col0.unsqueeze(1).expand(-1, spec_cols).clone()
+                if len(req_indices) < target_bs:
+                    padding = torch.full((target_bs - len(req_indices), spec_cols),
+                                         self._MAMBA_PAD_BLOCK_ID, dtype=torch.int32)
+                    table = torch.cat([table, padding], dim=0)
+                all_state_indices_cpu.append(table)
+        return torch.stack(all_state_indices_cpu, dim=0)  # [num_groups, num_spec_decodes, num_spec+1]
 
     def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: list[int], is_prompt: bool):
         '''
@@ -1986,6 +2047,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self._gdn_req_to_base_slot[req_id] = base_slot
                     logger.debug("GDN_COMPACT alloc req=%s base_slot=%d free_list_len=%d", req_id, base_slot,
                                  len(self._gdn_slot_free_list))
+        # Spec decode: reset acceptance count to 1 (neutral) for new requests.
+        if self._gdn_num_accepted_tokens is not None and req_ids_to_add:
+            idxs = torch.tensor(
+                [self.input_batch.req_id_to_index[req_id] for req_id in req_ids_to_add],
+                dtype=torch.long, device=self.device)
+            self._gdn_num_accepted_tokens.index_fill_(0, idxs, 1)
 
         # Condense the batched states if there are empty indices.
         if removed_req_indices:
@@ -3105,28 +3172,36 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         input_mrope_positions_list: list[list[int]] = [[] for _ in range(3)]
         if self.uses_mrope:
+            # M-RoPE positions must match the flattened token layout
+            # [padded_batch_size, num_tokens] (then view(-1,1) for spec decode).
+            # Each request contributes num_tokens_per_req positions (1 per
+            # real token; drafts get context_len+1, +2, ...). Pad the rest to
+            # num_tokens so the per-token flatten stays aligned.
+            nt_per_req = num_tokens_per_req[:num_decodes]
             for idx, req_id in enumerate(self.input_batch.req_ids[:num_decodes]):
                 seq_data = self.requests[req_id]
                 context_len = context_lens[idx]
-                position = context_len
                 if seq_data.mrope_position_delta is not None:
                     seq_data.mrope_position_delta = int(seq_data.mrope_position_delta)
                     pos_for_mrope = MRotaryEmbedding \
                         .get_next_input_positions(
                             seq_data.mrope_position_delta,
                             context_len=context_len,
-                            seq_len=context_len + 1)
+                            seq_len=context_len + num_tokens)
                 else:
-                    pos_for_mrope = [[position]] * 3
-                for idx in range(3):
-                    input_mrope_positions_list[idx].extend(pos_for_mrope[idx])
-
+                    base = context_len
+                    pos_for_mrope = [[base + t for t in range(num_tokens)] for _ in range(3)]
+                for sec in range(3):
+                    seq = pos_for_mrope[sec]
+                    if len(seq) < num_tokens:
+                        seq = seq + [seq[-1]] * (num_tokens - len(seq))
+                    input_mrope_positions_list[sec].extend(seq)
+            for sec in range(3):
+                cur = len(input_mrope_positions_list[sec])
+                if cur < padded_batch_size * num_tokens:
+                    input_mrope_positions_list[sec].extend(
+                        [-1] * (padded_batch_size * num_tokens - cur))
             positions = torch.tensor(input_mrope_positions_list, dtype=torch.int32, device='cpu')
-
-            # Pad the right side of input_mrope_positions by padded_batch_size
-            pad_size = padded_batch_size - positions.size(1)
-            if pad_size > 0:
-                positions = F.pad(positions, (0, pad_size), value=-1, mode='constant')
 
         ###################################
         # initialize token_ids with padding
@@ -3169,7 +3244,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # convert to [batch_size * num_tokens, 1]
         if num_tokens > 1:
             token_ids = token_ids.view(-1, 1)
-            positions = padded_index.view(-1, 1)
+            if not self.uses_mrope:
+                positions = padded_index.view(-1, 1)
             slot_mapping = slot_mapping.view(-1, 1)
 
         logits_indices = torch.zeros(padded_batch_size, dtype=torch.int32, device='cpu')
@@ -3266,7 +3342,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                 pin_memory=self.pin_memory)
             query_start_loc_p_cpu[1:] = torch.cumsum(seq_lens_cpu.clone().to(dtype=torch.int32), dim=0)
 
-            seq_lens_tensor = async_h2d_copy(seq_lens_cpu, device=self.device)
+            # For spec decode (num_tokens > 1) the token batch is flattened to
+            # [padded_batch * num_tokens, 1]. The full-attention backend uses
+            # seq_lens_tensor to derive batch_size/seq_len and choose the decode
+            # vs prompt path. Emit one seq-len entry per token (all 1s) so the
+            # flattened batch is treated as `batch_size = padded_batch*num_tokens`
+            # independent single-token decodes. The GDN/hybrid forward does NOT
+            # read seq_lens_tensor (it uses query_start_loc_p + state indices),
+            # which remain per-request.
+            if num_tokens > 1:
+                seq_lens_attn = torch.ones(padded_batch_size * num_tokens,
+                                           dtype=torch.int32, device='cpu', pin_memory=self.pin_memory)
+            else:
+                seq_lens_attn = seq_lens_cpu
+            seq_lens_tensor = async_h2d_copy(seq_lens_attn, device=self.device)
             load_indices_tensor = async_h2d_copy(load_state_indices_cpu, device=self.device)
             store_indices_tensor = async_h2d_copy(store_state_indices_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
@@ -3329,6 +3418,52 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             spec_decode_metadata = None
         logits_indices_device = async_h2d_copy(logits_indices, device=self.device)
 
+        # Speculative-decode split metadata for the GDN/hybrid forward.
+        # Stock splits the decode batch into spec vs non-spec token groups and
+        # processes each separately. On HPU the whole decode batch is flattened
+        # to [padded_batch * num_tokens, 1]; in MTP steady state every real
+        # decode request is a spec request (num_tokens_per_req > 1), so we
+        # implement the spec-only path (num_spec_decodes == num_decodes).
+        spec_query_start_loc = None
+        non_spec_query_start_loc = None
+        spec_sequence_masks = None
+        spec_token_indx = None
+        non_spec_token_indx = None
+        spec_state_indices_tensor = None
+        non_spec_state_indices_tensor = None
+        num_accepted_tokens = None
+        num_spec_decodes = 0
+        num_actual_tokens = 0
+        if (self.num_mamba_like_layers > 0 and num_tokens > 1
+                and self.speculative_config is not None):
+            num_spec = self.speculative_config.num_speculative_tokens
+            spec_mask = [n > 1 for n in num_scheduled_tokens[:num_decodes]]
+            num_spec_decodes = sum(spec_mask)
+            if num_spec_decodes == num_decodes and num_decodes > 0:
+                # Spec-only path: every real decode request is spec.
+                req_indices = list(range(num_decodes))
+                spec_state_indices_cpu = self.prepare_spec_mamba_state_idxs(
+                    req_indices, num_spec, num_decodes)
+                spec_state_indices_tensor = async_h2d_copy(spec_state_indices_cpu, device=self.device)
+                # Spec tokens are the first num_actual_tokens rows of the
+                # flattened batch; spec_query_start_loc is the per-request
+                # cumulative token count (query_start_loc_p).
+                num_actual_tokens = int(query_start_loc_p_cpu[num_decodes].item())
+                spec_query_start_loc = query_start_loc_p[:num_decodes + 1]
+                spec_token_indx = torch.arange(num_actual_tokens, dtype=torch.int32,
+                                               device=self.device)
+                non_spec_token_indx = torch.empty(0, dtype=torch.int32, device=self.device)
+                # Gather accepted counts from the HPU buffer (no host round-trip).
+                if self._gdn_num_accepted_tokens is not None:
+                    req_idxs = torch.tensor(
+                        [self.input_batch.req_id_to_index[self.input_batch.req_ids[i]]
+                         for i in range(num_decodes)],
+                        dtype=torch.long, device=self.device)
+                    num_accepted_tokens = self._gdn_num_accepted_tokens.index_select(0, req_idxs)
+                else:
+                    num_accepted_tokens = torch.ones(num_decodes, dtype=torch.int32, device=self.device)
+                spec_sequence_masks = torch.ones(num_decodes, dtype=torch.bool, device=self.device)
+
         attn_metadata = HPUAttentionMetadataV1.make_decode_metadata(
             block_list=block_list_device,
             block_usage=block_usage_device,
@@ -3346,6 +3481,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             store_indices_tensor=store_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            spec_sequence_masks=spec_sequence_masks,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            num_accepted_tokens=num_accepted_tokens,
+            num_spec_decodes=num_spec_decodes,
+            num_actual_tokens=num_actual_tokens,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
@@ -4008,8 +4153,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       pad_to: Optional[int] = None,
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
         htorch.core.mark_step()
+        _ps_t0 = time.time()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
+        _ps_t1 = time.time()
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+        _ps_t2 = time.time()
+        if os.environ.get("FASTQWEN_STEP_TIMING") == "1":
+            print(f"[step_timing]   prepare_sampling={round((_ps_t1-_ps_t0)*1000,1)}ms "
+                  f"regular_sampler={round((_ps_t2-_ps_t1)*1000,1)}ms", flush=True)
         htorch.core.mark_step()
         return sampler_output, sampling_metadata
 
@@ -4300,6 +4451,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         warmup_mode = self.warmup_mode
         self.scheduler_output = None
         self.warmup_mode = False
+        _ST = os.environ.get("FASTQWEN_STEP_TIMING") == "1"
+        _st_t0 = time.time()
+        if _ST and not warmup_mode:
+            _last = globals().get("_LAST_SAMPLE_TOKENS_END", 0.0)
+            _gap = (_st_t0 - _last) * 1000 if _last else 0.0
+            print(f"[step_timing] sample_tokens enter; step_gap={_gap:.1f}ms", flush=True)
+        # sampling_metadata is assigned in each sampling branch below but must
+        # be bound before the spec-decode drafter call at the end (which can
+        # run on a step where no sampling produced a value, e.g. a chunked
+        # prefill-only step). It is passed through but not consumed by the
+        # drafter path.
+        sampling_metadata = None
 
         # NOTE(kzawora): Since scheduler doesn't differentiate between prefills
         # and decodes, we must handle mixed batches. In _update_states we make
@@ -4520,61 +4683,105 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             htorch.core.mark_step()
-            non_flattened_hidden_states, aux_hidden_states, \
-                sample_hidden_states, logits_device = \
-                    self._execute_model_generic(
-                decode_data.token_ids,
-                decode_data.position_ids,
-                decode_data.attn_metadata,
-                decode_data.logits_indices,
-                self.kv_caches,
-                lora_logits_mask,
-                lora_mask,
-                warmup_mode=warmup_mode)
-            htorch.core.mark_step()
+            _fw_t0 = time.time()
+            with self.profiler.record_event('internal', "target_forward"):
+                non_flattened_hidden_states, aux_hidden_states, \
+                    sample_hidden_states, logits_device = \
+                        self._execute_model_generic(
+                    decode_data.token_ids,
+                    decode_data.position_ids,
+                    decode_data.attn_metadata,
+                    decode_data.logits_indices,
+                    self.kv_caches,
+                    lora_logits_mask,
+                    lora_mask,
+                    warmup_mode=warmup_mode)
+                htorch.core.mark_step()
+            if os.environ.get("FASTQWEN_STEP_TIMING") == "1" and not warmup_mode:
+                print(f"[step_timing] target_forward wall = {round((time.time()-_fw_t0)*1000,1)} ms "
+                      f"num_decodes={num_decodes} bs={decode_data.token_ids.size(0)}", flush=True)
+                print(f"[step_timing]   enter->forward_start = "
+                      f"{round((_fw_t0-_st_t0)*1000,1)}ms", flush=True)
+                globals()["_ST_POST_FORWARD"] = time.time()
 
             if self.use_structured_output:
                 logits_decode.append(logits_device[:num_decodes])
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
             else:
+                _sm_t0 = time.time()
+                _sm_sync_t0 = None
+                if os.environ.get("FASTQWEN_STEP_TIMING") == "1" and not warmup_mode:
+                    torch.hpu.synchronize()
+                    _sm_sync_t0 = time.time()
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
-                    sampler_output, sampling_metadata = self._run_sampling(
-                        batch_changed, logits_device
-                        if spec_decode_metadata is None else logits_device[spec_decode_metadata.bonus_logits_indices],
-                        pd_info.decode_req_ids, logits_device.shape[0])
-
+                    sampler_logits = (logits_device if spec_decode_metadata is None else
+                                      logits_device[spec_decode_metadata.bonus_logits_indices])
+                    # pad_to must match the ACTUAL batch of the logits handed
+                    # to the sampler. In the spec-decode path that is the number
+                    # of bonus-logits rows (one per decode request), not the full
+                    # flattened model-logits batch (padded_batch * num_tokens).
+                    # Passing the wrong pad_to sizes the sampling-metadata
+                    # temperature to a mismatched batch and dynamo's graph capture
+                    # fails on the div_ broadcast during spec decode.
+                    sampler_batch = (logits_device.shape[0] if spec_decode_metadata is None else
+                                     spec_decode_metadata.bonus_logits_indices.numel())
                     if spec_decode_metadata is None:
+                        sampler_output, sampling_metadata = self._run_sampling(
+                            batch_changed, sampler_logits, pd_info.decode_req_ids, sampler_batch)
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
                     else:
-                        # Handling spec decode sampling.
-                        sampler_output = self.rejection_sampler(
-                            spec_decode_metadata,
-                            None,  # draft_probs
-                            logits_device,
-                            sampling_metadata,
-                        )
-                        sampled_token_ids = sampler_output.sampled_token_ids
-                        decode_sampled_token_ids = \
-                            self.rejection_sampler.parse_output(
-                                sampled_token_ids,
-                                self.input_batch.vocab_size,
-                        )
-                        if isinstance(decode_sampled_token_ids, tuple):
-                            decode_sampled_token_ids, _ = decode_sampled_token_ids
-                        # Trim output in case of dummy padding
-                        decode_sampled_token_ids = decode_sampled_token_ids[:num_decodes]
-                        # convert decode_sampled_token_ids as list of tensor
-                        spec_decode_num_tokens = [len(v) for v in decode_sampled_token_ids]
+                        # Spec-decode: build the sampling metadata WITHOUT the
+                        # redundant bonus-token regular-sampler call. `_run_sampling`
+                        # samples the bonus logits then discards the result in this
+                        # branch, so the bonus was sampled TWICE per step — two full
+                        # 152k top-k/top-p regular-sampler passes on HPU. The
+                        # rejection sampler below samples the bonus token itself,
+                        # so we only build metadata here.
+                        htorch.core.mark_step()
+                        sampling_metadata = self._prepare_sampling(
+                            batch_changed, pd_info.decode_req_ids, sampler_batch)
+                        htorch.core.mark_step()
+                        _rj_t0 = time.time()
+                        with self.profiler.record_event('internal', "rejection_sampler"):
+                            sampler_output = self.rejection_sampler(
+                                spec_decode_metadata,
+                                None,  # draft_probs
+                                logits_device,
+                                sampling_metadata,
+                            )
+                        _rj_t1 = time.time()
+                        if os.environ.get("FASTQWEN_STEP_TIMING") == "1":
+                            print(f"[step_timing]   rejection_sampler={round((_rj_t1-_rj_t0)*1000,1)}ms", flush=True)
+                        sampled_token_ids = sampler_output.sampled_token_ids  # [B, max_spec+1]
+                        is_valid = sampled_token_ids != PLACEHOLDER_TOKEN_ID
+                        # Per-request accepted-token count (incl. bonus).
+                        spec_decode_num_tokens_t = is_valid.sum(dim=1)  # [batch]
+                        # Split into per-request HPU tensors of accepted tokens.
                         decode_sampled_token_ids = [
-                            torch.tensor(v, device="cpu").int() for v in decode_sampled_token_ids
+                            sampled_token_ids[i][is_valid[i]] for i in range(num_decodes)
                         ]
-                        decode_sampled_token_ids_device = \
-                            sampled_token_ids.to("hpu", non_blocking=True)
+                        spec_decode_num_tokens = spec_decode_num_tokens_t[:num_decodes]  # HPU, sync deferred to postprocessing
+                        # Record per-request accepted-token count for the next
+                        # GDN spec-decode step (sliding-window offset), on HPU.
+                        # Requests not in spec decode keep the neutral value 1.
+                        if num_decodes > 0 and self._gdn_num_accepted_tokens is not None:
+                            accepted_hpu = spec_decode_num_tokens_t[:num_decodes].clamp(min=1)
+                            self._gdn_num_accepted_tokens[:num_decodes].copy_(accepted_hpu)
+                        decode_sampled_token_ids_device = sampled_token_ids  # stays on HPU
                     decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
                     ##### Sampling End #####
+                if os.environ.get("FASTQWEN_STEP_TIMING") == "1" and not warmup_mode:
+                    print(f"[step_timing] sampler wall = {round((time.time()-_sm_t0)*1000,1)} ms", flush=True)
+                    if _sm_sync_t0 is not None:
+                        torch.hpu.synchronize()
+                        print(f"[step_timing]   sampler_device_synced = "
+                              f"{round((time.time()-_sm_sync_t0)*1000,1)}ms", flush=True)
+                    print(f"[step_timing]   enter->sampler_start = "
+                          f"{round((_sm_t0-_st_t0)*1000,1)}ms "
+                          f"(fwd_wall={round((time.time()-_fw_t0)*1000,1)})", flush=True)
 
             if self.is_driver_worker and self.profiler.enabled:
                 # Stop recording 'execute_model' event
@@ -4658,8 +4865,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # We already have tokens. Let's copy the data to
             # CPU as is, and then discard padded tokens.
             with self.profiler.record_event('internal', "sampler_postprocessing"):
+                _pp_t0 = time.time()
                 prefill_sampled_token_ids = [tensor.cpu() for tensor in prefill_sampled_token_ids]
                 if spec_decode_num_tokens is not None:
+                    spec_decode_num_tokens = spec_decode_num_tokens.tolist()  # sync once here (already drained by .cpu())
                     decode_sampled_token_ids = [tensor.cpu() for tensor in decode_sampled_token_ids]
                 else:
                     decode_sampled_token_ids = [tensor.cpu()[:num_decodes] for tensor in decode_sampled_token_ids]
@@ -4680,6 +4889,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         self.input_batch.req_id_to_index[req_id]] += sampled_token_ids_list[start_idx:start_idx +
                                                                                             num_tokens]
                     start_idx += num_tokens
+                if os.environ.get("FASTQWEN_STEP_TIMING") == "1" and not warmup_mode:
+                    print(f"[step_timing]   d2h_postprocess = {round((time.time()-_pp_t0)*1000,1)}ms", flush=True)
 
         ################## RETURN ##################
 
@@ -4725,12 +4936,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ################## Spec Decode ##################
         # Now, we will call drafter to propose draft token ids
         if self.speculative_config:
-            self._draft_token_ids = self.propose_draft_token_ids(
-                scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
-                sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
-                decode_sampled_token_ids_device, non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
-                aux_hidden_states_prefills, num_decodes, prefill_data if num_prefills > 0 else None,
-                decode_data if num_decodes > 0 else None)
+            _dr_t0 = time.time()
+            with self.profiler.record_event('internal', "drafter_forward"):
+                self._draft_token_ids = self.propose_draft_token_ids(
+                    scheduler_output, postprocessed_sampled_token_ids, sampling_metadata, non_flattened_hidden_states,
+                    sample_hidden_states, aux_hidden_states, prefill_sampled_token_ids_device,
+                    decode_sampled_token_ids_device, non_flattened_hidden_states_prefills, sample_hidden_states_prefills,
+                    aux_hidden_states_prefills, num_decodes, prefill_data if num_prefills > 0 else None,
+                    decode_data if num_decodes > 0 else None)
+            if os.environ.get("FASTQWEN_STEP_TIMING") == "1" and not warmup_mode:
+                print(f"[step_timing] drafter wall = {round((time.time()-_dr_t0)*1000,1)} ms", flush=True)
         ################## Spec Decode end ##################
 
         # Create output.
@@ -4777,6 +4992,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             ))
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
+
+        if _ST and not warmup_mode:
+            print(f"[step_timing] sample_tokens TOTAL = {round((time.time()-_st_t0)*1000,1)}ms", flush=True)
+            globals()["_LAST_SAMPLE_TOKENS_END"] = time.time()
 
         return model_runner_output
 
@@ -4952,6 +5171,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.sampler = self._compile(self.sampler)
             else:
                 self.model = self._compile(self.model)
+
+            # Compile the MTP/speculative drafter too. In torch.compile mode
+            # (PT_HPU_LAZY_MODE=0) `_maybe_wrap_in_hpu_graph` is a no-op, so the
+            # drafter would otherwise run eager per decode step — a full decoder
+            # layer over the token-inflated batch — which dominates step latency.
+            # Full-compile the drafter model (not just its regions): the MTP
+            # predictor forward chain (embed + pre-fc norms + fc projection +
+            # mtp layer + norm) includes an `fc` Linear that is not in the
+            # regional-compilation list and would otherwise dispatch eagerly every
+            # step, serializing the decode pipeline.
+            if hasattr(self, "drafter") and hasattr(self.drafter, "model"):
+                print(f"[drafter_debug] before: type={type(self.drafter.model).__name__} "
+                      f"layers={getattr(self.drafter.model, 'layers', None) and len(self.drafter.model.layers)}", flush=True)
+                self.drafter.model = self._compile(self.drafter.model)
+                print(f"[drafter_debug] after: type={type(self.drafter.model).__name__}", flush=True)
 
     def _compile_methods(self):
         """
@@ -5345,8 +5579,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         """
         # Choose batch sizes for warmup based on bucketing
         # Note: We skip batch_size=0 because you can't sample from empty logits
+        # The sampler buffers (top_k_cpu / top_p_cpu) are sized for max_num_reqs,
+        # so we must not warm up a batch larger than that. With speculative
+        # decoding the decode buckets carry bs * (1 + num_spec_tokens), which can
+        # exceed max_num_reqs; sampling is per-request, so cap here.
         test_batch_sizes = list(
-            dict.fromkeys([1] + [bucket[0] for bucket in self.bucketing_manager.decode_buckets if bucket[0] > 0]))
+            dict.fromkeys([
+                bs for bs in
+                ([1] + [bucket[0] for bucket in self.bucketing_manager.decode_buckets if bucket[0] > 0])
+                if bs <= self.max_num_reqs
+            ]))
 
         # Test different sampling configurations
         sampling_configs = [
@@ -5670,13 +5912,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # initialize_kv_cache aligns attn page size to mamba page size,
             # causing warmup to record wrong num_blocks otherwise.
             decode_block_size = self.attn_block_size
+            # A spec-decode bucket's batch dimension carries bs * (1 + num_spec)
+            # (a graph-shape reservation, never selected for a real decode), so
+            # decode_bs can exceed max_num_reqs. The batch buffers are sized for
+            # max_num_reqs requests, so cap the number of dummy decode requests
+            # here. Each dummy decode request still schedules 1 token, matching
+            # the runtime shape ([padded_decode_bs, 1]); draft tokens are carried
+            # separately via scheduled_spec_decode_tokens, not by inflating
+            # num_scheduled_tokens.
+            num_requests = min(decode_bs, self.max_num_reqs)
             if self.use_contiguous_pa:
-                decode_seq_lengths = [decode_block_size] * decode_bs
+                decode_seq_lengths = [decode_block_size] * num_requests
                 # Cap block_id at physical pool — contiguous PA uses
                 # block_id as the allocation base which must be valid.
                 block_id = min(decode_num_blocks - 1, self.kv_cache_config.num_blocks - 1)
             else:
-                decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, decode_block_size)
+                decode_seq_lengths = self._generate_seq_lengths(num_requests, decode_num_blocks, decode_block_size)
                 block_id = 0
             for dsl in decode_seq_lengths:
                 self._add_dummy_request(requests,
@@ -6653,7 +6904,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         if isinstance(kv_caches.get(layer_name), tuple):
                             continue
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+                        compact_total = gdn_max_reqs * self._gdn_spec_factor * self._num_gdn_groups + 2
                         state_tensors = []
                         for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                             target_shape = (compact_total, *shape)
@@ -6741,7 +6992,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         if isinstance(kv_caches.get(layer_name), tuple):
                             continue
                         gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+                        compact_total = gdn_max_reqs * self._gdn_spec_factor * self._num_gdn_groups + 2
                         state_tensors = []
                         for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                             target_shape = (compact_total, *shape)
@@ -6929,7 +7180,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             gdn_max_reqs = self._gdn_max_reqs
             self._gdn_slot_free_list = list(range(gdn_max_reqs - 1, -1, -1))
             self._gdn_req_to_base_slot.clear()
-            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+            compact_total = gdn_max_reqs * self._gdn_spec_factor * self._num_gdn_groups + 2
             logger.info("GDN compact: %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
                         len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total, num_blocks + 1,
                         len(self._gdn_slot_free_list))
@@ -7096,10 +7347,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self._draft_token_ids is None:
             return None
         req_ids = self.input_batch.req_ids
-        if isinstance(self._draft_token_ids, torch.Tensor):
-            draft_token_ids = self._draft_token_ids.tolist()
-        else:
-            draft_token_ids = self._draft_token_ids
+        _td_t0 = time.time()
+        with self.profiler.record_event('internal', "take_draft_token_ids"):
+            if isinstance(self._draft_token_ids, torch.Tensor):
+                draft_token_ids = self._draft_token_ids.tolist()
+            else:
+                draft_token_ids = self._draft_token_ids
+        if os.environ.get("FASTQWEN_STEP_TIMING") == "1":
+            print(f"[step_timing] take_draft wall = {round((time.time()-_td_t0)*1000,1)} ms", flush=True)
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
@@ -7165,6 +7420,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     prefill_batch_start_idx += len(req_id)
 
                 if draft_token_ids is None:
+                    if not draft_token_ids_prefill:
+                        # No draft tokens to propose: this is an incomplete
+                        # chunked-prefill step (no decode, no sampled tokens),
+                        # so there is nothing to seed the drafter with.
+                        return None
                     draft_token_ids = torch.cat(draft_token_ids_prefill, dim=0)
                 else:
                     draft_token_ids = torch.cat([draft_token_ids] + draft_token_ids_prefill, dim=0)
@@ -7201,17 +7461,32 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Decodes are the first num_decodes requests.
         # Prefill are the next num_reqs - num_decodes requests.
         # Note: sampled_token_ids includes both decode and prefill sampled tokens
-        block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
-        decode_block_table = block_table_cpu_tensor[:num_decodes]
+        # Only fetch the block table to CPU when the drafter needs it (num_spec>1
+        # for per-token attn metadata). For num_spec==1 the MTP drafter early-exits
+        # after its single forward and never touches the block table, so fetching it
+        # would be a needless device->host sync (drain) that serializes the step.
+        if self.speculative_config.num_speculative_tokens > 1:
+            block_table_cpu_tensor = self.input_batch.block_table[0].get_cpu_tensor()
+            decode_block_table = block_table_cpu_tensor[:num_decodes]
+        else:
+            decode_block_table = None
 
         common_attn_metadata = decode_data.attn_metadata
+        _drp_t0 = time.time()
         common_attn_metadata, hidden_states_indices, last_token_indices = \
             self.drafter.prepare_inputs(common_attn_metadata,
                                         decode_data.spec_decode_metadata,
                                         sampled_token_ids)
+        _drp_t1 = time.time()
 
         target_token_ids = decode_sampled_token_ids_tensor.reshape(-1, 1)[hidden_states_indices]
-        target_positions = decode_data.position_ids[hidden_states_indices]
+        if self.uses_mrope and decode_data.position_ids.dim() == 2:
+            # M-RoPE positions are [3, num_tokens]. hidden_states_indices are
+            # token positions in the flattened batch; index along the token
+            # dim and return to the [3, seq] form the MTP drafter expects.
+            target_positions = decode_data.position_ids.transpose(0, 1)[hidden_states_indices].transpose(0, 1)
+        else:
+            target_positions = decode_data.position_ids[hidden_states_indices]
 
         if self.use_aux_hidden_state_outputs and \
                 aux_hidden_states is not None:
@@ -7221,8 +7496,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(1)
+        _drp_t2 = time.time()
         draft_token_ids = self.drafter.propose(target_token_ids, target_positions, target_hidden_states,
                                                last_token_indices, common_attn_metadata, decode_block_table, self)
+        _drp_t3 = time.time()
+        if os.environ.get("FASTQWEN_STEP_TIMING") == "1":
+            print(f"[step_timing]   prepare_inputs={round((_drp_t1-_drp_t0)*1000,1)}ms "
+                  f"extract={round((_drp_t2-_drp_t1)*1000,1)}ms "
+                  f"propose(model)={round((_drp_t3-_drp_t2)*1000,1)}ms", flush=True)
 
         draft_token_ids = draft_token_ids[:num_decodes]
         return draft_token_ids

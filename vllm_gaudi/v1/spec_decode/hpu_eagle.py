@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import itertools
+import os
+import time
 
 import torch
 from vllm_gaudi.utils import async_h2d_copy
@@ -37,6 +39,7 @@ class HpuEagleProposer(EagleProposer):
                     target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
+        _et0 = time.time()
         ret_hidden_states = self.model(
             input_ids=target_token_ids,
             positions=target_positions,
@@ -44,6 +47,7 @@ class HpuEagleProposer(EagleProposer):
             inputs_embeds=None,
             attn_metadata=common_attn_metadata,
         )
+        _et1 = time.time()
 
         # All MTP related method names are now unified to "mtp"
         if self.method == "mtp":
@@ -54,6 +58,10 @@ class HpuEagleProposer(EagleProposer):
         last_hidden_states = last_hidden_states.view(-1, last_hidden_states.shape[-1])
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        _et2 = time.time()
+        if os.environ.get("FASTQWEN_STEP_TIMING") == "1":
+            print(f"[step_timing]   drafter_model={round((_et1-_et0)*1000,1)}ms "
+                  f"compute_logits={round((_et2-_et1)*1000,1)}ms", flush=True)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:

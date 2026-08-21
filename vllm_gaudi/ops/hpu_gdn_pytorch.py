@@ -553,14 +553,9 @@ def hpu_fused_recurrent_gated_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """PyTorch replacement for fused_recurrent_gated_delta_rule.
 
-    This implementation supports the non-speculative paths used by current
-    Gaudi Qwen3.5 integration.
+    Supports both the non-speculative decode/prefill paths and the
+    speculative-decode path (2D ``ssm_state_indices`` + ``num_accepted_tokens``).
     """
-    if num_accepted_tokens is not None:
-        raise NotImplementedError("Speculative decode path is not implemented in phase 1.")
-    if ssm_state_indices is not None and ssm_state_indices.ndim > 1:
-        raise NotImplementedError("2D ssm_state_indices (spec decode) is not implemented in phase 1.")
-
     if beta is None:
         beta = torch.ones_like(g)
     if scale is None:
@@ -588,6 +583,26 @@ def hpu_fused_recurrent_gated_delta_rule(
     # sync and NO _materialize_seq_ranges call needed.
     #   (a) cu_seqlens has N+1 entries and T == N  → N seqs, 1 token each
     #   (b) cu_seqlens is None and T == 1          → B seqs, 1 token each
+    _is_spec = (num_accepted_tokens is not None) or (ssm_state_indices is not None and ssm_state_indices.ndim > 1)
+
+    if _is_spec:
+        if num_accepted_tokens is None or ssm_state_indices is None or ssm_state_indices.ndim != 2:
+            raise ValueError("Speculative path requires both 2D 'ssm_state_indices' and 'num_accepted_tokens'.")
+        return _recurrent_spec_path_vectorized(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            inplace_final_state,
+            cu_seqlens,
+            ssm_state_indices,
+            num_accepted_tokens,
+            use_qk_l2norm_in_kernel,
+        )
+
     _all_single_token = ((cu_seqlens is not None and B == 1 and cu_seqlens.shape[0] - 1 == T)
                          or (cu_seqlens is None and T == 1))
 
@@ -786,6 +801,214 @@ def _recurrent_general_path(
     out = out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, HV, Vdim)
 
     return out, final_state
+
+
+@torch._dynamo.disable
+def _recurrent_spec_path(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor | None,
+    inplace_final_state: bool,
+    cu_seqlens: torch.LongTensor,
+    ssm_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Speculative-decode recurrent GDN path (2D state indices).
+
+    Mirrors the CUDA ``fused_sigmoid_gating_delta_rule_update`` spec path
+    (see fused_sigmoid_gating.py): each spec sequence resumes its recurrence
+    from the state slot ``ssm_state_indices[seq, num_accepted[seq] - 1]`` and,
+    after processing draft token ``t`` (0-indexed within the sequence), stores
+    the resulting state into slot ``ssm_state_indices[seq, t]`` (rollback for
+    the acceptance step on the next call).
+
+    ``ssm_state_indices`` is ``[num_spec_decodes, num_spec + 1]``.  States are
+    read from ``initial_state`` (the shared ssm_state cache) in-place so the
+    per-draft slots are populated for the next step.
+
+    Returns (out [1, num_tokens, HV, V], final_state).
+    """
+    B, T, H, Kdim = q.shape
+    _, _, HV, Vdim = v.shape
+    device = q.device
+
+    # Grouped-value attention: repeat q/k heads to match value heads.
+    if H != HV:
+        if HV % H == 0:
+            repeat = HV // H
+            q = q.repeat_interleave(repeat, dim=2)
+            k = k.repeat_interleave(repeat, dim=2)
+            H = HV
+        else:
+            raise ValueError(f"Unsupported head mapping in spec path: q/k heads={H}, value heads={HV}.")
+
+    if cu_seqlens is None:
+        raise ValueError("'cu_seqlens' must be provided for the spec path.")
+    seq_ranges = _materialize_seq_ranges(cu_seqlens, B * T)
+    num_seqs = len(seq_ranges)
+
+    if initial_state is None:
+        final_state = torch.zeros((num_seqs, HV, Vdim, Kdim), dtype=torch.float32, device=device)
+    else:
+        final_state = initial_state if inplace_final_state else initial_state.clone()
+
+    state_work = final_state.to(torch.float32)
+    num_slots = state_work.shape[0]
+
+    qf = q.reshape(-1, H, Kdim).to(torch.float32)
+    kf = k.reshape(-1, H, Kdim).to(torch.float32)
+    vf = v.reshape(-1, HV, Vdim).to(torch.float32)
+    gf = g.reshape(-1, HV).to(torch.float32)
+    bf = beta.reshape(-1, HV).to(torch.float32)
+
+    out = torch.empty((qf.shape[0], HV, Vdim), dtype=torch.float32, device=device)
+
+    sidx2d = ssm_state_indices.to(dtype=torch.long, device=device)
+    n_acc = num_accepted_tokens.to(dtype=torch.long, device=device)
+
+    for seq_id, (bos, eos) in enumerate(seq_ranges):
+        if eos <= bos:
+            continue
+        if seq_id >= sidx2d.shape[0]:
+            continue
+
+        accepted = int(n_acc[seq_id])
+        resume_col = max(accepted - 1, 0)
+        resume_slot = int(sidx2d[seq_id, resume_col])
+        safe_resume = resume_slot % num_slots if resume_slot >= 0 else 0
+        h_state = state_work[safe_resume]
+
+        for t in range(bos, eos):
+            q_t = qf[t]
+            k_t = kf[t]
+            v_t = vf[t]
+            g_t = gf[t]
+            b_t = bf[t]
+
+            if use_qk_l2norm_in_kernel:
+                q_t = _l2norm_last_dim(q_t)
+                k_t = _l2norm_last_dim(k_t)
+
+            out_t, h_state = _recurrent_timestep_body(
+                q_t, k_t, v_t, g_t, b_t, h_state, scale, HV, H, Kdim,
+            )
+            out[t] = out_t
+
+            # Store state after token (t - bos) into slot (t - bos).
+            col = t - bos
+            if col < sidx2d.shape[1]:
+                slot = int(sidx2d[seq_id, col])
+                if slot >= 0:
+                    state_work[slot % num_slots] = h_state
+
+    final_state.copy_(state_work.to(final_state.dtype))
+    out = out.to(v.dtype)
+
+    out = out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, HV, Vdim)
+
+    return out, final_state
+
+
+def _recurrent_spec_path_vectorized(
+    q: torch.Tensor,       # [1, num_tokens, H, K]
+    k: torch.Tensor,
+    v: torch.Tensor,       # [1, num_tokens, HV, V]
+    g: torch.Tensor,       # [1, num_tokens, HV]
+    beta: torch.Tensor,    # [1, num_tokens, HV]
+    scale: float,
+    initial_state: torch.Tensor,   # [num_slots, HV, V, K]
+    inplace_final_state: bool,
+    cu_seqlens: torch.LongTensor,  # [num_spec_decodes + 1]
+    ssm_state_indices: torch.Tensor,  # [num_spec_decodes, num_spec + 1]
+    num_accepted_tokens: torch.Tensor,  # [num_spec_decodes]
+    use_qk_l2norm_in_kernel: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized spec-decode GDN recurrence (no Python loops / .item()).
+
+    Unrolls the per-request ``num_spec + 1`` draft recurrence into batched
+    tensor ops so it can be captured in the compiled model graph.
+    """
+    _, num_tokens, H, Kdim = q.shape
+    HV, Vdim = v.shape[2], v.shape[3]
+    device = q.device
+    num_seqs = ssm_state_indices.shape[0]
+    spec_len = ssm_state_indices.shape[1]  # num_spec + 1
+
+    starts = cu_seqlens[:-1].long() if num_seqs > 0 else cu_seqlens.new_zeros(0)
+    counts = (cu_seqlens[1:] - cu_seqlens[:-1]).long() if num_seqs > 0 else cu_seqlens.new_zeros(0)
+
+    resume_col = torch.clamp(num_accepted_tokens - 1, min=0).long()
+    row = torch.arange(num_seqs, device=device)
+    resume_slot = ssm_state_indices[row, resume_col]
+    num_slots = initial_state.shape[0]
+    resume_slot = torch.remainder(resume_slot, num_slots)
+
+    h_state = state_index_gather(initial_state, resume_slot, HV, Vdim, Kdim)
+
+    qf = q.reshape(num_tokens, H, Kdim).float()
+    kf = k.reshape(num_tokens, H, Kdim).float()
+    vf = v.reshape(num_tokens, HV, Vdim).float()
+    gf = g.reshape(num_tokens, HV).float()
+    bf = beta.reshape(num_tokens, HV).float()
+    out = torch.empty((num_tokens, HV, Vdim), dtype=torch.float32, device=device)
+
+    for col in range(spec_len):
+        valid = counts > col
+        token_idx = starts + col
+        safe_tok = torch.where(valid, token_idx, torch.zeros_like(token_idx)).clamp(min=0, max=num_tokens - 1)
+
+        qt = qf[safe_tok]
+        kt = kf[safe_tok]
+        vt = vf[safe_tok]
+        gt = gf[safe_tok]
+        bt = bf[safe_tok]
+
+        if use_qk_l2norm_in_kernel:
+            qt = _l2norm_last_dim(qt)
+            kt = _l2norm_last_dim(kt)
+
+        h_state, out_t = _recurrent_timestep_body_vectorized(
+            qt, kt, vt, gt, bt, h_state, scale, HV, H, Kdim)
+
+        # Scatter all rows at once. Each (seq, col) maps to a distinct row
+        # ``starts[seq] + col``; invalid (padding) rows are overwritten with a
+        # meaningless value that is never read, so the boolean-mask scatter
+        # (which dynamo can't trace due to the data-dependent nonzero) is
+        # avoided while keeping the output correct for valid rows.
+        out[token_idx] = out_t
+
+        slot_col = ssm_state_indices[row, col]
+        slot_col_safe = torch.remainder(slot_col, num_slots)
+        state_index_scatter(initial_state, slot_col_safe, h_state, HV, Vdim, Kdim)
+
+    final_state = initial_state
+    out = out.view(1, num_tokens, HV, Vdim)
+    return out, final_state
+
+
+def state_index_gather(state, idx, HV, Vdim, Kdim):
+    safe = torch.remainder(idx, state.shape[0])
+    return state.index_select(0, safe)
+
+
+def state_index_scatter(state, idx, h_state, HV, Vdim, Kdim):
+    safe = torch.remainder(idx, state.shape[0])
+    state.index_copy_(0, safe, h_state)
+
+
+def _recurrent_timestep_body_vectorized(qt, kt, vt, gt, bt, h_state, scale, HV, H, Kdim):
+    qt = qt * scale
+    h_state = h_state * torch.exp(gt).view(-1, HV, 1, 1)
+    proj = torch.sum(h_state * kt.view(-1, H, 1, Kdim), dim=-1)
+    v_new = (vt - proj) * bt.view(-1, HV, 1)
+    h_state = h_state + v_new.unsqueeze(-1) * kt.view(-1, H, 1, Kdim)
+    out_t = torch.sum(h_state * qt.view(-1, H, 1, Kdim), dim=-1)
+    return h_state, out_t
 
 
 def hpu_chunk_gated_delta_rule(
