@@ -69,9 +69,14 @@ class HpuEagleProposer(EagleProposer):
             return draft_token_ids.view(-1, 1)
 
         # [num_tokens, 1]
-        target_positions = target_positions.view(-1)
-        # [batch_size]
-        positions = target_positions[last_token_indices]
+        uses_mrope = bool(getattr(model_runner, 'uses_mrope', False))
+        if uses_mrope:
+            # mrope positions are [3, num_tokens]; keep the 3-row structure.
+            positions = target_positions[:, last_token_indices]  # [3, batch_size]
+        else:
+            target_positions = target_positions.view(-1)
+            # [batch_size]
+            positions = target_positions[last_token_indices]
         if self.method == "mtp":
             hidden_states = target_hidden_states.view(-1, target_hidden_states.shape[-1])
         else:
@@ -88,7 +93,10 @@ class HpuEagleProposer(EagleProposer):
         # Positions used by prepare_attn_metadata needs to be cpu because
         # compile only mode for warmup will not do any real computations
         target_positions_cpu = target_positions.cpu()
-        positions_cpu = target_positions_cpu[last_token_indices.cpu()]
+        if uses_mrope:
+            positions_cpu = target_positions_cpu[:, last_token_indices.cpu()]  # [3, batch_size]
+        else:
+            positions_cpu = target_positions_cpu[last_token_indices.cpu()]
 
         # Decode 1 token each time
         for token_index in range(self.num_speculative_tokens - 1):
@@ -104,12 +112,20 @@ class HpuEagleProposer(EagleProposer):
 
             # Prepare the attn metadata
             positions_cpu += 1
-            attn_metadata = self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu, model_runner)
+            if uses_mrope:
+                # prepare_attn_metadata only needs the text position row.
+                attn_metadata = self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu[0], model_runner)
+            else:
+                attn_metadata = self.prepare_attn_metadata(block_table_cpu_tensor, positions_cpu, model_runner)
 
             # [batch_size, 1]
             input_ids = input_ids.view(-1, 1)
-            # [batch_size, 1]
-            input_positions = clamped_positions.view(-1, 1)
+            if uses_mrope:
+                # [3, batch_size] (rope squeezes a trailing 1 if present)
+                input_positions = clamped_positions
+            else:
+                # [batch_size, 1]
+                input_positions = clamped_positions.view(-1, 1)
             # [batch_size, 1, hidden_size]
             input_hidden_states = hidden_states.view(-1, 1, hidden_states.shape[-1])
             inputs_embeds = None
@@ -191,6 +207,17 @@ class HpuEagleProposer(EagleProposer):
         # which might smaller than the (padded) batch_size
         num_seq = block_table_cpu_tensor.shape[0]
 
+        # The block table may not cover the draft positions when the drafter
+        # proposes multiple tokens (num_spec>1) past the currently allocated
+        # blocks (and warmup exercises a synthetic max-model-len position with a
+        # short block table). Clamp positions to the last slot the block table
+        # covers so we never index out of bounds; for real inference the scheduler
+        # allocates lookahead blocks that do cover the draft positions, so this is
+        # a no-op there. Used for both the block-tables list and the slot mapping.
+        max_avail_pos = block_table_cpu_tensor.shape[1] * block_size
+        clamped_positions = clamped_positions.clamp(max=max_avail_pos - 1)
+        positions = clamped_positions
+
         # Prepare block tables list
         # block_tables_list is a nested list of shape [num_seq, num_blocks]
         # num_blocks should include the slots needed for the current token
@@ -200,6 +227,11 @@ class HpuEagleProposer(EagleProposer):
         block_tables_list = []
         for i, n in enumerate(num_blocks):
             seq_block_table = block_table_cpu_tensor[i, :n].tolist()
+            if len(seq_block_table) != n:
+                print(f"[eagle_dbg] MTP assert fail: seq={i} n_blocks_needed={n} "
+                      f"block_table_avail={len(block_table_cpu_tensor[i])} "
+                      f"positions={positions.tolist()} block_size={block_size} "
+                      f"num_seq={num_seq} bt_shape={tuple(block_table_cpu_tensor.shape)}", flush=True)
             assert len(seq_block_table) == n
             block_tables_list.append(seq_block_table)
         # Needs to be resolved by defragmenter

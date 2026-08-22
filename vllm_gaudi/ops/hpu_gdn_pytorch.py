@@ -950,11 +950,11 @@ def _recurrent_spec_path_vectorized(
 
     h_state = state_index_gather(initial_state, resume_slot, HV, Vdim, Kdim)
 
-    qf = q.reshape(num_tokens, H, Kdim).float()
-    kf = k.reshape(num_tokens, H, Kdim).float()
-    vf = v.reshape(num_tokens, HV, Vdim).float()
-    gf = g.reshape(num_tokens, HV).float()
-    bf = beta.reshape(num_tokens, HV).float()
+    qf = q.reshape(-1, H, Kdim).float()
+    kf = k.reshape(-1, H, Kdim).float()
+    vf = v.reshape(-1, HV, Vdim).float()
+    gf = g.reshape(-1, HV).float()
+    bf = beta.reshape(-1, HV).float()
     out = torch.empty((num_tokens, HV, Vdim), dtype=torch.float32, device=device)
 
     for col in range(spec_len):

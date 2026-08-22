@@ -1489,6 +1489,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = HpuRejectionSampler(self.sampler)
 
+        self._spec_sampling_metadata = None
+        self._spec_sampling_metadata_key = None
+
         # Keep in int64 to avoid overflow with long context
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
@@ -2489,6 +2492,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         sampling_metadata = self.input_batch.make_selective_sampling_metadata(req_id_output_token_ids_lst,
                                                                               skip_copy=not batch_changed)
         return sampling_metadata
+
+    def _get_spec_sampling_metadata(self,
+                                    batch_changed: bool,
+                                    req_ids: list[str],
+                                    pad_to: Optional[int] = None) -> SamplingMetadata:
+        # Build the sampling metadata for a stable spec-decode batch only when the
+        # request set (or batch structure) changes. top_k/top_p/temperature are
+        # per-request constants, so re-slicing and re-building them every step is
+        # pure overhead. Keyed on the request-id set; the sampler caches its own
+        # derived device tensors on the returned object's identity, so reusing the
+        # same object avoids per-step H2D copies too.
+        key = tuple(req_ids)
+        if (getattr(self, '_spec_sampling_metadata', None) is None
+                or getattr(self, '_spec_sampling_metadata_key', None) != key
+                or batch_changed):
+            self._spec_sampling_metadata = self._prepare_sampling(
+                batch_changed, req_ids, pad_to)
+            self._spec_sampling_metadata_key = key
+        return self._spec_sampling_metadata
 
     def get_habana_paged_attn_buffers(self, block_tables, slot_mapping, batch_size, block_size=None):
         block_size = self.attn_block_size if block_size is None else block_size
@@ -4716,8 +4738,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 with self.profiler.record_event('internal', "sampler"):
                     ##### Sampling Start #####
                     spec_decode_metadata = decode_data.spec_decode_metadata
-                    sampler_logits = (logits_device if spec_decode_metadata is None else
-                                      logits_device[spec_decode_metadata.bonus_logits_indices])
                     # pad_to must match the ACTUAL batch of the logits handed
                     # to the sampler. In the spec-decode path that is the number
                     # of bonus-logits rows (one per decode request), not the full
@@ -4725,25 +4745,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # Passing the wrong pad_to sizes the sampling-metadata
                     # temperature to a mismatched batch and dynamo's graph capture
                     # fails on the div_ broadcast during spec decode.
-                    sampler_batch = (logits_device.shape[0] if spec_decode_metadata is None else
-                                     spec_decode_metadata.bonus_logits_indices.numel())
                     if spec_decode_metadata is None:
+                        sampler_logits = logits_device
+                        sampler_batch = logits_device.shape[0]
                         sampler_output, sampling_metadata = self._run_sampling(
                             batch_changed, sampler_logits, pd_info.decode_req_ids, sampler_batch)
                         decode_sampled_token_ids.append(sampler_output.sampled_token_ids.flatten())
                         logprobs_segments.append((list(pd_info.decode_req_ids), sampler_output.logprobs_tensors))
                     else:
+                        sampler_batch = spec_decode_metadata.bonus_logits_indices.numel()
                         # Spec-decode: build the sampling metadata WITHOUT the
                         # redundant bonus-token regular-sampler call. `_run_sampling`
                         # samples the bonus logits then discards the result in this
                         # branch, so the bonus was sampled TWICE per step — two full
                         # 152k top-k/top-p regular-sampler passes on HPU. The
                         # rejection sampler below samples the bonus token itself,
-                        # so we only build metadata here.
-                        htorch.core.mark_step()
-                        sampling_metadata = self._prepare_sampling(
+                        # so we only build metadata here. The metadata (and the
+                        # sampler's derived device tensors) are cached on the
+                        # request set, so a stable decode batch skips the per-step
+                        # metadata build; no mark_step is issued so this overlaps
+                        # the async forward instead of serializing behind it.
+                        sampling_metadata = self._get_spec_sampling_metadata(
                             batch_changed, pd_info.decode_req_ids, sampler_batch)
-                        htorch.core.mark_step()
                         _rj_t0 = time.time()
                         with self.profiler.record_event('internal', "rejection_sampler"):
                             sampler_output = self.rejection_sampler(

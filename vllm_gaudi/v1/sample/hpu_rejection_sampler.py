@@ -176,42 +176,26 @@ def _apply_topk_topp(
 
 
 @torch.compile(**(_COMPILE_ARGS or {}))
-def _rejection_sample_fused(
-    draft_token_ids: torch.Tensor,  # [num_tokens] compacted, request-major
-    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
-    max_spec_len: int,
-    target_logits: torch.Tensor,  # [num_tokens, vocab_size] RAW logits
-    k: torch.Tensor,  # [num_tokens] int64
-    p: Optional[torch.Tensor],  # [num_tokens] or None
+def _sample_bonus(
+    logits: torch.Tensor,  # [batch_size, vocab_size] RAW (temp-scaled) logits
+    k: torch.Tensor,  # [batch_size] int64
+    p: Optional[torch.Tensor],  # [batch_size] or None
     max_k: int,
-    bonus_token_ids: torch.Tensor,  # [batch_size, 1]
-    uniform_probs: torch.Tensor,  # [num_tokens]
-    inv_q: torch.Tensor,  # [batch_size, max_k] Gumbel inv_q over the top-k subset
-    is_greedy: torch.Tensor,  # [batch_size]
+    inv_q: torch.Tensor,  # [batch_size, max_k]
+    is_greedy: torch.Tensor,  # [batch_size] bool
 ) -> torch.Tensor:
-    """Fused top-k/top-p + rejection sampling, operating only on the topk subset.
+    """Sample ONE bonus token per request from the target distribution.
 
-    Replaces the two-step path (``_apply_topk_topp`` materialising a full 152k
-    masked logits tensor, then ``rejection_sample`` softmaxing the full vocab and
-    building a ``[batch, vocab]`` Gumbel ``inv_q``) with a single compiled kernel
-    that runs ``topk(max_k)`` once and does everything on the compact
-    ``[num_tokens, max_k]`` subset: top-p masking, renormalization, greedy/random
-    acceptance, and Gumbel-max recovered-token sampling. Avoids every redundant
-    full-vocab pass. Returns ``[batch_size, max_spec_len + 1]`` int32.
+    The stock path calls the full regular ``Sampler`` (``self.sampler``) which
+    applies top-k/top-p via a full-vocab sort over 152k and samples — ~4.6ms on
+    HPU for a single token. This instead does ``topk(max_k)`` + top-p over the
+    compact subset + a Gumbel-max sample, all in one compiled graph. Greedy
+    requests return the argmax. Returns ``[batch_size]`` int64 token ids.
     """
-    batch_size = cu_num_draft_tokens.shape[0]
-    device = target_logits.device
-    num_tokens = target_logits.shape[0]
-
-    starts = torch.zeros_like(cu_num_draft_tokens)
-    starts[1:] = cu_num_draft_tokens[:-1]
-    counts = cu_num_draft_tokens - starts  # [batch_size]
-
-    # ---- top-k then top-p, all on the compact subset ----
-    vals, idx = target_logits.topk(max_k, dim=-1)  # [num_tokens, max_k] desc
-    pos = torch.arange(max_k, device=device).unsqueeze(0)  # [1, max_k]
-    in_k = pos < k.unsqueeze(-1)  # [num_tokens, max_k]
-    neg_inf = torch.tensor(float('-inf'), device=device)
+    vals, idx = logits.topk(max_k, dim=-1)  # [batch, max_k]
+    pos = torch.arange(max_k, device=logits.device).unsqueeze(0)  # [1, max_k]
+    in_k = pos < k.unsqueeze(-1)
+    neg_inf = torch.tensor(float('-inf'), device=logits.device)
     probs = torch.where(in_k, vals, neg_inf).softmax(dim=-1)
     if p is not None:
         cum = probs.cumsum(dim=-1)
@@ -221,15 +205,65 @@ def _rejection_sample_fused(
     keep = keep | (~keep.any(dim=-1, keepdim=True))
     probs = torch.where(keep, probs, torch.zeros_like(probs))
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    greedy_k = probs.argmax(dim=-1)
+    random_k = (probs * inv_q).argmax(dim=-1)
+    chosen_k = torch.where(is_greedy, greedy_k, random_k)
+    return idx.gather(-1, chosen_k.unsqueeze(-1)).squeeze(-1)  # [batch]
 
-    # ---- reshape to the fixed [batch, max_spec_len] grid ----
+
+@torch.compile(**(_COMPILE_ARGS or {}))
+def _rejection_sample_fused(
+    draft_token_ids: torch.Tensor,  # [num_tokens] compacted, request-major
+    cu_num_draft_tokens: torch.Tensor,  # [batch_size]
+    max_spec_len: int,
+    target_logits: torch.Tensor,  # [num_tokens, vocab_size] RAW (temp-scaled) logits
+    k: torch.Tensor,  # [batch_size] int64, PER-REQUEST (not expanded)
+    p: Optional[torch.Tensor],  # [batch_size] or None, PER-REQUEST
+    max_k: int,
+    bonus_logits: torch.Tensor,  # [batch_size, vocab_size] RAW (temp-scaled) logits
+    uniform_probs: torch.Tensor,  # [num_tokens]
+    inv_q: torch.Tensor,  # [batch_size, max_k] Gumbel inv_q over the top-k subset
+    is_greedy: torch.Tensor,  # [batch_size]
+) -> torch.Tensor:
+    """Fused top-k/top-p + rejection sampling + bonus sample in ONE graph.
+
+    The uniform grid is ``num_tokens == batch_size * max_spec_len`` (request-major),
+    so ``k``/``p`` are passed per-request and broadcast onto the grid inside the
+    kernel — no ``expand_batch_to_tokens`` / repeat_interleave on the host, and no
+    device read of ``top_k.max()``. The bonus token is sampled in-graph from
+    ``bonus_logits`` (topk/topp/Gumbel), so there is only ONE compiled graph and no
+    separate sampler call. Returns ``[batch_size, max_spec_len + 1]`` int32.
+    """
+    batch_size = cu_num_draft_tokens.shape[0]
+    device = target_logits.device
+
+    starts = torch.zeros_like(cu_num_draft_tokens)
+    starts[1:] = cu_num_draft_tokens[:-1]
+    counts = cu_num_draft_tokens - starts  # [batch_size]
+
+    # ---- target top-k then top-p, in the [b, max_spec_len] grid space ----
+    tgt = target_logits.view(batch_size, max_spec_len, -1)  # [b, ns, vocab]
+    vals, idx = tgt.topk(max_k, dim=-1)  # [b, ns, max_k] desc
+    pos = torch.arange(max_k, device=device).view(1, 1, max_k)  # [1, 1, max_k]
+    in_k = pos < k.unsqueeze(1).unsqueeze(-1)  # k [b,1,1] -> [b,1,max_k]
+    neg_inf = torch.tensor(float('-inf'), device=device)
+    probs = torch.where(in_k, vals, neg_inf).softmax(dim=-1)
+    if p is not None:
+        cum = probs.cumsum(dim=-1)
+        keep = (cum > (1.0 - p).unsqueeze(1).unsqueeze(-1)) & in_k
+    else:
+        keep = in_k
+    keep = keep | (~keep.any(dim=-1, keepdim=True))
+    probs = torch.where(keep, probs, torch.zeros_like(probs))
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    tgt_g = probs  # [b, ns, max_k]
+    idx_g = idx
+
     draft_ids = draft_token_ids.view(batch_size, max_spec_len)  # [b, ns]
-    tgt_g = probs.view(batch_size, max_spec_len, max_k)  # [b, ns, max_k]
-    idx_g = idx.view(batch_size, max_spec_len, max_k)  # [b, ns, max_k]
     uniform_g = uniform_probs.view(batch_size, max_spec_len)  # [b, ns]
 
     # ---- target probability of the drafted token ----
-    draft_idx = draft_ids.clamp(min=0, max=target_logits.shape[-1] - 1)
+    draft_idx = draft_ids.clamp(min=0, max=tgt.shape[-1] - 1)
     match = idx_g == draft_idx.unsqueeze(-1)  # [b, ns, max_k]
     target_prob = (tgt_g * match).sum(dim=-1)  # [b, ns]
 
@@ -265,9 +299,26 @@ def _rejection_sample_fused(
                         dtype=torch.int32, device=device)
     output[:, :max_spec_len] = torch.where(keep_mask, chosen_pad, output[:, :max_spec_len])
 
+    # ---- bonus token sampled in-graph from bonus_logits ----
+    b_vals, b_idx = bonus_logits.topk(max_k, dim=-1)  # [batch, max_k]
+    b_pos = torch.arange(max_k, device=device).unsqueeze(0)
+    b_in_k = b_pos < k.unsqueeze(-1)  # [batch, max_k]
+    b_probs = torch.where(b_in_k, b_vals, neg_inf).softmax(dim=-1)
+    if p is not None:
+        b_cum = b_probs.cumsum(dim=-1)
+        b_keep = (b_cum > (1.0 - p).unsqueeze(-1)) & b_in_k
+    else:
+        b_keep = b_in_k
+    b_keep = b_keep | (~b_keep.any(dim=-1, keepdim=True))
+    b_probs = torch.where(b_keep, b_probs, torch.zeros_like(b_probs))
+    b_probs = b_probs / b_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    b_greedy_k = b_probs.argmax(dim=-1)
+    b_random_k = (b_probs * inv_q).argmax(dim=-1)
+    b_chosen_k = torch.where(is_greedy, b_greedy_k, b_random_k)
+    bonus_vals = b_idx.gather(-1, b_chosen_k.unsqueeze(-1)).squeeze(-1).to(torch.int32)  # [batch]
+
     all_accepted = ~mismatches.any(dim=1)
     bonus_pos = counts.clamp(max=max_spec_len).long()
-    bonus_vals = bonus_token_ids[:, 0]
     output[torch.arange(batch_size, device=device), bonus_pos] = torch.where(
         all_accepted, bonus_vals, torch.full_like(bonus_vals, PLACEHOLDER_TOKEN_ID))
 
@@ -366,13 +417,19 @@ def rejection_sample_fused(
     max_spec_len: int,
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
     target_logits: torch.Tensor,  # [num_tokens, vocab_size] RAW (temp-scaled) logits
-    k: torch.Tensor,  # [num_tokens] int64
-    p: Optional[torch.Tensor],  # [num_tokens] or None
+    k: torch.Tensor,  # [batch_size] int64, PER-REQUEST
+    p: Optional[torch.Tensor],  # [batch_size] or None, PER-REQUEST
     max_k: int,
-    bonus_token_ids: torch.Tensor,  # [batch_size, 1]
+    bonus_logits: torch.Tensor,  # [batch_size, vocab_size] RAW (temp-scaled) logits
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
-    """Host wrapper for the fused top-k/top-p + rejection-sampling kernel."""
+    """Host wrapper for the fully-fused rejection-sampling + bonus kernel.
+
+    ``k``/``p`` are per-request (``[batch_size]``); the kernel broadcasts them onto
+    the ``[batch, max_spec_len]`` grid. ``bonus_logits`` is passed raw so the bonus
+    token is sampled in the same compiled graph — no separate sampler, no expand,
+    no host device reads.
+    """
     device = target_logits.device
     batch_size = len(num_draft_tokens)
     num_tokens = draft_token_ids.shape[0]
@@ -397,7 +454,7 @@ def rejection_sample_fused(
 
     output = _rejection_sample_fused(
         draft_token_ids, cu, max_spec_len, target_logits, k, p, max_k,
-        bonus_token_ids, uniform_probs, inv_q, is_greedy)
+        bonus_logits, uniform_probs, inv_q, is_greedy)
     return output.to(torch.int32)
 
 
@@ -413,6 +470,41 @@ class HpuRejectionSampler(rejection_sampler.RejectionSampler):
     stock implementation for every other case (logprobs, constraints, etc.).
     """
 
+    # Cached per-request sampling-constraint params and their device tensors.
+    # Keyed on the SamplingMetadata object identity: the model runner rebuilds
+    # the metadata only when the request set changes, so for a stable decode
+    # batch we skip re-slicing the per-request top_k/top_p/temperature and the
+    # H2D copies every step. The cache is keyed on the object id (not just the
+    # batch size) so a request change at the same batch size is picked up.
+    _md_id: int = -1
+    _has_topk: bool = False
+    _has_topp: bool = False
+    _max_top_k: int = 0
+    _k_device: Optional[torch.Tensor] = None
+    _p_device: Optional[torch.Tensor] = None
+    _temp_safe_device: Optional[torch.Tensor] = None
+
+    def _refresh_constraint_cache(self, sampling_metadata, batch_size, device) -> None:
+        if self._md_id == id(sampling_metadata):
+            return
+        self._md_id = id(sampling_metadata)
+        # top_k <= 0 (e.g. -1) and top_p >= 1.0 mean "no constraint".
+        top_k = sampling_metadata.top_k
+        top_p = sampling_metadata.top_p
+        self._has_topk = top_k is not None and int(top_k.max()) > 0
+        self._has_topp = top_p is not None and float(top_p.min()) < 1.0
+        self._max_top_k = int(top_k.max()) if (top_k is not None and self._has_topk) else 0
+        self._k_device = (top_k[:batch_size].to(device, dtype=torch.int64)
+                          if self._has_topk else None)
+        self._p_device = (top_p[:batch_size].to(device) if self._has_topp else None)
+        temp = sampling_metadata.temperature
+        if temp is None or sampling_metadata.all_greedy:
+            self._temp_safe_device = torch.ones(batch_size, dtype=torch.float32, device=device)
+        else:
+            temp_f = temp[:batch_size].float().to(device)
+            self._temp_safe_device = torch.where(
+                temp_f == GREEDY_TEMPERATURE, torch.ones_like(temp_f), temp_f)
+
     def __call__(
         self,
         metadata,
@@ -420,19 +512,20 @@ class HpuRejectionSampler(rejection_sampler.RejectionSampler):
         logits,
         sampling_metadata,
     ) -> SamplerOutput:
-        # top_k <= 0 (e.g. -1) and top_p >= 1.0 mean "no constraint".
-        top_k = sampling_metadata.top_k
-        top_p = sampling_metadata.top_p
-        has_topk = top_k is not None and int(top_k.max()) > 0
-        has_topp = top_p is not None and float(top_p.min()) < 1.0
+        batch_size = len(metadata.num_draft_tokens)
+        device = logits.device
+        self._refresh_constraint_cache(sampling_metadata, batch_size, device)
+        has_topk = self._has_topk
+        has_topp = self._has_topp
+        max_k = self._max_top_k
         has_processors = (
             not sampling_metadata.no_penalties
             or bool(sampling_metadata.bad_words_token_ids)
             or sampling_metadata.allowed_token_ids_mask is not None
         )
         if os.environ.get("FASTQWEN_STEP_TIMING") == "1":
-            print(f"[step_timing]   top_k={top_k} top_p={top_p} topk={has_topk} "
-                  f"topp={has_topp} no_penalties={sampling_metadata.no_penalties}",
+            print(f"[step_timing]   topk={has_topk} max_k={max_k} topp={has_topp} "
+                  f"no_penalties={sampling_metadata.no_penalties}",
                   flush=True)
         # Stock fallback: logits processors, logprobs, or top-p-only (no fast
         # top-p kernel without an accompanying top-k).
@@ -456,66 +549,50 @@ class HpuRejectionSampler(rejection_sampler.RejectionSampler):
             print(f"[step_timing]     rs_call[enter]={1000*(_now-_t0):.2f}ms", flush=True)
             _t0 = _now
 
-        # Bonus token via the regular sampler (no logprobs needed).
-        _bn_t0 = time.time() if _T else None
-        bonus_logits = logits[metadata.bonus_logits_indices]
-        bonus_out = self.sampler(
-            logits=bonus_logits,
-            sampling_metadata=replace(sampling_metadata, max_num_logprobs=-1),
-            predict_bonus_token=True,
-        )
-        bonus_token_ids = bonus_out.sampled_token_ids
+        # Target + bonus logits (raw, temp-scaled later). The fully-fused kernel
+        # samples the bonus token in-graph, so no separate sampler call. When all
+        # requests draft the same number of tokens (MTP), the model logits are
+        # already laid out as [batch, num_spec+1, vocab]; extract via views instead
+        # of an advanced-indexing gather over the 152k vocab (slow on HPU).
+        num_spec = metadata.max_spec_len
+        uniform_spec = (num_spec > 0 and logits.numel() > 0
+                        and all(n == num_spec for n in metadata.num_draft_tokens)
+                        and logits.shape[0] == batch_size * (num_spec + 1))
+        target_3d = None
+        if uniform_spec:
+            logits3d = logits.view(batch_size, num_spec + 1, logits.shape[-1])
+            target_3d = logits3d[:, :num_spec, :].float()  # [batch, num_spec, vocab]
+            bonus_logits = logits3d[:, num_spec, :]
+        else:
+            bonus_logits = logits[metadata.bonus_logits_indices]  # [batch, vocab]
+            target_logits = logits[metadata.target_logits_indices].float()
         if _T:
             torch.hpu.synchronize()
             _now = time.time()
-            print(f"[step_timing]     rs_call[bonus]={1000*(_now-_t0):.2f}ms "
-                  f"bonus_synced={1000*(_now-_bn_t0):.2f}ms", flush=True)
+            print(f"[step_timing]     rs_call[gather]={1000*(_now-_t0):.2f}ms", flush=True)
             _t0 = _now
 
-        target_logits = logits[metadata.target_logits_indices].float()
-        if _T:
-            torch.hpu.synchronize()
-            _now = time.time()
-            print(f"[step_timing]     rs_call[gather]={1000*(_now-_t0):.2f}ms "
-                  f"gather_synced={1000*(_now-_bn_t0):.2f}ms", flush=True)
-            _tk_t0 = _now
-            _t0 = _now
+        if has_topk:
+            # Temperature scale both bonus + target logits (greedy -> 1). top-k is
+            # order-invariant to temperature but the acceptance/recovered/bonus
+            # probabilities are temperature-dependent, so scale before the kernel.
+            if not sampling_metadata.all_greedy:
+                temp_safe = self._temp_safe_device
+                bonus_logits = bonus_logits / temp_safe.unsqueeze(-1)
+                if target_3d is not None:
+                    target_3d = target_3d / temp_safe.view(batch_size, 1, 1)
+                else:
+                    # Non-uniform drafts: target_logits is request-major with
+                    # ``num_spec`` slots per request (short rows padded via the
+                    # -1 indices). Repeat each request's temp over its slots.
+                    slots = target_logits.shape[0] // batch_size
+                    temp_safe_tok = temp_safe.repeat_interleave(slots).view(-1, 1)
+                    target_logits = target_logits / temp_safe_tok
+            if target_3d is not None:
+                target_logits = target_3d.reshape(-1, logits.shape[-1])
 
-        # Temperature scaling (greedy -> 1), applied per request. The compacted
-        # target rows are request-major with max_spec_len==1, so row i is request i.
-        fused_args = None
-        if not sampling_metadata.all_greedy:
-            temp = sampling_metadata.temperature
-            if temp is not None:
-                temp_f = temp[:batch_size].float().to(device)
-                temp_safe = torch.where(temp_f == rejection_sampler.GREEDY_TEMPERATURE,
-                                        torch.ones_like(temp_f), temp_f)
-                target_logits = target_logits / temp_safe.unsqueeze(-1)
-
-            if has_topk:
-                # Fused path: pass raw (temp-scaled) logits + k/p to the fused
-                # top-k/top-p rejection kernel; it never materialises the full
-                # vocab. Resolve the expand helper at call time so the HPU patch
-                # (which replaces the triton kernel with a pure-PyTorch version)
-                # is honored.
-                num_tokens = target_logits.shape[0]
-                cu = metadata.cu_num_draft_tokens
-                expand = rejection_sampler.expand_batch_to_tokens
-                tk = expand(top_k, cu, num_tokens).to(device, dtype=torch.int64)
-                tp = None
-                if has_topp:
-                    tp = expand(top_p, cu, num_tokens).to(device)
-                max_k = int(top_k.max())
-                fused_args = (tk, tp, max_k)
-                if _T:
-                    torch.hpu.synchronize()
-                    _now = time.time()
-                    print(f"[step_timing]     rs_call[topk_prep]={1000*(_now-_t0):.2f}ms "
-                          f"topk_prep_synced={1000*(_now-_tk_t0):.2f}ms", flush=True)
-                    _t0 = _now
-
-        if fused_args is not None:
-            tk, tp, max_k = fused_args
+            # Per-request k/p: cached on-device tensors, broadcast onto the grid
+            # inside the kernel (no expand_batch_to_tokens / repeat_interleave).
             _fj_t0 = time.time() if _T else None
             output_token_ids = rejection_sample_fused(
                 metadata.draft_token_ids,
@@ -523,10 +600,10 @@ class HpuRejectionSampler(rejection_sampler.RejectionSampler):
                 metadata.max_spec_len,
                 metadata.cu_num_draft_tokens,
                 target_logits,
-                tk,
-                tp,
+                self._k_device,
+                self._p_device,
                 max_k,
-                bonus_token_ids,
+                bonus_logits,
                 sampling_metadata,
             )
             if _T:
@@ -536,6 +613,20 @@ class HpuRejectionSampler(rejection_sampler.RejectionSampler):
                       f"fused_synced={1000*(_now-_fj_t0):.2f}ms", flush=True)
                 _t0 = _now
         else:
+            # No-constraint path (rare): bonus via the regular sampler + rejection.
+            bonus_out = self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=replace(sampling_metadata, max_num_logprobs=-1),
+                predict_bonus_token=True,
+            )
+            bonus_token_ids = bonus_out.sampled_token_ids
+            if not sampling_metadata.all_greedy:
+                temp = sampling_metadata.temperature
+                if temp is not None:
+                    temp_f = temp[:batch_size].float().to(device)
+                    temp_safe = torch.where(temp_f == rejection_sampler.GREEDY_TEMPERATURE,
+                                            torch.ones_like(temp_f), temp_f)
+                    target_logits = target_logits / temp_safe.unsqueeze(-1)
             output_token_ids = rejection_sample(
                 metadata.draft_token_ids,
                 metadata.num_draft_tokens,
