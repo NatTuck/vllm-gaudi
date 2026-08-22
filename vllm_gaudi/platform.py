@@ -63,7 +63,9 @@ class HpuPlatform(Platform):
     dispatch_key: str = "HPU"
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
-    supported_quantization: list[str] = ["compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt"]
+    supported_quantization: list[str] = [
+        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4"
+    ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
 
@@ -239,6 +241,9 @@ class HpuPlatform(Platform):
         if get_config().VLLM_CONTIGUOUS_PA:
             logger.warning("Using Contiguous PA, disabling prefix caching")
             vllm_config.cache_config.enable_prefix_caching = False
+            if vllm_config.model_config.get_sliding_window():
+                logger.info("Contiguous paged attention is enabled; sliding-window layers "
+                            "will use indexed KV-cache fetches.")
 
         if (vllm_config.cache_config.enable_prefix_caching and vllm_config.cache_config.mamba_cache_mode == "all"):
             vllm_config.cache_config.mamba_cache_mode = "align"
