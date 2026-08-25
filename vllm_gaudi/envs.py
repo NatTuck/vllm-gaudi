@@ -17,6 +17,13 @@ if TYPE_CHECKING:
     VLLM_MINIMAX_M3_MOE_DECODE_GATHER: bool = True
     VLLM_MINIMAX_M3_MOE_GATHER_MAX_TOKENS: int = 16
     VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY: bool = False
+    VLLM_HPU_MOE_GATHER: bool = False
+    VLLM_HPU_MOE_GATHER_MAX_TP: int = 320
+    VLLM_HPU_MOE_GATHER_VERIFY: bool = False
+    VLLM_HPU_MOE_GATHER_VERIFY_DIR: Optional[str] = None
+    VLLM_HPU_MOE_GATHER_VERIFY_LAYERS: int = 40
+    VLLM_HPU_FUSED_ROUTER: bool = False
+    VLLM_HPU_FUSED_ROUTER_LIB: Optional[str] = None
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -87,6 +94,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # data-dependent output shapes that must be materialized during warmup.
     "VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY":
     lambda: os.environ.get("VLLM_MM_WARMUP_OUTSIDE_COMPILE_ONLY", "false").strip().lower() in ("1", "true"),
+
+    # EXPERIMENTAL custom MoE combine (gathered-expert pure-PyTorch path),
+    # gated on tokens*topk <= VLLM_HPU_MOE_GATHER_MAX_TP.
+    "VLLM_HPU_MOE_GATHER":
+    lambda: os.environ.get("VLLM_HPU_MOE_GATHER", "0").lower() in ("1", "true"),
+    "VLLM_HPU_MOE_GATHER_MAX_TP":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_GATHER_MAX_TP", "320")),
+    "VLLM_HPU_MOE_GATHER_VERIFY":
+    lambda: os.environ.get("VLLM_HPU_MOE_GATHER_VERIFY", "0").lower() in ("1", "true"),
+    "VLLM_HPU_MOE_GATHER_VERIFY_DIR":
+    lambda: os.environ.get("VLLM_HPU_MOE_GATHER_VERIFY_DIR", None),
+    "VLLM_HPU_MOE_GATHER_VERIFY_LAYERS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_GATHER_VERIFY_LAYERS", "40")),
+
+    # EXPERIMENTAL fused MoE router via the out-of-tree `router_select` custom
+    # TPC op. VLLM_HPU_FUSED_ROUTER_LIB names the op .so; if unset the op fails
+    # to load.
+    "VLLM_HPU_FUSED_ROUTER":
+    lambda: os.environ.get("VLLM_HPU_FUSED_ROUTER", "0").lower() in ("1", "true"),
+    "VLLM_HPU_FUSED_ROUTER_LIB":
+    lambda: os.environ.get("VLLM_HPU_FUSED_ROUTER_LIB", None),
 }
 
 # end-env-vars-definition

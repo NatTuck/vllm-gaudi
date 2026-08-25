@@ -29,7 +29,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
 # import/load inside apply_monolithic forced a dynamo graph break (the custom op
 # ran eagerly -> ~38k kernel instantiations -> slower). With this, apply_monolithic
 # calls the op directly and it is captured into the compiled layer region.
-_HPU_ROUTER_FUSED = bool(os.environ.get("HPU_ROUTER_FUSED"))
+_HPU_ROUTER_FUSED = envs.VLLM_HPU_FUSED_ROUTER
 if _HPU_ROUTER_FUSED:
     from vllm_gaudi.ops.hpu_fused_router import _router_select_op  # noqa: E402  (loads op lib)
 else:
@@ -37,17 +37,18 @@ else:
 
 # EXPERIMENTAL custom MoE combine: replace the Habana mixture_of_experts op
 # (fixed ~47-kernel/layer `router_stage1_i32` pipeline) with a pure-PyTorch
-# gathered-expert path. Default stock. `HPU_MOE_GATHER_VERIFY=1` runs BOTH the
-# custom path and the Habana op on the same inputs and records FP8-ULP per layer
-# (see experiments/moe_combine/).
-_HPU_MOE_GATHER = bool(os.environ.get("HPU_MOE_GATHER"))
-_HPU_MOE_GATHER_VERIFY = bool(os.environ.get("HPU_MOE_GATHER_VERIFY"))
+# gathered-expert path. Default stock. `VLLM_HPU_MOE_GATHER_VERIFY=1` (with
+# VLLM_HPU_MOE_GATHER=1) runs BOTH the custom path and the Habana op on the
+# same inputs and records FP8-ULP per layer (see experiments/moe_combine/).
+_HPU_MOE_GATHER = envs.VLLM_HPU_MOE_GATHER
+# Only meaningful together with the gather path.
+_HPU_MOE_GATHER_VERIFY = envs.VLLM_HPU_MOE_GATHER_VERIFY and _HPU_MOE_GATHER
 # Max tokens*topk (== gathered-expert count g) for which the custom gather path
 # is used. The gathered pure-PyTorch path wins below ~g=64 and LOSES to the stock
 # fused op once g approaches E (the dense gather + fp32 bmm path is slower than
 # the Habana op). Measured crossover for Qwen3.6-35B-A3B (E=256, K=8): custom
 # wins at T<=8 (g<=64), loses at T=16 (g=128). Default 64 keeps the win regime.
-_HPU_MOE_GATHER_MAX_TP = int(os.environ.get("HPU_MOE_GATHER_MAX_TP", "64"))
+_HPU_MOE_GATHER_MAX_TP = envs.VLLM_HPU_MOE_GATHER_MAX_TP
 if _HPU_MOE_GATHER:
     try:
         from experiments.moe_combine.moe_combine import gather_silu_fp8_moe  # noqa: E402
@@ -61,8 +62,8 @@ if _HPU_MOE_GATHER:
 else:
     gather_silu_fp8_moe = None
 
-_HPU_MOE_GATHER_VERIFY_DIR = os.environ.get("HPU_MOE_GATHER_VERIFY_DIR")
-_HPU_MOE_GATHER_VERIFY_LAYERS = int(os.environ.get("HPU_MOE_GATHER_VERIFY_LAYERS", "40"))
+_HPU_MOE_GATHER_VERIFY_DIR = envs.VLLM_HPU_MOE_GATHER_VERIFY_DIR
+_HPU_MOE_GATHER_VERIFY_LAYERS = envs.VLLM_HPU_MOE_GATHER_VERIFY_LAYERS
 
 
 def _verify_rank() -> int:
@@ -93,7 +94,7 @@ _VERIFY_CNT: dict[tuple[int, int], int] = {}
 def _record_moe_combine_ulp(stock, custom, topk_ids):
     """Save (stock, custom) output pairs for offline FP8-ULP comparison.
 
-    Only called in verify mode (HPU_MOE_GATHER_VERIFY=1). The outputs are tiny
+    Only called in verify mode (VLLM_HPU_MOE_GATHER_VERIFY=1). The outputs are tiny
     ([T,H] bf16), so torch.save here is cheap; the dynamo graph-break it causes
     is acceptable for a validation run. All env values are module-level constants
     so the non-verify compiled path stays fully specializable. Filenames are
@@ -106,7 +107,13 @@ def _record_moe_combine_ulp(stock, custom, topk_ids):
     _k = (_n, _r)
     _c = _VERIFY_CNT.get(_k, 0)
     if _c < _HPU_MOE_GATHER_VERIFY_LAYERS:
-        os.makedirs(_HPU_MOE_GATHER_VERIFY_DIR, exist_ok=True)
+        if not os.path.isdir(_HPU_MOE_GATHER_VERIFY_DIR):
+            try:
+                os.makedirs(_HPU_MOE_GATHER_VERIFY_DIR, exist_ok=True)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to create MoE-gather verify output directory: "
+                    f"{_HPU_MOE_GATHER_VERIFY_DIR}") from e
         torch.save({"stock": stock.detach().cpu(), "custom": custom.detach().cpu(),
                     "T": _n, "rank": _r},
                    os.path.join(_HPU_MOE_GATHER_VERIFY_DIR, f"moecomb_T{_n}_n{_c}_r{_r}.pt"))
