@@ -64,7 +64,8 @@ class HpuPlatform(Platform):
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
     supported_quantization: list[str] = [
-        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4"
+        "compressed-tensors", "fp8", "inc", "awq_hpu", "gptq_hpu", "modelopt", "gpt_oss_mxfp4",
+        "deepseek_v4_fp8"
     ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
@@ -109,6 +110,9 @@ class HpuPlatform(Platform):
         Set the device for the current platform.
         """
         return
+
+    def is_hpu(self) -> bool:
+        return True
 
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:

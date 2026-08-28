@@ -81,10 +81,28 @@ def register_utils():
     import vllm_gaudi.utils  # noqa: F401
 
     vllm_gaudi.utils.patch_nixl_utils_for_hpu()
-    # Install the in-process EngineCore reconfigure hook only when
-    # multi-model mode is requested, to avoid heavy imports for all users.
+
+    # Install the load_and_decode per-rank snapshot capture/restore hook into
+    # the worker load_model when the FASTQWEN_* env vars are set (fast
+    # model-load iteration tool). Idempotent; no-op when unset.
     import os
 
+    if os.environ.get("FASTQWEN_RESTORE_SNAPSHOT") == "1" or os.environ.get(
+        "FASTQWEN_CAPTURE_SNAPSHOT"
+    ) == "1":
+        try:
+            from load_and_decode.worker_restore import install as _lad_install
+
+            _lad_install()
+        except Exception as e:  # pragma: no cover
+            from vllm.logger import init_logger
+
+            init_logger("vllm_gaudi").warning(
+                "load_and_decode worker snapshot hook not installed: %s", e
+            )
+
+    # Install the in-process EngineCore reconfigure hook only when
+    # multi-model mode is requested, to avoid heavy imports for all users.
     if os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG"):
         from vllm_gaudi.v1.engine.core_patch import install_engine_core_patch
 

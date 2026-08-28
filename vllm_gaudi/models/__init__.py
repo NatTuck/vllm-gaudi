@@ -63,6 +63,13 @@ def register_model():
     from vllm_gaudi.models.deepseek_ocr import HpuDeepseekOCRForCausalLM  # noqa: F401
     ModelRegistry.register_model("DeepseekOCRForCausalLM", "vllm_gaudi.models.deepseek_ocr:HpuDeepseekOCRForCausalLM")
 
+    # DeepSeek V4 (incl. GLM flash): override the architecture with the HPU
+    # implementation. Importing the module also installs the HPU MoE forward
+    # override (see deepseek_v4.py), so this must stay a side-effectful import.
+    import vllm_gaudi.models.deepseek_v4  # noqa: F401
+    ModelRegistry.register_model("DeepseekV4ForCausalLM",
+                                 "vllm_gaudi.models.deepseek_v4:DeepseekV4ForCausalLM")
+
     # Upstream vLLM migrated GPTBigCode/Starcoder2 to the Transformers modeling
     # backend, which does not trace cleanly under HPU warmup/bucketing. Register
     # the vendored native implementations so these architectures keep working on

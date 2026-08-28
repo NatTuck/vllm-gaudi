@@ -12,7 +12,8 @@ from vllm.model_executor.layers.quantization.fp8 import (Fp8LinearMethod as Orig
 import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
 from vllm_gaudi.extension.runtime import get_config
-from vllm_gaudi.ops.hpu_fused_moe import (_normalize_moe_activation, model_has_quant_config, select_experts_from_routed)
+from vllm_gaudi.ops.hpu_fused_moe import (hpu_route_topk, _normalize_moe_activation, model_has_quant_config,
+                                          select_experts_from_routed)
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
 from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
@@ -221,14 +222,9 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         is_sequence_parallel = layer.moe_config.is_sequence_parallel
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-            topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
-        else:
-            import torch.nn.functional as F
-            topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
-            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_weights, topk_ids = hpu_route_topk(
+            layer, x, router_logits, getattr(self, "model_type", None)
+        )
 
         # The HPU mixture_of_experts kernel (including the chunked
         # weighted_sum_reduction_bf16 reduction) compiles for int64 routing

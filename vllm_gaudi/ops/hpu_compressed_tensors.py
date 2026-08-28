@@ -57,6 +57,7 @@ from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8, VllmMixtureOfEx
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.ops.hpu_fused_moe import (
     _normalize_moe_activation,
+    hpu_route_topk,
     select_experts_from_routed,
 )
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_tensor
@@ -539,14 +540,9 @@ class HPUCompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
     ) -> torch.Tensor:
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-            topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
-        else:
-            import torch.nn.functional as F
-            topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
-            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_weights, topk_ids = hpu_route_topk(
+            layer, x, router_logits, getattr(self, "model_type", None)
+        )
 
         if layer.moe_config.is_sequence_parallel:
             # Sequence-parallel MoE without data parallelism (TP>1 + EP with the
@@ -994,14 +990,9 @@ class HPUCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
 
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-            topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
-        else:
-            import torch.nn.functional as F
-            topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
-            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_weights, topk_ids = hpu_route_topk(
+            layer, x, router_logits, getattr(self, "model_type", None)
+        )
         topk_ids = topk_ids.view(*x.shape[:-1], -1)
         topk_weights = topk_weights.view(*x.shape[:-1], -1)
 

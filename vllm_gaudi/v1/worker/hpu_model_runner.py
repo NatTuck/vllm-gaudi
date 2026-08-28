@@ -1772,6 +1772,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     dtype=self.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                 )
+            elif isinstance(attn_module, AttentionLayerBase):
+                # DeepSeek V4 attention registers in the static forward context
+                # but is neither Attention nor MLAAttention. Emit ONE spec per
+                # DSV4 attention layer (its own get_kv_cache_spec) so the HPU
+                # worker allocates a normal KV cache; skip the SWA / indexer /
+                # compressor caches, which the dense-MLA fallback does not use
+                # and which would collide on the same layer index in bind_kv_cache.
+                from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+
+                if isinstance(attn_module, DeepseekV4Attention):
+                    spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                    if spec is not None:
+                        kv_cache_spec[layer_name] = spec
+                continue
 
         return kv_cache_spec
 
@@ -6219,7 +6233,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                               self.vllm_config.model_config.logits_processors),
             )
 
-        if not self.is_pooling_model:
+        if not self.is_pooling_model and self.kv_caches:
             self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
         # Profiling
         prompt_profile_cfg, decode_profile_cfg = self._read_profiling_cfg()
@@ -6337,7 +6351,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # NOTE(kzawora): This is a nasty workaround - for whatever cache_utils-related reason,
         # reusing defragmenter used in warmup causes accuracy drops, which is why we re-create
         # and re-initialize it.
-        if not self.is_pooling_model:
+        if not self.is_pooling_model and self.kv_caches:
             self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
 
     def shutdown_inc(self, suppress=suppress, finalize_calibration=finalize_calibration):

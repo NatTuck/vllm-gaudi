@@ -20,6 +20,7 @@ from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpMXFP4
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.ops.hpu_fused_moe import (
     _normalize_moe_activation,
+    hpu_route_topk,
     select_experts_from_routed,
 )
 from vllm_gaudi.v1.worker.hpu_dp_utils import (
@@ -114,19 +115,9 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
 
-        if self.model_type == "gpt_oss":
-            topk_weights, topk_ids = torch.topk(router_logits, layer.top_k, dim=-1)
-            topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32)
-        else:
-            if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-                # `RoutedExperts` no longer owns a `.router` (upstream PR #41184
-                # moved it onto `MoERunner`); route via the shared helper that
-                # reproduces upstream's select_experts from the layer's params.
-                topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
-            else:
-                topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-                topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
-                topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights, topk_ids = hpu_route_topk(
+            layer, x, router_logits, getattr(self, "model_type", None)
+        )
         topk_weights = topk_weights.to(x.dtype)
 
         if not (layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None):

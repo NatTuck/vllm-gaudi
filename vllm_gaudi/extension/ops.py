@@ -1033,6 +1033,29 @@ def gaudi_weight_wrapper(weight_loader):
     """Wrapper for Gaudi weight conversion."""
 
     def wrapper(*args, **kwargs):
+        in_kwargs = "loaded_weight" in kwargs
+        if in_kwargs:
+            loaded_weight = kwargs["loaded_weight"]
+        else:
+            loaded_weight = args[1]
+        # HPU cannot copy_ the float8_e8m0fnu (e8m0) scale dtype. The block-fp8
+        # scale params on HPU are float32 (DeepSeek V4 expert_dtype=fp8), so
+        # decode the e8m0 byte to its float32 value up front, matching what the
+        # CUDA copy_ would do.
+        if loaded_weight.dtype == torch.float8_e8m0fnu:
+            loaded_weight = loaded_weight.float()
+            if in_kwargs:
+                kwargs["loaded_weight"] = loaded_weight
+            else:
+                args = (args[0], loaded_weight) + args[2:]
+            return weight_loader(*args, **kwargs)
+        if loaded_weight.dtype == torch.uint8:
+            # DeepSeek V4 expert block scales are stored as raw e8m0 exponent
+            # bytes (the custom nvidia load_weights views them as uint8 to
+            # preserve the bytes for its NVIDIA path). Decode byte -> power-of-2
+            # so the scale is a real value; scale_adjustment's *2.0 below then
+            # applies correctly (weights were *0.5'd, so scales must *2.0).
+            loaded_weight = torch.pow(2.0, loaded_weight.float() - 127.0)
         if get_config().scale_adjustment:
             # loaded_weight may be passed positionally (args[1]) or as a
             # keyword. Upstream FusedMoE (vllm#47197) now calls
@@ -1040,11 +1063,6 @@ def gaudi_weight_wrapper(weight_loader):
             # keyword-only args, so probe both.
             # weights will be always in fp8, but scales will be in fp32,
             # so we can detect it by dtype
-            in_kwargs = "loaded_weight" in kwargs
-            if in_kwargs:
-                loaded_weight = kwargs["loaded_weight"]
-            else:
-                loaded_weight = args[1]
             if loaded_weight.dtype == torch.float8_e4m3fn:
                 loaded_weight = (loaded_weight.float() * 0.5).to(torch.float8_e4m3fn)
             else:
@@ -1114,6 +1132,13 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
 def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
     if force_channel_fp8:
         # convert to channel-wise fp8
+        # NOTE: DeepSeek V4 experts bypass gaudi_weight_wrapper's e8m0 decode
+        # (the custom nvidia load_weights views scales as raw uint8 bytes), so
+        # their raw e8m0 bytes were never decoded and scale_adjustment *2.0
+        # corrupted them. gaudi_weight_wrapper now decodes the uint8 byte ->
+        # power-of-2 (see gaudi_weight_wrapper), so the scale is correct here.
+        # Weights are *0.5'd by scale_adjustment (fit e4m3fnuz range), so HPU's
+        # native dequant + dynamic_quant is correct and fast.
         w13_weight, w13_weight_scale_inv = dynamic_quant(
             dequant_block_fp8_weight_naive(layer.w13_weight.data, layer.w13_weight_scale_inv.data,
                                            layer.quant_config.weight_block_size))

@@ -367,6 +367,46 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
     )
 
 
+def hpu_route_topk(
+    layer,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    model_type: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute (topk_weights, topk_ids) for the HPU monolithic MoE path.
+
+    Handles the grouped/custom routing path, DeepSeek V4's sqrtsoftplus scoring
+    (scores = sqrt(softplus(logits)) -> top-k -> normalize -> *routed_scaling_factor),
+    and the generic softmax path. Shared by every HPU MoE quant method so the
+    routing math stays consistent.
+    """
+    if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
+        return select_experts_from_routed(layer, x, router_logits)
+
+    import torch.nn.functional as F
+
+    if getattr(layer, "scoring_func", "softmax") == "sqrtsoftplus":
+        # DeepSeek V4 reference (transformers DeepseekV4TopKRouter).
+        scores = torch.sqrt(F.softplus(router_logits.to(torch.float32)))
+        e_score_bias = getattr(layer, "e_score_correction_bias", None)
+        if e_score_bias is not None:
+            scores = scores + e_score_bias.to(torch.float32)
+        topk_weights, topk_ids = torch.topk(scores, layer.top_k, dim=-1)
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weights = topk_weights * float(getattr(layer, "routed_scaling_factor", 1.0))
+        return topk_weights, topk_ids
+
+    if model_type == "gpt_oss":
+        topk_weights, topk_ids = torch.topk(router_logits, layer.top_k, dim=-1)
+        topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32)
+        return topk_weights, topk_ids
+
+    topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    return topk_weights, topk_ids
+
+
 @UnquantizedFusedMoEMethod.register_oot
 class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """MoE method without quantization."""
@@ -451,19 +491,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ):
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-            topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
-        else:
-            import torch.nn.functional as F
-
-            if self.model_type == "gpt_oss":
-                topk_weights, topk_ids = torch.topk(router_logits, layer.top_k, dim=-1)
-                topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32)
-            else:
-                topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-                topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
-                topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_weights, topk_ids = hpu_route_topk(layer, x, router_logits, self.model_type)
 
         # The HPU mixture_of_experts kernel compiles for bf16 (x.dtype) router
         # weights and int64 routing tables. The grouped-topk / custom-routing
@@ -474,6 +502,17 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # for every routing path so the kernel inputs are dtype-consistent.
         topk_ids = topk_ids.to(torch.int64)
         topk_weights = topk_weights.to(x.dtype)
+
+        if __import__("os").environ.get("HPU_DUMP") == "1":
+            try:
+                import re as _moe_re
+                from vllm_gaudi.models.deepseek_v4 import _HPU_CAP
+                _m = _moe_re.search(r"\.(\d+)\.experts$", getattr(layer, "prefix", "") or "")
+                _lidx = int(_m.group(1)) if _m else -1
+                _HPU_CAP.setdefault("moe_topk_w", {})[_lidx] = topk_weights.detach().float().clone()
+                _HPU_CAP.setdefault("moe_topk_ids", {})[_lidx] = topk_ids.detach().clone()
+            except Exception:
+                pass
 
         if layer.moe_config.dp_size > 1:
             dp_metadata = get_hpu_dp_metadata()
@@ -542,19 +581,7 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ):
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
-        if layer.use_grouped_topk or getattr(layer, "custom_routing_function", None) is not None:
-            topk_weights, topk_ids = select_experts_from_routed(layer, x, router_logits)
-        else:
-            import torch.nn.functional as F
-
-            if self.model_type is not None and self.model_type in ["gpt_oss"]:
-                topk_weights, topk_ids = torch.topk(router_logits, layer.top_k, dim=-1)
-                topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32)
-            else:
-                topk_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-                topk_weights, topk_ids = torch.topk(topk_weights, layer.top_k, dim=-1)
-                topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+        topk_weights, topk_ids = hpu_route_topk(layer, x, router_logits, self.model_type)
 
         # See apply_monolithic: the bf16 HPU MoE kernel needs int64 routing
         # tables and x.dtype router weights. Normalize for every routing path
@@ -688,6 +715,22 @@ def patched_fused_moe_forward(
                 router_logits = torch.nn.functional.linear(hidden_states, self._combined_gate_weight)
             else:
                 router_logits, _ = self.gate(hidden_states)
+        if __import__("os").environ.get("HPU_DUMP") == "1":
+            try:
+                import re as _rm
+                import vllm_gaudi.models.deepseek_v4 as _d4
+                _m = _rm.search(r"\.(\d+)\.ffn(?:\.experts)?$", getattr(self, "layer_name", "") or "")
+                _li = int(_m.group(1)) if _m else 0
+                _d4._HPU_CAP.setdefault("run_router_logits", {})[_li] = router_logits.detach().float().clone()
+                _d4._HPU_CAP.setdefault("run_moe_in", {})[_li] = hidden_states.detach().float().clone()
+                _d4._HPU_CAP.setdefault("run_layer_name", {})[_li] = getattr(self, "layer_name", "") or ""
+                _g = getattr(self, "gate", None)
+                _d4._HPU_CAP.setdefault("run_gate_w", {})[_li] = _g.weight.detach().float().clone() if _g is not None else None
+                _d4._HPU_CAP.setdefault("run_fse_fuse_gate", {})[_li] = bool(getattr(self, "_fse_fuse_gate", False))
+                _gw = getattr(self, "_combined_gate_weight", None)
+                _d4._HPU_CAP.setdefault("run_combined_gw", {})[_li] = _gw.detach().float().clone() if _gw is not None else None
+            except Exception as _e:
+                print(f"[runner] cap err {_e}", flush=True)
         # Core MoERunner._apply_quant_method takes no layer argument — it reads
         # everything it needs off the runner (self.routed_experts / self.router).
         # Call it exactly as upstream _forward_impl does. vllm PR #52024 dropped
@@ -699,6 +742,17 @@ def patched_fused_moe_forward(
             shared_experts_input=shared_experts_input,
             input_ids=input_ids,
         )
+        if __import__("os").environ.get("HPU_DUMP") == "1":
+            try:
+                import re as _rm2
+                import vllm_gaudi.models.deepseek_v4 as _d4b
+                _m2 = _rm2.search(r"\.(\d+)\.ffn(?:\.experts)?$", getattr(self, "layer_name", "") or "")
+                _li2 = int(_m2.group(1)) if _m2 else 0
+                if shared_output is not None:
+                    _d4b._HPU_CAP.setdefault("run_shared_out", {})[_li2] = shared_output.detach().float().clone()
+                _d4b._HPU_CAP.setdefault("run_fused_hidden", {})[_li2] = fused_hidden.detach().float().clone()
+            except Exception as _e2:
+                print(f"[runner] cap2 err {_e2}", flush=True)
         result = self._maybe_combine(shared_output, fused_hidden)
     else:
         # Upstream PR #41184 dropped MoERunner._trtllm_mxfp4_unpadded_dim(); the
