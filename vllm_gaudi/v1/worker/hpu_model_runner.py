@@ -172,7 +172,8 @@ HPU_TORCH_DTYPE_TO_STR_DTYPE = {
     torch.float32: "float32",
     torch.bfloat16: "bfloat16",
     torch.float16: "float16",
-    torch.float8_e4m3fn: "fp8_e4m3"
+    torch.float8_e4m3fn: "fp8_e4m3",
+    torch.uint8: "fp8",
 }
 
 shutdown_inc_called = False
@@ -6677,7 +6678,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 torch.compile's aot_autograd does not support input mutations
                 on views with different dtypes (the raw buffer is bf16 but
                 GDN states may be float32)."""
-                for ln in kv_cache_tensor.layers:
+                for ln in kv_cache_tensor.shared_by:
                     spec = _layer_spec.get(ln)
                     if isinstance(spec, FullAttentionSpec):
                         continue
@@ -6703,10 +6704,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # coalesced layers share one (standard Mamba2) spec; group 0 may
                 # be a smaller attention spec in hybrid models and under-pad the
                 # buffer, letting the last as_strided view run past the end.
-                raw_spec = _layer_spec[kv_cache_tensor.layers[0]]
+                raw_spec = _layer_spec[kv_cache_tensor.shared_by[0]]
                 size = kv_cache_tensor.size + raw_spec.page_size_bytes
                 tensor = torch.zeros(size // 2, dtype=torch.bfloat16, device=self.device)
-                for layer_name in kv_cache_tensor.layers:
+                for layer_name in kv_cache_tensor.shared_by:
                     kv_caches[layer_name] = tensor
 
             for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -6832,7 +6833,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         pass
         else:  # non-hybrid scenario
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                for layer_name in kv_cache_tensor.layers:
+                for layer_name in kv_cache_tensor.shared_by:
                     # Get the correct spec for this layer
                     kv_cache_spec = None
                     for group in kv_cache_config.kv_cache_groups:

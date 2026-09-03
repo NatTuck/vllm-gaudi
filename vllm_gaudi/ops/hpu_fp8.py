@@ -74,6 +74,10 @@ class Fp8LinearMethod(OrigFp8LinearMethod):
 
     def create_weights(self, *args, **kwargs) -> None:
         if hpu_ops.is_hpu_gaudi2:
+            # HPU cannot allocate float8_e8m0fnu (e8m0) scale params. Create
+            # block-fp8 scales as float32 and decode the checkpoint's e8m0
+            # bytes to their float32 value in gaudi_weight_wrapper at load.
+            self.is_scale_e8m0 = False
             kwargs['weight_loader'] = hpu_ops.gaudi_weight_wrapper(kwargs.get('weight_loader'))
         super().create_weights(*args, **kwargs)
 

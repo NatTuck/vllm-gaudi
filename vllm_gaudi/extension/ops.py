@@ -948,15 +948,17 @@ def apply_block_fp8_linear_hpu(
             bias,
         )
         return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+    orig_M = getattr(layer, "orig_M", None)
+    orig_N = getattr(layer, "orig_N", None)
     return apply_block_fp8_linear_hpu_dequant(
         input,
         layer.weight,
         block_size,
         layer.weight_scale_inv,
         bias=bias,
-        original_M=layer.orig_M,
-        original_N=layer.orig_N,
-        do_unpad=do_unpad,
+        original_M=orig_M,
+        original_N=orig_N,
+        do_unpad=do_unpad and orig_M is not None,
     )
 
 
@@ -974,13 +976,70 @@ def apply_block_fp8_linear_hpu_dequant(
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    original_M = original_M.data.item()
-    original_N = original_N.data.item()
-    weight = dequant_block_fp8_weight_naive(weight, weight_scale, block_size, input.dtype, original_M, original_N,
-                                            do_unpad)
-    output = torch.nn.functional.linear(input_2d, weight, bias=None)
+    weight = _dequant_fp8_weight(weight, weight_scale)
+    if do_unpad and original_M is not None and original_N is not None:
+        om = original_M.data.item()
+        on = original_N.data.item()
+        weight = weight[:om, :on]
     if bias is not None:
-        output = output + bias
+        output = torch.nn.functional.linear(input_2d, weight, bias=bias)
+    else:
+        output = torch.nn.functional.linear(input_2d, weight, bias=None)
+    return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
+
+
+def _dequant_fp8_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize an fp8 weight tensor to bf16.
+
+    Handles 2D block scales ``[M_blocks, N_blocks]``, 1D per-channel scales
+    ``[M]`` (per-output-row), and 1D per-input scales ``[N]``. Returns bf16.
+    """
+    wf = weight.float()
+    if scale.dim() == 2:
+        # Block-fp8 weight [M, N] with scale [M_blocks, N_blocks]; infer the
+        # block size from the ratio (block_m = M // M_blocks).
+        sm, sn = scale.shape
+        bm = wf.shape[0] // sm
+        bn = wf.shape[1] // sn
+        return dequant_block_fp8_weight_naive(weight, scale, (bm, bn), torch.bfloat16)
+    if scale.numel() == wf.shape[0]:
+        return (wf * scale.view(-1, 1)).to(torch.bfloat16)
+    if scale.numel() == wf.shape[1]:
+        return (wf * scale.view(1, -1)).to(torch.bfloat16)
+    return (wf * scale).to(torch.bfloat16)
+
+
+def apply_block_fp8_linear_hpu_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    block_size: List[int],
+    bias: Optional[torch.Tensor] = None,
+    original_out_features: Optional[int] = None,
+    original_in_features: Optional[int] = None,
+) -> torch.Tensor:
+    """Block-fp8 GEMM for HPU: dequant weight to bf16, then F.linear.
+
+    The weight stays as fp8 in HBM (loaded once by Fp8LinearMethod). This
+    function dequants it on-the-fly in the forward pass, avoiding the CPU
+    dequant + bf16 cache workaround.
+
+    ``torch.ops.hpu.fp8_gemm_v2`` does not support 2D block scales, so the
+    native HPU block-fp8 GEMM path is unavailable. The fallback dequants the
+    block-fp8 weight to bf16 and runs ``F.linear`` -- keeping the weight in
+    HBM as fp8 (not bf16) and avoiding any CPU round-trip.
+
+    If ``original_out_features`` / ``original_in_features`` are provided, the
+    dequantized weight is unpadded to those original dimensions before the
+    matmul (matching ``fp8_block_linear_postprocess_weights`` padding).
+    """
+    input_2d = input.view(-1, input.shape[-1])
+    weight_bf16 = _dequant_fp8_weight(weight, weight_scale_inv)
+    if original_out_features is not None or original_in_features is not None:
+        om = original_out_features or weight.shape[0]
+        on = original_in_features or weight.shape[1]
+        weight_bf16 = weight_bf16[:om, :on]
+    output = F.linear(input_2d, weight_bf16, bias=bias)
     return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
 
 
@@ -1043,12 +1102,15 @@ def gaudi_weight_wrapper(weight_loader):
         # decode the e8m0 byte to its float32 value up front, matching what the
         # CUDA copy_ would do.
         if loaded_weight.dtype == torch.float8_e8m0fnu:
+            # Decode e8m0 byte to float32, then fall through to
+            # scale_adjustment *2.0 below (weights are *0.5'd, so
+            # scales must *2.0 to keep the real dequant value).
             loaded_weight = loaded_weight.float()
             if in_kwargs:
                 kwargs["loaded_weight"] = loaded_weight
             else:
                 args = (args[0], loaded_weight) + args[2:]
-            return weight_loader(*args, **kwargs)
+            # fall through to scale_adjustment
         if loaded_weight.dtype == torch.uint8:
             # DeepSeek V4 expert block scales are stored as raw e8m0 exponent
             # bytes (the custom nvidia load_weights views them as uint8 to
