@@ -2,6 +2,15 @@ import os
 import json
 import sys
 
+# HPU does not support forking after device init — the device gets lazily
+# initialized as soon as ``torch.hpu`` is touched (which happens during
+# plugin registration), and a forked child inherits a corrupted HPU context
+# that crashes on ``_hpu_C.init()``.  Force spawn multiprocessing early so
+# that ``_maybe_force_spawn`` in the upstream multiproc_executor picks it up
+# (that function checks for CUDA/XPU init but not HPU).
+if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD", "").lower() != "fork":
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 
 def _uses_lmcache_connector() -> bool:
     """Check if lmcache is configured as the KV connector.

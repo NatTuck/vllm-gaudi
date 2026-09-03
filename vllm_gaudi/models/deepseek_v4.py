@@ -502,8 +502,6 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._comp_kernel_state = None
         self._comp_coff = 2 if self.compress_ratio == 4 else 1
         self._comp_reset = False
-        # is_prompt tensor flag (set externally before forward)
-        self._is_prompt = torch.tensor(0, dtype=torch.int64)
         # Compressor capacity (set by _init_comp_kernel_state, read by forward)
         self._cap = 0
 
@@ -984,64 +982,76 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
 
 
-    def forward(self, positions, hidden_states, llama_4_scaling=None):
-        num_tokens = hidden_states.shape[0]
-
-        def _out(r):
-            return r[0] if isinstance(r, tuple) else r
-
-        qr_kv = _out(self.fused_wqa_wkv(hidden_states))
+    def _fused_qkv(self, hidden_states):
+        """Shared preamble: fused_wqa_wkv → split → rmsnorm → rope."""
+        qr_kv = self.fused_wqa_wkv(hidden_states)
+        qr_kv = qr_kv[0] if isinstance(qr_kv, tuple) else qr_kv
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr = _rmsnorm(qr, self.eps, self.q_norm.weight.data)
         kv = _rmsnorm(kv, self.eps, self.kv_norm.weight.data)
-        is_prompt = self._is_prompt
-        pos_flat = positions.reshape(-1)
+        return qr, kv
 
+    def forward_prefill(self, positions, hidden_states):
+        """Prefill: write T tokens to ring buffer, reset+run compressor, causal mask."""
+        qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+        T = kv_roped.shape[0]
+        self._win_n.zero_()
+        self._decode_pos.zero_()
+        self._win_cache[:T] = kv_roped[:T]
+        self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
 
-        if is_prompt.item():
-            T = kv_roped.shape[0]
-            self._win_n.zero_()
-            self._decode_pos.zero_()
-            self._win_cache[:T] = kv_roped[:T]
-            self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
-        else:
-            self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
-            self._decode_pos.add_(1)
-            self._win_n.add_(1).clamp_(max=self.window_size)
-
+        pos_flat = positions.reshape(-1)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
 
         cap = self._cap
         past_kv = torch.cat([self._win_cache, comp_full], dim=0)
         past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
 
-        if is_prompt.item():
-            win_ids = torch.arange(self.window_size, device=pos_flat.device)
-            win_present = win_ids.unsqueeze(0) < self._win_n.unsqueeze(-1)
-            if T <= self.window_size:
-                win_causal = pos_flat[:, None] >= pos_flat[None, :]
-                win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=pos_flat.device)
-                win_mask[:, :T] = win_causal & win_present[:, :T]
-            else:
-                start = T - self.window_size
-                win_mask = pos_flat[:, None] >= pos_flat[None, start:]
-
-            comp_ids = torch.arange(cap, device=pos_flat.device)
-            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
-            if comp_bb is not None:
-                comp_attend = comp_present & torch.isfinite(comp_bb)
-            else:
-                comp_attend = comp_present
-            mask = torch.cat([win_mask, comp_attend], dim=-1)
+        win_ids = torch.arange(self.window_size, device=pos_flat.device)
+        win_present = win_ids.unsqueeze(0) < self._win_n.unsqueeze(-1)
+        if T <= self.window_size:
+            win_causal = pos_flat[:, None] >= pos_flat[None, :]
+            win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=pos_flat.device)
+            win_mask[:, :T] = win_causal & win_present[:, :T]
         else:
-            win_mask = torch.ones(1, self.window_size, dtype=torch.bool, device=pos_flat.device)
-            comp_ids = torch.arange(cap, device=pos_flat.device)
-            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
-            mask = torch.cat([win_mask, comp_present], dim=-1)
+            start = T - self.window_size
+            win_mask = pos_flat[:, None] >= pos_flat[None, start:]
 
-        o = self._forward_compilable(qr, kv, positions, past_kv, mask)
-        return o
+        comp_ids = torch.arange(cap, device=pos_flat.device)
+        comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
+        if comp_bb is not None:
+            comp_attend = comp_present & torch.isfinite(comp_bb)
+        else:
+            comp_attend = comp_present
+        mask = torch.cat([win_mask, comp_attend], dim=-1)
+
+        return self._forward_compilable(qr, kv, positions, past_kv, mask)
+
+    def forward_decode(self, positions, hidden_states):
+        """Decode: append 1 token to ring buffer, run compressor (no reset), full mask."""
+        qr, kv = self._fused_qkv(hidden_states)
+        kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+        self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
+        self._decode_pos.add_(1)
+        self._win_n.add_(1).clamp_(max=self.window_size)
+
+        pos_flat = positions.reshape(-1)
+        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
+
+        cap = self._cap
+        past_kv = torch.cat([self._win_cache, comp_full], dim=0)
+        past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+
+        win_mask = torch.ones(1, self.window_size, dtype=torch.bool, device=pos_flat.device)
+        comp_ids = torch.arange(cap, device=pos_flat.device)
+        comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
+        mask = torch.cat([win_mask, comp_present], dim=-1)
+
+        return self._forward_compilable(qr, kv, positions, past_kv, mask)
+
+    def forward(self, positions, hidden_states, llama_4_scaling=None):
+        return self.forward_decode(positions, hidden_states)
 
 
 _HPU_CAP: dict = {"attn_in": {}, "attn_out": {}}
@@ -1130,95 +1140,59 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
 
-    def _forward_inner(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        input_ids: torch.Tensor | None,
-        post_mix: torch.Tensor | None,
-        res_mix: torch.Tensor | None,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure tensor math: mHC pre/fused → attn → mHC fused → ffn.
-
-        No HPU_DUMP, no V4_DEBUG, no try/except, no ``os.environ`` —
-        safe for ``torch.compile`` on HPU.
-        """
+    def _mhc(self, x, residual, post_mix, res_mix):
+        """mHC pre/fused — shared by prefill and decode."""
         if residual is None:
             if x.dim() == 2:
-                residual, post_mix, res_mix, x = _mhc_pre_broadcast_compilable(
-                    x,
-                    self.hc_attn_fn_broadcast,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    self.hc_mult,
-                    self.attn_norm.weight.data,
-                    self.rms_norm_eps,
+                return _mhc_pre_broadcast_compilable(
+                    x, self.hc_attn_fn_broadcast, self.hc_attn_scale,
+                    self.hc_attn_base, self.rms_norm_eps, self.hc_eps,
+                    self.hc_eps, self.hc_post_alpha, self.hc_sinkhorn_iters,
+                    self.hc_mult, self.attn_norm.weight.data, self.rms_norm_eps,
                 )
-            else:
-                from vllm.model_executor.kernels.mhc import mhc_pre_torch
-
-                residual = x
-                post_mix, res_mix, x = mhc_pre_torch(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                )
-        else:
-            residual, post_mix, res_mix, x = _mhc_fused_post_pre_compilable(
-                x,
-                residual,
-                post_mix,
-                res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                self.hc_mult,
-                self.attn_norm.weight.data,
-                self.rms_norm_eps,
-            )
-
-        x = self.attn(positions, x, None)
-
-        residual, post_mix, res_mix, x = _mhc_fused_post_pre_compilable(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            self.hc_mult,
-            self.ffn_norm.weight.data,
-            self.rms_norm_eps,
+            from vllm.model_executor.kernels.mhc import mhc_pre_torch
+            return (x, *mhc_pre_torch(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                self.rms_norm_eps, self.hc_eps, self.hc_eps,
+                self.hc_post_alpha, self.hc_sinkhorn_iters,
+            ))
+        return _mhc_fused_post_pre_compilable(
+            x, residual, post_mix, res_mix,
+            self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            self.rms_norm_eps, self.hc_eps, self.hc_eps,
+            self.hc_post_alpha, self.hc_sinkhorn_iters, self.hc_mult,
+            self.attn_norm.weight.data, self.rms_norm_eps,
         )
 
+    def _mhc_post_ffn(self, x, residual, post_mix, res_mix):
+        return _mhc_fused_post_pre_compilable(
+            x, residual, post_mix, res_mix,
+            self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            self.rms_norm_eps, self.hc_eps, self.hc_eps,
+            self.hc_post_alpha, self.hc_sinkhorn_iters, self.hc_mult,
+            self.ffn_norm.weight.data, self.rms_norm_eps,
+        )
+
+    def _forward_inner_prefill(
+        self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None,
+    ):
+        residual, post_mix, res_mix, x = self._mhc(x, residual, post_mix, res_mix)
+        x = self.attn.forward_prefill(positions, x)
+        residual, post_mix, res_mix, x = self._mhc_post_ffn(x, residual, post_mix, res_mix)
+        x = self.ffn(x, input_ids)
+        return x, residual, post_mix, res_mix
+
+    def _forward_inner_decode(
+        self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None,
+    ):
+        residual, post_mix, res_mix, x = self._mhc(x, residual, post_mix, res_mix)
+        x = self.attn.forward_decode(positions, x)
+        residual, post_mix, res_mix, x = self._mhc_post_ffn(x, residual, post_mix, res_mix)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
     def forward(self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None):
-        x, residual, post_mix, res_mix = self._forward_inner(
+        x, residual, post_mix, res_mix = self._forward_inner_prefill(
             x, positions, input_ids, post_mix, res_mix, residual
         )
         return x, residual, post_mix, res_mix
@@ -1342,26 +1316,35 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             positions = positions.reshape(-1)
 
         residual, post_mix, res_mix = None, None, None
-        is_prompt_t = torch.where(
-            positions.shape[-1] > 1,
-            torch.tensor(1, dtype=torch.int64, device=positions.device),
-            torch.tensor(0, dtype=torch.int64, device=positions.device),
-        )
+        is_prefill = positions.shape[-1] > 1
         import os as _os
         _dbg = _os.environ.get("V4_DEBUG") == "1"
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
-            if _dbg:
-                print(f"[v4model] layer {idx} in", flush=True)
-            layer.attn._is_prompt = is_prompt_t
-            hidden_states, residual, post_mix, res_mix = layer(
-                hidden_states, positions, input_ids, post_mix, res_mix, residual
-            )
-            if _dbg:
-                print(f"[v4model] layer {idx} out", flush=True)
-            _diag(f"after_layer", hidden_states, layer=idx)
+        if is_prefill:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            ):
+                if _dbg:
+                    print(f"[v4model] layer {idx} in", flush=True)
+                hidden_states, residual, post_mix, res_mix = layer._forward_inner_prefill(
+                    hidden_states, positions, input_ids, post_mix, res_mix, residual
+                )
+                if _dbg:
+                    print(f"[v4model] layer {idx} out", flush=True)
+                _diag(f"after_layer", hidden_states, layer=idx)
+        else:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer),
+                start=self.start_layer,
+            ):
+                if _dbg:
+                    print(f"[v4model] layer {idx} in", flush=True)
+                hidden_states, residual, post_mix, res_mix = layer._forward_inner_decode(
+                    hidden_states, positions, input_ids, post_mix, res_mix, residual
+                )
+                if _dbg:
+                    print(f"[v4model] layer {idx} out", flush=True)
+                _diag(f"after_layer", hidden_states, layer=idx)
         _DIAG_DONE["v"] = True
 
         import os as _hdump
