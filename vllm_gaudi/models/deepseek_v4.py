@@ -502,6 +502,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._comp_kernel_state = None
         self._comp_coff = 2 if self.compress_ratio == 4 else 1
         self._comp_reset = False
+        # is_prompt tensor flag (set externally before forward)
+        self._is_prompt = torch.tensor(0, dtype=torch.int64)
+        # Compressor capacity (set by _init_comp_kernel_state, read by forward)
+        self._cap = 0
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -583,11 +587,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             hidden_states, q_residual, positions, reset=reset
         )
         if ckv_full is None:
-            st = self._comp_kernel_state
-            cap = st["cap"] if st is not None else 0
+            cap = self._cap
             dev = hidden_states.device
             D = self.head_dim
-            empty = torch.zeros(cap or 1, D, dtype=torch.bfloat16, device=dev)
+            empty = torch.zeros(max(cap, 1), D, dtype=torch.bfloat16, device=dev)
             return empty, torch.tensor(0, dtype=torch.int64, device=dev), None, None
         return ckv_full, c_n, bb, None
 
@@ -623,6 +626,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         D = self.head_dim
         idx_h = self.indexer.head_dim if (rate == 4 and self.indexer is not None) else D
         cap = 4096
+        self._cap = cap
         st = {
             "rate": rate, "D": D, "idx_h": idx_h, "cap": cap, "dev": dev,
             "c_win_kv": None, "c_win_gate": None, "c_win_n": 0,
@@ -982,174 +986,61 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
         num_tokens = hidden_states.shape[0]
-        import os as _fdbg
-        if _fdbg.environ.get("V4_DEBUG") == "1" and getattr(self, "_fwd_dbg_n", 0) < 4:
-            self._fwd_dbg_n = getattr(self, "_fwd_dbg_n", 0) + 1
-            try:
-                from vllm.forward_context import get_forward_context
-                amf = get_forward_context().attn_metadata
-                ispf = bool(getattr(amf, "is_prompt", None)) if amf is not None else None
-            except Exception as e:
-                ispf = f"err:{e}"
-            pos = positions.reshape(-1)
-            sm = cl = bl = None
-            try:
-                sm = getattr(amf, "slot_mapping", None)
-                cl = getattr(amf, "context_lens_tensor", None)
-                bl = getattr(amf, "block_list", None)
-            except Exception:
-                pass
-            kc_info = "nobind"
-            try:
-                if getattr(self, "kv_cache", None) is not None:
-                    kc = self.kv_cache[0]
-                    nnz = int((kc.abs().sum(dim=(-1, -2)) > 0).sum())
-                    kc_info = f"slots={kc.shape[0]} nnz_slots={nnz} am={float(kc.float().abs().mean()):.3g}"
-            except Exception as e:
-                kc_info = f"err:{e}"
-            print(f"[dbg] fwd#{self._fwd_dbg_n} T={num_tokens} is_prompt={ispf} "
-                  f"posmin={int(pos.min()):d} posmax={int(pos.max()):d} "
-                  f"hs={tuple(hidden_states.shape)} "
-                  f"win_n={int(self._win_n.item()) if hasattr(self, '_win_n') else 0} "
-                  f"sm={sm.reshape(-1).tolist() if sm is not None else None} "
-                  f"cl={cl.reshape(-1).tolist() if cl is not None else None} "
-                  f"bl={bl.reshape(-1).tolist() if bl is not None else None} kc[{kc_info}]", flush=True)
 
         def _out(r):
             return r[0] if isinstance(r, tuple) else r
 
-        _diag("attn_input", hidden_states)
-        # fused_wqa_wkv is a MergedColumnParallelLinear loaded as block-fp8 by
-        # Fp8LinearMethod. Use its native forward (handles merged-column output).
         qr_kv = _out(self.fused_wqa_wkv(hidden_states))
-        _diag("attn_fused_wqa_wkv", qr_kv)
-        if not _DIAG_DONE["v"]:
-            w = self.fused_wqa_wkv.weight
-            wf = w.to(torch.float32)
-            nnan = torch.isnan(wf)
-            print(f"[diag] fused_w weight per-128-row-block NaN: "
-                  f"{[int(nnan[i:i+128].sum()) for i in range(0, w.shape[0], 128)]}", flush=True)
-            for attr in ("scale", "weight_scale", "weight_scale_1", "weight_scale_2"):
-                if hasattr(self.fused_wqa_wkv, attr):
-                    s = getattr(self.fused_wqa_wkv, attr)
-                    try:
-                        _diag(f"fused_wqa_wkv.{attr}", s)
-                    except Exception as e:
-                        print(f"[diag] fused_wqa_wkv.{attr} err: {e}", flush=True)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        _diag("attn_qr", qr)
-        _diag("attn_kv", kv)
         qr = _rmsnorm(qr, self.eps, self.q_norm.weight.data)
         kv = _rmsnorm(kv, self.eps, self.kv_norm.weight.data)
-        _diag("attn_qr_normed", qr)
-        _diag("attn_kv_normed", kv)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0:
-            _HPU_CAP.setdefault("attn_qr_normed", {})[0] = qr.detach().float().clone()
-
-        import os as _odbg
-        is_prompt = None
-        try:
-            from vllm.forward_context import get_forward_context
-            am0 = get_forward_context().attn_metadata
-            is_prompt = bool(getattr(am0, "is_prompt", None)) if am0 is not None else None
-        except Exception as e:
-            is_prompt = f"err:{e}"
+        is_prompt = self._is_prompt
         pos_flat = positions.reshape(-1)
-        if os.environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0:
-            _HPU_CAP.setdefault("pos_flat", {})[0] = pos_flat.detach().cpu().clone()
 
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1, 2):
-            _HPU_CAP.setdefault("attn_kv_roped", {})[getattr(self, "_layer_idx", -1)] = kv_roped.detach().float().clone()
 
-        if is_prompt is True:
-            # Prefill: reset window ring buffer and compressor state.
+        if is_prompt.item():
             T = kv_roped.shape[0]
             self._win_n.zero_()
             self._decode_pos.zero_()
             self._win_cache[:T] = kv_roped[:T]
             self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
-            self._comp_reset = True
-            comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
+        else:
+            self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
+            self._decode_pos.add_(1)
+            self._win_n.add_(1).clamp_(max=self.window_size)
 
-            # Build static-shape past_kv [WIN+CAP, H, D]
-            cap = self._comp_kernel_state["cap"] if self._comp_kernel_state is not None else 0
-            past_kv = torch.cat([self._win_cache, comp_full], dim=0)
-            past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
 
-            # Build mask [T, WIN+CAP]. Window part: causal over first T tokens.
+        cap = self._cap
+        past_kv = torch.cat([self._win_cache, comp_full], dim=0)
+        past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+
+        if is_prompt.item():
             win_ids = torch.arange(self.window_size, device=pos_flat.device)
-            win_present = win_ids.unsqueeze(0) < self._win_n.unsqueeze(-1)  # [1, WIN]
+            win_present = win_ids.unsqueeze(0) < self._win_n.unsqueeze(-1)
             if T <= self.window_size:
-                win_causal = pos_flat[:, None] >= pos_flat[None, :]  # [T, T]
+                win_causal = pos_flat[:, None] >= pos_flat[None, :]
                 win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=pos_flat.device)
                 win_mask[:, :T] = win_causal & win_present[:, :T]
             else:
                 start = T - self.window_size
-                win_mask = pos_flat[:, None] >= pos_flat[None, start:]  # [T, WIN]
+                win_mask = pos_flat[:, None] >= pos_flat[None, start:]
 
-            # Compressed part: present entries with finite block_bias (or all present if None)
             comp_ids = torch.arange(cap, device=pos_flat.device)
-            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)  # [1, CAP]
+            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
             if comp_bb is not None:
                 comp_attend = comp_present & torch.isfinite(comp_bb)
             else:
                 comp_attend = comp_present
-            mask = torch.cat([win_mask, comp_attend], dim=-1)  # [T, WIN+CAP]
-            attn_mask = mask
-
-            if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1, 2, 3):
-                _HPU_CAP.setdefault("comp_v", {})[getattr(self, "_layer_idx", -1)] = (
-                    comp_full.detach().float().clone()
-                )
-                _HPU_CAP.setdefault("comp_p", {})[getattr(self, "_layer_idx", -1)] = comp_n.detach().cpu()
+            mask = torch.cat([win_mask, comp_attend], dim=-1)
         else:
-            # Decode: append to ring buffer, run compressor, build static-shape mask.
-            self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
-            self._decode_pos.add_(1)
-            self._win_n.add_(1).clamp_(max=self.window_size)
-            self._comp_reset = False
-            comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
-
-            cap = self._comp_kernel_state["cap"] if self._comp_kernel_state is not None else 0
-            past_kv = torch.cat([self._win_cache, comp_full], dim=0)
-            past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
-
-            # Decode mask: all window entries are valid, compressed entries up to n are valid
             win_mask = torch.ones(1, self.window_size, dtype=torch.bool, device=pos_flat.device)
             comp_ids = torch.arange(cap, device=pos_flat.device)
             comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
             mask = torch.cat([win_mask, comp_present], dim=-1)
-            attn_mask = mask
 
-        o = self._forward_compilable(qr, kv, positions, past_kv, attn_mask)
-
-        if is_prompt is True:
-            if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1):
-                import torch.nn.functional as _F
-                valid = pos_flat >= 0
-                q_att = (apply_block_fp8_linear_hpu_gemm(
-                    qr[valid],
-                    self.wq_b.weight,
-                    self.wq_b.weight_scale_inv,
-                    self.wq_b.quant_config.weight_block_size,
-                    original_out_features=self.wq_b.orig_M.data.item(),
-                    original_in_features=self.wq_b.orig_N.data.item(),
-                ).view(-1, self.n_local_heads, self.head_dim))
-                q_att = _rmsnorm(q_att, self.eps)
-                q_att = _apply_rope(q_att, pos_flat[valid], self.rotary_emb.cos_sin_cache, self.rope_head_dim)
-                kf = self._win_cache.unsqueeze(0).unsqueeze(0).expand(1, self.n_local_heads, -1, self.head_dim)
-                _HPU_CAP.setdefault("attn_sparse", {})[0] = o[valid].detach().float().clone()
-                o_full = _F.scaled_dot_product_attention(
-                    q_att.unsqueeze(0).transpose(1, 2), kf, kf, is_causal=True
-                ).transpose(1, 2).squeeze(0)
-                _HPU_CAP.setdefault("attn_full", {})[0] = o_full.detach().float().clone()
-                _HPU_CAP.setdefault("attn_qreal", {})[0] = q_att.detach().float().clone()
-
-        _diag("attn_sdpa_out", o)
-        import os as _oob
-        if _oob.environ.get("HPU_DUMP") == "1":
-            _HPU_CAP.setdefault("attn_pre_o", {})[getattr(self, "_layer_idx", -1)] = o.detach().float().clone()
+        o = self._forward_compilable(qr, kv, positions, past_kv, mask)
         return o
 
 
@@ -1327,61 +1218,9 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
         return x, residual, post_mix, res_mix
 
     def forward(self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None):
-        import os
-        if not getattr(self, "_moe_scale_fixed", False):
-            self._moe_scale_fixed = True
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0 \
-                and not getattr(self, "_routed_w_captured", False):
-            self._routed_w_captured = True
-            try:
-                ex = getattr(self.ffn, "experts", None)
-                if ex is not None and hasattr(ex, "routed_experts"):
-                    ex = ex.routed_experts
-                if ex is not None:
-                    for attr in ("w13_weight", "w2_weight", "w13_weight_scale",
-                                 "w2_weight_scale", "w13_weight_scale_inv",
-                                 "w2_weight_scale_inv", "w13_scale_inv", "w2_scale_inv"):
-                        v = getattr(ex, attr, None)
-                        if v is not None:
-                            _HPU_CAP.setdefault("routed_" + attr, {})[0] = \
-                                v.detach().float().clone()
-            except Exception as e:
-                print(f"[routed] wcap err {e}", flush=True)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0 \
-                and not getattr(self, "_gate_captured", False):
-            self._gate_captured = True
-            try:
-                g = getattr(getattr(self.ffn, "gate", None), "weight", None)
-                if g is not None:
-                    _HPU_CAP.setdefault("gate_w", {})[0] = g.detach().float().clone()
-            except Exception as e:
-                print(f"[gate] cap err {e}", flush=True)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0 \
-                and not getattr(self, "_se_w_captured", False):
-            self._se_w_captured = True
-            try:
-                se = getattr(self.ffn, "shared_experts", None)
-                _HPU_CAP.setdefault("se_gu_w", {})[0] = se.gate_up_proj.weight.detach().float().clone()
-                _HPU_CAP.setdefault("se_dn_w", {})[0] = se.down_proj.weight.detach().float().clone()
-                for tag, mod in (("se_gu_s", se.gate_up_proj), ("se_dn_s", se.down_proj)):
-                    bs = getattr(mod, "weight_scale_inv", None)
-                    if bs is None:
-                        bs = getattr(mod, "weight_scale", None)
-                    _HPU_CAP.setdefault(tag, {})[0] = bs.detach().float().clone() if bs is not None else None
-            except Exception as e:
-                print(f"[se] wcap err {e}", flush=True)
-        dbg = os.environ.get("V4_DEBUG") == "1"
-        if dbg:
-            print(f"[v4dec] x.dim={x.dim()} x.shape={tuple(x.shape)} residual_none={residual is None} "
-                  f"hc_mult={self.hc_mult} attn_fn0={tuple(self.hc_attn_fn.shape)}")
-        _diag("dec_x_in", x)
-
         x, residual, post_mix, res_mix = self._forward_inner(
             x, positions, input_ids, post_mix, res_mix, residual
         )
-
-        _diag("dec_after_attn", x)
-        _diag("dec_after_ffn", x)
         return x, residual, post_mix, res_mix
 
 
@@ -1503,6 +1342,11 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             positions = positions.reshape(-1)
 
         residual, post_mix, res_mix = None, None, None
+        is_prompt_t = torch.where(
+            positions.shape[-1] > 1,
+            torch.tensor(1, dtype=torch.int64, device=positions.device),
+            torch.tensor(0, dtype=torch.int64, device=positions.device),
+        )
         import os as _os
         _dbg = _os.environ.get("V4_DEBUG") == "1"
         for idx, layer in enumerate(
@@ -1511,6 +1355,7 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         ):
             if _dbg:
                 print(f"[v4model] layer {idx} in", flush=True)
+            layer.attn._is_prompt = is_prompt_t
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states, positions, input_ids, post_mix, res_mix, residual
             )
