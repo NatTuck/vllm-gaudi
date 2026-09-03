@@ -1424,43 +1424,7 @@ class DeepseekV4ForCausalLM(_NvDeepseekV4ForCausalLM):
     model_cls = DeepseekV4HPUModel
 
     def compute_logits(self, hidden_states):
-        import os as _os
-
-        if _os.environ.get("V4_DEBUG") == "1":
-            print(f"[v4head] compute_logits hidden={tuple(hidden_states.shape)}", flush=True)
-            hs = hidden_states.float()
-            print(f"[diag] pre_logits_hidden abs_mean={float(hs.abs().mean()):.5g} "
-                  f"abs_max={float(hs.abs().max()):.5g} sq_mean={float(hs.square().mean()):.5g}", flush=True)
-        _diag("pre_logits_hidden", hidden_states)
-        if _os.environ.get("V4_DEBUG") == "1":
-            w = getattr(self.lm_head, "weight", None)
-            if w is not None:
-                wf = w.float()
-                print(f"[diag] lm_head weight dtype={w.dtype} shape={tuple(w.shape)} "
-                      f"abs_mean={float(wf.abs().mean()):.5g} abs_max={float(wf.abs().max()):.5g}", flush=True)
-            s = getattr(self.lm_head, "weight_scale_inv", None) or getattr(self.lm_head, "weight_scale", None)
-            if s is not None:
-                print(f"[diag] lm_head scale dtype={s.dtype} shape={tuple(s.shape)} "
-                      f"mean={float(s.float().mean()):.5g} min={float(s.float().min()):.5g} max={float(s.float().max()):.5g}", flush=True)
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if _os.environ.get("V4_DEBUG") == "1":
-            print(f"[v4head] logits done {tuple(logits.shape)}", flush=True)
-        _diag("logits", logits)
-        if _os.environ.get("V4_DEBUG") == "1":
-            lf = logits.reshape(-1, logits.shape[-1]).float()[-1]
-            fin = torch.isfinite(lf)
-            if fin.any():
-                safe = torch.where(fin, lf, torch.full_like(lf, float("-inf")))
-                top5, top5i = torch.topk(safe, 5)
-                print(f"[diag] logits last-token top5_ids={top5i.tolist()} "
-                      f"top5_vals={['%.4g' % v for v in top5.tolist()]} "
-                      f"all_nan={bool((~fin).all())}", flush=True)
-                for probe_tok in (11111,):
-                    if probe_tok < safe.numel():
-                        rank = int((safe > safe[probe_tok]).sum())
-                        print(f"[diag] probe token {probe_tok} rank={rank} val={float(safe[probe_tok]):.4g}", flush=True)
-        _DIAG_DONE["v"] = True
-        return logits
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def warmup(self, device: torch.device) -> None:
         """Run one forward with expected prefill and decode shapes to trigger
@@ -1920,22 +1884,11 @@ def _hpu_deepseek_v4_moe_forward(
     hidden_states: torch.Tensor,
     input_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """HPU DeepSeek V4 MoE forward (clean torch, reference-exact bf16).
-
-    Replaces the stock HPU fused ``mixture_of_experts`` path (which dequants fp8
-    with per-row scales -> lossy, and can't handle the official fp4 routed
-    experts). Here we route with the real gate logits (sqrt-softplus topk, or the
-    hash tid2eid table for layers 0-2), dequant the active experts fp4 -> bf16,
-    and run clean matmuls matching the transformers reference.
-    """
-    import re as _moe_re
+    """HPU DeepSeek V4 MoE forward (clean torch, reference-exact bf16)."""
     from vllm.distributed import tensor_model_parallel_all_reduce
 
     org_shape = hidden_states.shape
     flat = hidden_states.reshape(-1, self.hidden_size)
-    _diag("moe_in", flat)
-    m = _moe_re.search(r"\.(\d+)\.ffn$", self.prefix or "")
-    lidx = int(m.group(1)) if m else 0
 
     router_logits = self.gate(flat)[0]
     scores = torch.sqrt(torch.nn.functional.softplus(router_logits))
@@ -1953,34 +1906,14 @@ def _hpu_deepseek_v4_moe_forward(
     topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
     topk_weights = topk_weights * self.routed_scaling_factor
 
-    if os.environ.get("HPU_DUMP") == "1":
-        _HPU_CAP.setdefault("router_logits", {})[lidx] = (
-            router_logits.detach().float().clone()
-        )
-        _HPU_CAP.setdefault("moe_in", {})[lidx] = flat.detach().float().clone()
-        _HPU_CAP.setdefault("topk_ids", {})[lidx] = topk_ids.detach().clone()
-        _HPU_CAP.setdefault("topk_weights", {})[lidx] = (
-            topk_weights.detach().float().clone()
-        )
-
     routed = _compute_v4_routed(self, flat, topk_ids, topk_weights)
-    if os.environ.get("HPU_DUMP") == "1":
-        _HPU_CAP.setdefault("routed_out", {})[lidx] = routed.detach().float().clone()
 
-    # Routed experts are TP-sharded (this rank computes only its expert range);
-    # all-reduce to the full routed output. The shared expert is computed full
-    # (replicated) from the checkpoint, so it is NOT all-reduced (avoids 4x).
     if self.tp_size > 1:
         routed = tensor_model_parallel_all_reduce(routed)
     if self.shared_experts is not None:
         routed = routed.float() + self.shared_experts(flat).float()
     final_hidden_states = routed.to(torch.bfloat16)
 
-    _diag("moe_out", final_hidden_states)
-    if os.environ.get("HPU_DUMP") == "1":
-        _HPU_CAP.setdefault("moe_out", {})[lidx] = (
-            final_hidden_states.detach().float().clone()
-        )
     return final_hidden_states.view(org_shape)
 
 
