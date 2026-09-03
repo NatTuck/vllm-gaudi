@@ -606,14 +606,14 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         sin = freqs.sin() * scale
         self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
         idx_h = self.indexer.head_dim if (rate == 4 and self.indexer is not None) else D
-        max_win = 2 * rate
-        self._c_win_kv = torch.zeros(max_win, 2 * D, dtype=torch.bfloat16, device=dev)
-        self._c_win_gate = torch.zeros(max_win, 2 * D, dtype=torch.bfloat16, device=dev)
+        max_tokens = rate * 2 + 128  # prefill up to 128 tokens + leftover
+        self._c_win_kv = torch.zeros(max_tokens, 2 * D, dtype=torch.bfloat16, device=dev)
+        self._c_win_gate = torch.zeros(max_tokens, 2 * D, dtype=torch.bfloat16, device=dev)
         self._c_comp = torch.zeros(cap, D, dtype=torch.bfloat16, device=dev)
         self._c_ovl_kv = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
         self._c_ovl_gate = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
-        self._i_win_kv = torch.zeros(max_win, 2 * idx_h, dtype=torch.bfloat16, device=dev)
-        self._i_win_gate = torch.zeros(max_win, 2 * idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_win_kv = torch.zeros(max_tokens, 2 * idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_win_gate = torch.zeros(max_tokens, 2 * idx_h, dtype=torch.bfloat16, device=dev)
         self._i_comp = torch.zeros(cap, idx_h, dtype=torch.bfloat16, device=dev)
         self._i_ovl_kv = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
         self._i_ovl_gate = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
