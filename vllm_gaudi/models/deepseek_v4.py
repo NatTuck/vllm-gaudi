@@ -35,10 +35,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.sequence import IntermediateTensors
 
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4CSACompressor,
-    DeepseekV4HCACompressor,
-)
+
 
 _DIAG_DONE = {"v": False}
 
@@ -87,8 +84,13 @@ def _apply_rope(
     cos_sin_cache: torch.Tensor,
     rope_head_dim: int,
 ) -> torch.Tensor:
-    """GPT-J (interleaved-pair) RoPE applied to the LAST rope_head_dim dims."""
-    cache = cos_sin_cache.to(x.dtype).index_select(0, positions)  # [T, 2*half]
+    """GPT-J (interleaved-pair) RoPE applied to the LAST rope_head_dim dims.
+
+    Rotates in fp32 with the fp32 cos/sin cache (index_select, not a bf16
+    cast of the whole cache) so results match the reference
+    ``apply_rotary_pos_emb`` bit-exactly and are graph-stable.
+    """
+    cache = cos_sin_cache.index_select(0, positions)  # [T, 2*half]
     half = rope_head_dim // 2
     cos, sin = cache.chunk(2, dim=-1)  # [T, half]
     x_pass = x[..., :-rope_head_dim]
@@ -99,10 +101,10 @@ def _apply_rope(
     dims = x.dim()
     c = cos.unsqueeze(1) if dims == 3 else cos
     s = sin.unsqueeze(1) if dims == 3 else sin
-    r0 = x0 * c - x1 * s
-    r1 = x0 * s + x1 * c
+    r0 = x0.float() * c - x1.float() * s
+    r1 = x0.float() * s + x1.float() * c
     rot = torch.stack([r0, r1], dim=-1).reshape(shape)
-    return torch.cat([x_pass, rot], dim=-1)
+    return torch.cat([x_pass, rot.to(x.dtype)], dim=-1)
 
 
 def _attn_with_sink(
@@ -117,6 +119,9 @@ def _attn_with_sink(
 
     q: [T, H, D]; k (= v): [K, H, D]; mask: [T, K] bool (True = allow), or None.
     sink: [H] per-head logit.
+
+    Reference/eager math (used to validate the FusedSDPA compiled path). einsum
+    is fine here; the graph-compiled path uses _attn_with_sink_fsdpa.
     """
     sc = torch.einsum("thd,khd->thk", q.float(), k.float()) * scaling  # [T,H,K]
     if mask is not None:
@@ -130,6 +135,86 @@ def _attn_with_sink(
     return out.to(q.dtype)
 
 
+def _attn_with_sink_fsdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    mask: torch.Tensor | None,
+    sink: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    """Graph-compiled V4 attention via the HPU FusedSDPA kernel.
+
+    The per-head attention sink is folded into the additive ``attn_mask`` as a
+    zero-valued extra key column whose bias is the per-head sink logit. This
+    computes ``softmax([q·k^T | sink]) · [v | 0]`` == ``_attn_with_sink``
+    (validated cos 0.99998) but is graph-compilable on ``hpu_backend``
+    (``torch.einsum`` is not). ``softmax_mode='fp32'`` is the only mode that
+    compiles here.
+
+    q [T,H,D]; k (= v) [K,H,D]; mask [T,K] bool (True=allow) or None (decode).
+    Returns [T,H,D].
+    """
+    K = k.shape[0]
+    zeros = torch.zeros(1, k.shape[1], k.shape[2], dtype=k.dtype, device=k.device)
+    k_ext = torch.cat([k, zeros], dim=0)  # [K+1,H,D]
+    v_ext = torch.cat([k, zeros], dim=0)
+    T, H, D = q.shape
+    bias = torch.zeros((1, H, T, K), dtype=torch.float32, device=q.device)
+    if mask is not None:
+        bias = torch.where(
+            mask.unsqueeze(0).unsqueeze(0), bias, torch.full((), float("-inf"), device=q.device)
+        )
+    sinkcol = sink.float().reshape(1, H, 1, 1).expand(1, H, T, 1)
+    bias = torch.cat([bias, sinkcol], dim=-1)  # [1,H,T,K+1]
+    qh = q.unsqueeze(0).transpose(1, 2).contiguous()     # [1,H,T,D]
+    kh = k_ext.unsqueeze(0).transpose(1, 2).contiguous()  # [1,H,K+1,D]
+    vh = v_ext.unsqueeze(0).transpose(1, 2).contiguous()
+    out = torch.ops.hpu.sdpa_recomp_fwd(
+        qh, kh, vh, bias, 0.0, scaling, False, False, "fp32", None, "right", (-1, -1), None
+    )
+    out = out[0] if isinstance(out, tuple) else out
+    return out.transpose(1, 2).squeeze(0).to(q.dtype)  # [T,H,D]
+
+
+def _attn_with_sink_matmul(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    mask: torch.Tensor | None,
+    sink: torch.Tensor,
+    scaling: float,
+) -> torch.Tensor:
+    """Graph-compilable V4 attention via explicit ``torch.bmm`` (no einsum,
+    no ``torch.ops.hpu.sdpa_recomp_fwd``). Matches the FusedSDPA version's
+    contract: the sink is folded into the last key column (zero-valued key
+    with per-head sink logit bias). ``torch.bmm`` compiles on
+    ``hpu_backend`` and avoids HPU runtime bugs (e.g. segfault with
+    ``sdpa_recomp_fwd`` for large prefill shapes).
+
+    q [T,H,D]; k (= v) [K,H,D]; mask [T,K] bool (True=allow) or None.
+    Returns [T,H,D].
+    """
+    K = k.shape[0]
+    T, H, D = q.shape
+    zeros = torch.zeros(1, H, D, dtype=k.dtype, device=k.device)
+    k_ext = torch.cat([k, zeros], dim=0)  # [K+1, H, D]
+    qf = q.float(); kf = k_ext.float()
+    q_hd = qf.permute(1, 0, 2).contiguous()    # [H, T, D]
+    k_hd = kf.permute(1, 0, 2).contiguous()    # [H, K+1, D]
+    sc = torch.bmm(q_hd, k_hd.transpose(-1, -2)).permute(1, 0, 2)  # [T, H, K+1]
+    sc = sc * scaling
+    bias = torch.zeros(T, H, K + 1, dtype=torch.float32, device=q.device)
+    if mask is not None:
+        bias[:, :, :K].masked_fill_(~mask.unsqueeze(1), float("-inf"))
+    bias[:, :, -1] = sink.float().reshape(1, -1)
+    combined = sc + bias
+    combined = combined - combined.max(dim=-1, keepdim=True).values
+    probs = torch.softmax(combined, dim=-1)
+    sp = probs.permute(1, 0, 2).contiguous()  # [H, T, K+1]
+    kf_p = kf.permute(1, 0, 2).contiguous()   # [H, K+1, D]
+    out = torch.bmm(sp, kf_p).permute(1, 0, 2)  # [T, H, D]
+    return out.to(q.dtype)
+
+
 
 def _apply_inv_rope(
     x: torch.Tensor,
@@ -137,7 +222,7 @@ def _apply_inv_rope(
     cos_sin_cache: torch.Tensor,
     rope_head_dim: int,
 ) -> torch.Tensor:
-    cache = cos_sin_cache.to(x.dtype).index_select(0, positions)
+    cache = cos_sin_cache.index_select(0, positions)
     half = rope_head_dim // 2
     cos, sin = cache.chunk(2, dim=-1)
     x_pass = x[..., :-rope_head_dim]
@@ -148,10 +233,10 @@ def _apply_inv_rope(
     dims = x.dim()
     c = cos.unsqueeze(1) if dims == 3 else cos
     s = sin.unsqueeze(1) if dims == 3 else sin
-    r0 = x0 * c + x1 * s
-    r1 = -x0 * s + x1 * c
+    r0 = x0.float() * c + x1.float() * s
+    r1 = -x0.float() * s + x1.float() * c
     rot = torch.stack([r0, r1], dim=-1).reshape(shape)
-    return torch.cat([x_pass, rot], dim=-1)
+    return torch.cat([x_pass, rot.to(x.dtype)], dim=-1)
 
 
 def _mhc_pre_broadcast(
@@ -193,6 +278,45 @@ def _mhc_pre_broadcast(
     if _hcc.environ.get("HPU_DUMP") == "1" and _hcc.environ.get("HPU_DUMP_MHC") == "1":
         _HPU_CAP.setdefault("mhc_pre", {})[0] = pre_mix.detach().float().clone()
         _HPU_CAP.setdefault("mhc_collapsed", {})[0] = collapsed_pre.detach().float().clone()
+    return residual_out, post_mix.unsqueeze(-1), comb_mix, layer_input
+
+
+def _mhc_pre_broadcast_compilable(
+    x: torch.Tensor,
+    fn_broadcast: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+    hc_mult: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``_mhc_pre_broadcast`` without HPU_DUMP — safe for ``torch.compile``."""
+    T, H = x.shape
+    x_float = x.float()
+    mixes = x_float @ fn_broadcast.t()
+    sqrsum = x_float.square().sum(-1, keepdim=True)
+    mixes = mixes * torch.rsqrt(sqrsum / H + rms_eps)
+    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+    post_logits = mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    post_mix = torch.sigmoid(post_logits) * hc_post_mult
+    comb_logits = (
+        mixes[:, 2 * hc_mult :].view(T, hc_mult, hc_mult) * hc_scale[2]
+        + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+    )
+    comb_mix = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+    comb_mix = comb_mix / (comb_mix.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb_mix = comb_mix / (comb_mix.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+        comb_mix = comb_mix / (comb_mix.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    residual_out = (pre_mix.unsqueeze(-1) * x.unsqueeze(1)).to(x.dtype)
+    collapsed_pre = residual_out.sum(1)
+    layer_input = _rmsnorm(collapsed_pre, norm_eps, norm_weight)
     return residual_out, post_mix.unsqueeze(-1), comb_mix, layer_input
 
 
@@ -238,8 +362,61 @@ def _mhc_fused_post_pre(
         comb_mix_cur = comb_mix_cur / (comb_mix_cur.sum(-1, keepdim=True) + hc_sinkhorn_eps)
         comb_mix_cur = comb_mix_cur / (comb_mix_cur.sum(-2, keepdim=True) + hc_sinkhorn_eps)
     layer_input_cur = torch.sum(pre_mix.unsqueeze(-1) * r_flat.float(), dim=1).to(x.dtype)
-    if __import__("os").environ.get("HPU_DUMP") == "1" and _MHC_PHASE == "ffn":
-        _HPU_CAP.setdefault("mhc_ffn_prenorm", {})[_MHC_LAYER] = layer_input_cur.detach().float().clone()
+    if norm_weight is not None:
+        layer_input_cur = _rmsnorm(layer_input_cur, norm_eps, norm_weight)
+    return (
+        residual_cur,
+        post_mix_cur.view(*outer, hc_mult, 1),
+        comb_mix_cur.view(*outer, hc_mult, hc_mult),
+        layer_input_cur.view(*outer, H),
+    )
+
+
+def _mhc_fused_post_pre_compilable(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+    hc_mult: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``_mhc_fused_post_pre`` without HPU_DUMP — safe for ``torch.compile``."""
+    mixed_residual = torch.matmul(
+        comb_res_mix.float().transpose(-1, -2), residual.float()
+    )
+    post_term = post_layer_mix.float() * x.unsqueeze(-2).float()
+    residual_cur = (mixed_residual + post_term).to(residual.dtype)
+    outer = residual_cur.shape[:-2]
+    r_flat = residual_cur.reshape(-1, hc_mult, residual_cur.shape[-1])
+    T = r_flat.shape[0]
+    H = r_flat.shape[-1]
+    xf = r_flat.view(T, hc_mult * H).float()
+    mixes = xf @ fn.t()
+    sqrsum = xf.square().sum(-1, keepdim=True)
+    mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * H) + rms_eps)
+    pre_logits = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    pre_mix = torch.sigmoid(pre_logits) + hc_pre_eps
+    post_logits = mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    post_mix_cur = torch.sigmoid(post_logits) * hc_post_mult
+    comb_logits = (
+        mixes[:, 2 * hc_mult :].view(T, hc_mult, hc_mult) * hc_scale[2]
+        + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult)
+    )
+    comb_mix_cur = torch.softmax(comb_logits, dim=-1) + hc_sinkhorn_eps
+    comb_mix_cur = comb_mix_cur / (comb_mix_cur.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb_mix_cur = comb_mix_cur / (comb_mix_cur.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+        comb_mix_cur = comb_mix_cur / (comb_mix_cur.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    layer_input_cur = torch.sum(pre_mix.unsqueeze(-1) * r_flat.float(), dim=1).to(x.dtype)
     if norm_weight is not None:
         layer_input_cur = _rmsnorm(layer_input_cur, norm_eps, norm_weight)
     return (
@@ -263,76 +440,11 @@ def _hc_head(
     x_normed = _rmsnorm(x_flat, rms_eps)
     mixes = x_normed.float() @ fn.t()  # [T, hc_mult]
     pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps  # [T, hc_mult]
-    out = torch.einsum("tm,tmh->th", pre, hs_flat.float()).to(hs_flat.dtype)
+    out = torch.matmul(pre.unsqueeze(-2), hs_flat.float()).squeeze(-2).to(hs_flat.dtype)
     return out
 
 
-class _DSV4CompressionState:
-    """Port of the private ``DeepseekV4HCACache`` / ``DeepseekV4CSACache`` state
-    (the internal buffer / compressed / overlap bookkeeping the public
-    compressor & indexer modules drive via their ``past_key_values`` arg).
 
-    State is keyed by entry name ("compressor" / "indexer"): each holds the
-    pending source tokens between windows (``buffer_*``), the running list of
-    compressed KV entries emitted so far (``compressed_kv``), and how many
-    windows have closed (``entry_count``). CSA additionally carries per-name
-    overlap state for the two-series (Ca/Cb) window scheme. This replaces the
-    private methods ``store_compression_weights`` / ``update_compressor_states``
-    / ``update_overlap_state``.
-    """
-
-    def __init__(self, config, compress_rate: int):
-        self.config = config
-        self.compress_rate = compress_rate
-        self.buffer_kv: dict[str, torch.Tensor | None] = {"compressor": None, "indexer": None}
-        self.buffer_gate: dict[str, torch.Tensor | None] = {"compressor": None, "indexer": None}
-        self.compressed_kv: dict[str, torch.Tensor | None] = {"compressor": None, "indexer": None}
-        self.entry_count: dict[str, int] = {"compressor": 0, "indexer": 0}
-        self.overlap_kv: dict[str, torch.Tensor | None] = {"compressor": None, "indexer": None}
-        self.overlap_gate: dict[str, torch.Tensor | None] = {"compressor": None, "indexer": None}
-
-    def store_compression_weights(self, name, kv, gate):
-        first_window_position = self.entry_count[name] * self.compress_rate
-        buffered_kv, buffered_gate = self.buffer_kv[name], self.buffer_gate[name]
-        if buffered_kv is not None and buffered_kv.shape[1]:
-            kv = torch.cat([buffered_kv, kv], dim=1)
-            gate = torch.cat([buffered_gate, gate], dim=1)
-        usable = (kv.shape[1] // self.compress_rate) * self.compress_rate
-        self.buffer_kv[name], self.buffer_gate[name] = kv[:, usable:], gate[:, usable:]
-        return kv[:, :usable], gate[:, :usable], first_window_position
-
-    def update_compressor_states(self, name, compressed):
-        if self.compressed_kv[name] is None:
-            self.compressed_kv[name] = compressed
-        elif compressed.shape[1] > 0:
-            self.compressed_kv[name] = torch.cat([self.compressed_kv[name], compressed], dim=1)
-        self.entry_count[name] += compressed.shape[1]
-        return self.compressed_kv[name]
-
-    def update_overlap_state(self, name, chunk_kv, chunk_gate, head_dim):
-        prior_kv, prior_gate = self.overlap_kv[name], self.overlap_gate[name]
-        self.overlap_kv[name] = chunk_kv[:, -1, :, :head_dim].clone()
-        self.overlap_gate[name] = chunk_gate[:, -1, :, :head_dim].clone()
-        return prior_kv, prior_gate
-
-    def reset(self):
-        for d in (self.buffer_kv, self.buffer_gate, self.compressed_kv, self.overlap_kv, self.overlap_gate):
-            for k in d:
-                d[k] = None
-        for k in self.entry_count:
-            self.entry_count[k] = 0
-
-
-class _DSV4PkvShim:
-    """Minimal stand-in for ``past_key_values`` so the public compressor/indexer
-    modules can reach a single layer's ported state via
-    ``past_key_values.layers[layer_idx]``."""
-
-    def __init__(self, layer_idx: int, state: _DSV4CompressionState):
-        self._layer_idx = layer_idx
-        self._state = state
-        self.layers = [None] * (layer_idx + 1)
-        self.layers[layer_idx] = state
 
 
 class DeepseekV4HPUAttention(DeepseekV4Attention):
@@ -350,17 +462,19 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
     from vllm_gaudi.attention.backends.hpu_attn import HPUMLAAttentionBackend
 
     backend_cls = HPUMLAAttentionBackend
-    use_flashmla_fp8_layout = True
+    use_fp8_ds_mla_layout = False
 
     def __init__(self, *args, **kwargs) -> None:
         # The shared base and DeepseekV4Indexer allocate torch.cuda.Event in
         # __init__; HPU has no cuda streams, so redirect to torch.hpu.Event.
         _orig_event = torch.cuda.Event
         torch.cuda.Event = torch.hpu.Event  # type: ignore[assignment, misc]
-        try:
-            super().__init__(*args, **kwargs)
-        finally:
-            torch.cuda.Event = _orig_event  # type: ignore[assignment, misc]
+
+        # The base __init__ calls _resolve_dsv4_kv_cache_dtype; with
+        # use_fp8_ds_mla_layout=False it takes the bf16 branch and returns
+        # ("auto", bf16) — no hack needed.
+        super().__init__(*args, **kwargs)
+        torch.cuda.Event = _orig_event  # type: ignore[assignment, misc]
         # The checkpoint stores a full-head ``attn_sink`` ([n_heads]) that is
         # replicated across TP ranks (CUDA pads n_local_heads up to the global
         # head count so the sink param matches). Match that here so weight
@@ -371,31 +485,23 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             torch.full((self.n_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
         )
-        # Manual full-context KV cache (roped kv per layer) so DECODE steps can
-        # attend to the prompt + previously generated tokens. Without this, each
-        # generated token attends only to itself (num_tokens=1) -> content-free
-        # output. Reset on prefill, append on decode. (Not a real paged cache.)
-        self._kv_cache: list[torch.Tensor] | None = None
-        # Compressor state (DeepSeek V4 sparse attention): per-token kv/score
-        # states + the compressed-KV cache written at boundary positions.
-        self._comp_kv_states: torch.Tensor | None = None
-        self._comp_score_states: torch.Tensor | None = None
-        self._comp_kv_cache: list[torch.Tensor] = []
-        self._comp_kv_positions: list[int] = []
-        self._comp_coff = 2 if self.compress_ratio == 4 else 1
-        # Last cached token position, to detect a new sequence (reset caches).
-        self._last_pos: int | None = None
-        # True once the window cache has been seeded with the prompt's roped kv
-        # read from the engine's paged cache (for the first decode of a request).
-        self._paged_ctx_seeded: bool = False
+        # Window KV cache as ring buffer with tensor counter
+        self._win_cache_device = self.fused_wqa_wkv.weight.device
+        self.window_size = getattr(self, "window_size", 128)
+        self._win_cache = torch.zeros(
+            self.window_size, self.head_dim,
+            dtype=torch.bfloat16, device=self.fused_wqa_wkv.weight.device,
+        )
+        self._win_n = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
+        self._decode_pos = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
 
-        # Public sparse-attention modules (built lazily after weights load) and
-        # the ported private compression state.
+        # Compressor kernel state (capacity buffers + counters)
         vllm_config = kwargs.get("vllm_config", None) or (args[0] if args else None)
         self._hf_config = getattr(vllm_config, "model_config", None).hf_config
-        self._pub_sparse = None
-        self._comp_state = None
-        self._pkv_shim = None
+        self._compress_cache = None
+        self._comp_kernel_state = None
+        self._comp_coff = 2 if self.compress_ratio == 4 else 1
+        self._comp_reset = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -459,224 +565,275 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         dst.position_bias.data.copy_(src.ape.data)
         dst.kv_norm.weight.data.copy_(src.norm.weight.data)
 
-    def _build_public_sparse(self):
-        """Lazily build the public transformers compressor/indexer from the
-        checkpoint weights already loaded into the vLLM compressor/indexer.
 
-        A fresh transformers config is loaded (from the checkpoint path) because
-        the server's ``hf_config`` carries a flat ``rope_parameters`` dict (for
-        the vLLM rope builder), while the public transformers compressor/indexer
-        expect the nested per-rope-type form."""
-        if self._pub_sparse is not None:
-            return self._pub_sparse
-        cfg = self._hf_config
-        path = getattr(cfg, "_name_or_path", None)
-        if path:
-            from transformers import AutoConfig
-            try:
-                cfg = AutoConfig.from_pretrained(path, trust_remote_code=True)
-            except Exception:
-                cfg = self._hf_config
-        if self.compress_ratio == 4:
-            pub = DeepseekV4CSACompressor(cfg)
-        else:
-            pub = DeepseekV4HCACompressor(cfg)
-        comp = self.compressor
-        self._copy_fused_compressor(comp, pub, self.head_dim)
-        if self.compress_ratio == 4:
-            idx = self.indexer
-            pub_idx = pub.indexer
-            self._copy_fused_compressor(idx.compressor, pub_idx, idx.head_dim)
-            wq = self._dequant_fp8_weight(idx.wq_b)
-            pub_idx.q_b_proj.weight.data.copy_(wq)
-            pub_idx.scorer.weights_proj.weight.data.copy_(
-                idx.weights_proj.weight.data
-            )
-        pub = pub.to(torch.bfloat16).to(comp.device)
-        self._pub_sparse = pub
-        print(f"[diag] built public {type(pub).__name__} ratio={self.compress_ratio} "
-              f"layer={getattr(self, '_layer_idx', -1)}", flush=True)
-        return pub
-
-    def _compression(self):
-        if self._comp_state is None:
-            self._comp_state = _DSV4CompressionState(
-                self._hf_config, self.compress_ratio
-            )
-            self._pkv_shim = _DSV4PkvShim(getattr(self, "_layer_idx", 0), self._comp_state)
-        return self._comp_state, self._pkv_shim
 
     def _run_compressor(self, hidden_states, q_residual, positions):
-        """Run the public compressor/indexer over real tokens -> (compressed_kv,
-        block_bias). Returns squeezed [n_comp, D] and [n_valid, n_comp] mask (or
-        None)."""
+        """Run the graph-compilable CSA compressor/indexer over real tokens ->
+        (compressed_kv_full, compressed_n, block_bias_full). Returns static-shape
+        [CAP, D] buffer (padded with zeros past count), scalar count, and
+        [T, CAP] block_bias (or None for decode)."""
         if self.compressor is None or self.compress_ratio <= 1:
-            return None, None, None
-        pub = self._build_public_sparse()
-        state, shim = self._compression()
-        hs = hidden_states.unsqueeze(0)
-        qr = q_residual.unsqueeze(0)
-        pos = positions.unsqueeze(0)
-        compressed_kv, block_bias = pub(
-            hs, qr, pos, shim, getattr(self, "_layer_idx", 0)
+            D = self.head_dim
+            dev = hidden_states.device
+            empty = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
+            return empty, torch.tensor(0, dtype=torch.int64, device=dev), None, None
+        reset = getattr(self, "_comp_reset", False)
+        self._comp_reset = False
+        ckv_full, c_n, bb, _topk = self._compressor_compilable(
+            hidden_states, q_residual, positions, reset=reset
         )
-        n_comp = compressed_kv.shape[2]
-        if n_comp == 0 or block_bias is None:
-            return None, None, None
-        ckv = compressed_kv[0, 0]  # [n_comp, D]
-        bb = block_bias[0, 0]  # [n_valid, n_comp]
-        if os.environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 2:
-            _HPU_CAP.setdefault("comp_input", {})[0] = hs[0].detach().float().clone()
-            _HPU_CAP.setdefault("comp_kv", {})[0] = ckv.detach().float().clone()
-            _HPU_CAP.setdefault("comp_bb", {})[0] = bb.detach().float().clone()
-            _HPU_CAP.setdefault("comp_pos", {})[0] = positions.detach().cpu().clone()
-        return ckv, bb, n_comp
+        if ckv_full is None:
+            st = self._comp_kernel_state
+            cap = st["cap"] if st is not None else 0
+            dev = hidden_states.device
+            D = self.head_dim
+            empty = torch.zeros(cap or 1, D, dtype=torch.bfloat16, device=dev)
+            return empty, torch.tensor(0, dtype=torch.int64, device=dev), None, None
+        return ckv_full, c_n, bb, None
 
-    def _dequant_wo_a(self) -> torch.Tensor:
-        # wo_a is fp8 with a per-block or per-output-row scale; the einsum needs
-        # the REAL weight (fp8 bytes dequantized by that scale). Cache once.
-        cached = getattr(self, "_wo_a_weight_dequant", None)
-        if cached is None:
-            w = self.wo_a.weight.data.float()
-            # Prefer the block scale; fall back to whatever scale is present.
-            s = getattr(self.wo_a, "weight_scale_inv", None)
-            if s is None or s.numel() == 0:
-                s = getattr(self.wo_a, "weight_scale", None)
-            s = s.float()
-            if s.dim() == 2:
+    # ------------------------------------------------------------------
+    # Graph-compilable CSA compressor + indexer kernel (layer 2, ratio 4).
+    # Replaces the eager transformers public compressor (`_run_compressor`)
+    # with tensor ops. State (window buffer, running compressed list,
+    # overlap) is kept as capacity buffers + counters so the core compiles;
+    # returns (compressed_kv [n,D], block_bias [T,n], topk) in the same
+    # contract as `_run_compressor`.
+    # ------------------------------------------------------------------
+    def _get_compress_cache(self, cap: int) -> torch.Tensor:
+        if self._compress_cache is not None and self._compress_cache.shape[0] >= cap:
+            return self._compress_cache
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+            DeepseekV4CSACompressor,
+        )
+        pub = DeepseekV4CSACompressor(self._hf_config)
+        dev = self.compressor.ape.device
+        inv = pub.rotary_emb.compress_inv_freq.float().to(dev)
+        scale = pub.rotary_emb.compress_attention_scaling
+        p = torch.arange(cap, dtype=torch.float32, device=dev)
+        freqs = p.unsqueeze(1) * inv.unsqueeze(0)
+        cos = freqs.cos() * scale
+        sin = freqs.sin() * scale
+        self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
+        return self._compress_cache
+
+    def _init_comp_kernel_state(self, dev):
+        if self._comp_kernel_state is not None:
+            return self._comp_kernel_state
+        rate = self.compress_ratio
+        D = self.head_dim
+        idx_h = self.indexer.head_dim if (rate == 4 and self.indexer is not None) else D
+        cap = 4096
+        st = {
+            "rate": rate, "D": D, "idx_h": idx_h, "cap": cap, "dev": dev,
+            "c_win_kv": None, "c_win_gate": None, "c_win_n": 0,
+            "c_comp": torch.zeros(cap, D, dtype=torch.bfloat16, device=dev), "c_n": 0,
+            "c_ovl_kv": None, "c_ovl_gate": None,
+            "i_win_kv": None, "i_win_gate": None, "i_win_n": 0,
+            "i_comp": torch.zeros(cap, idx_h, dtype=torch.bfloat16, device=dev), "i_n": 0,
+            "i_ovl_kv": None, "i_ovl_gate": None,
+        }
+        self._comp_kernel_state = st
+        return st
+
+    def _comp_rmsnorm(self, x, w):
+        xf = x.float()
+        out = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
+        return (out * w.float()).to(x.dtype)
+
+    def _comp_store(self, buf_kv, buf_gate, buf_n, kv, gate, rate):
+        if buf_n > 0 and buf_kv is not None:
+            kv = torch.cat([buf_kv[:buf_n], kv], dim=0)
+            gate = torch.cat([buf_gate[:buf_n], gate], dim=0)
+        total = kv.shape[0]
+        usable = (total // rate) * rate
+        left = total - usable
+        return kv[:usable], gate[:usable], kv[usable:].clone(), gate[usable:].clone(), left
+
+    def _comp_windows(self, chunk_kv, chunk_gate, first_pos, Dk, ape, norm_w,
+                      cache, ovl_kv, ovl_gate, rope_dim):
+        rate = self.compress_ratio
+        nw = chunk_kv.shape[0] // rate
+        if nw == 0:
+            return chunk_kv.new_zeros((0, Dk))
+        ck = chunk_kv.view(nw, rate, 2 * Dk)
+        cg = chunk_gate.view(nw, rate, 2 * Dk) + ape
+        nk = chunk_kv.new_zeros(nw, 2 * rate, Dk)
+        ng = cg.new_full((nw, 2 * rate, Dk), float("-inf"))
+        nk[:, rate:] = ck[:, :, Dk:].to(chunk_kv.dtype)
+        ng[:, rate:] = cg[:, :, Dk:]
+        if nw > 1:
+            nk[1:, :rate] = ck[:-1, :, :Dk].to(chunk_kv.dtype)
+            ng[1:, :rate] = cg[:-1, :, :Dk]
+        if ovl_kv is not None:
+            nk[0, :rate] = ovl_kv.to(chunk_kv.dtype)
+            ng[0, :rate] = ovl_gate.to(cg.dtype)
+        soft = torch.softmax(ng.float(), dim=1)
+        comp = (nk.float() * soft).sum(dim=1).to(chunk_kv.dtype)
+        comp = self._comp_rmsnorm(comp, norm_w)
+        pos = torch.arange(nw, device=chunk_kv.device) * rate + first_pos
+        comp = _apply_rope(comp, pos, cache, rope_dim)
+        return comp
+
+    def _comp_overlap(self, chunk_kv, chunk_gate, Dk, ape):
+        if chunk_kv.shape[0] == 0:
+            return None, None
+        last = chunk_kv.view(-1, self.compress_ratio, 2 * Dk)[-1]
+        lastg = (chunk_gate.view(-1, self.compress_ratio, 2 * Dk) + ape)[-1]
+        return last[:, :Dk].clone(), lastg[:, :Dk].clone()
+
+    def _comp_windows_hca(self, chunk_kv, chunk_gate, first_pos, Dk, ape, norm_w,
+                          cache, rope_dim):
+        """Compress a batch of full HCA windows (no Ca/Cb, no overlap)."""
+        rate = self.compress_ratio
+        nw = chunk_kv.shape[0] // rate
+        if nw == 0:
+            return chunk_kv.new_zeros((0, Dk))
+        ck = chunk_kv.view(nw, rate, Dk)
+        cg = chunk_gate.view(nw, rate, Dk) + ape
+        soft = torch.softmax(cg.float(), dim=1)
+        comp = (ck.float() * soft).sum(dim=1).to(torch.bfloat16)
+        comp = self._comp_rmsnorm(comp, norm_w)
+        pos = torch.arange(nw, device=chunk_kv.device) * rate + first_pos
+        comp = _apply_rope(comp, pos, cache, rope_dim)
+        return comp
+
+    def _compressor_compilable(self, hidden, qr, positions, reset=False):
+        if self.compressor is None or self.compress_ratio <= 1:
+            return None, None, None, None
+        rate = self.compress_ratio
+        D = self.head_dim
+        dev = hidden.device
+        st = self._init_comp_kernel_state(dev)
+        if reset:
+            st["c_win_kv"] = st["c_win_gate"] = None
+            st["c_win_n"] = 0
+            st["c_n"] = 0
+            st["c_ovl_kv"] = st["c_ovl_gate"] = None
+            st["i_win_kv"] = st["i_win_gate"] = None
+            st["i_win_n"] = 0
+            st["i_n"] = 0
+            st["i_ovl_kv"] = st["i_ovl_gate"] = None
+        cache = self._get_compress_cache(st["cap"] * rate + 16)
+
+        c = self.compressor
+        fused = c.fused_wkv_wgate.weight.data
+        coff = getattr(self, "_comp_coff", 2 if rate == 4 else 1)
+        kv_out = coff * D
+        kv_w = fused[:kv_out]
+        gate_w = fused[kv_out:]
+        ape = c.ape.to(torch.bfloat16)
+        norm_w = c.norm.weight
+
+        kv = hidden @ kv_w.t()
+        gate = hidden @ gate_w.t()
+        ckv, cgate, wkv, wgate, wleft = self._comp_store(
+            st["c_win_kv"], st["c_win_gate"], st["c_win_n"], kv, gate, rate)
+        st["c_win_kv"] = wkv if wleft > 0 else None
+        st["c_win_gate"] = wgate if wleft > 0 else None
+        st["c_win_n"] = wleft
+        if rate == 4:
+            comp = self._comp_windows(ckv, cgate, st["c_n"] * rate, D, ape, norm_w,
+                                      cache, st["c_ovl_kv"], st["c_ovl_gate"], self.rope_head_dim)
+        else:
+            comp = self._comp_windows_hca(ckv, cgate, st["c_n"] * rate, D, ape, norm_w,
+                                          cache, self.rope_head_dim)
+        if comp.shape[0] > 0:
+            st["c_comp"][st["c_n"]: st["c_n"] + comp.shape[0]] = comp
+            st["c_n"] += comp.shape[0]
+        if rate == 4 and ckv.shape[0] // rate > 0:
+            st["c_ovl_kv"], st["c_ovl_gate"] = self._comp_overlap(ckv, cgate, D, ape)
+        compressed_kv_slice = st["c_comp"][: st["c_n"]]
+        compressed_kv_full = st["c_comp"]
+
+        # ---- indexer (only CSA, ratio 4) ----
+        has_idx = rate == 4 and self.indexer is not None
+        if has_idx:
+            idx_h = st["idx_h"]
+            idx = self.indexer
+            ifused = idx.compressor.fused_wkv_wgate.weight.data
+            ikv_w = ifused[: 2 * idx_h]
+            igate_w = ifused[2 * idx_h:]
+            iape = idx.compressor.ape.to(torch.bfloat16)
+            inorm_w = idx.compressor.norm.weight
+            ikv = hidden @ ikv_w.t()
+            igate = hidden @ igate_w.t()
+            ikv2, igate2, iwkv, iwg, iwleft = self._comp_store(
+                st["i_win_kv"], st["i_win_gate"], st["i_win_n"], ikv, igate, rate)
+            st["i_win_kv"] = iwkv if iwleft > 0 else None
+            st["i_win_gate"] = iwg if iwleft > 0 else None
+            st["i_win_n"] = iwleft
+            icomp = self._comp_windows(ikv2, igate2, st["i_n"] * rate, idx_h, iape, inorm_w,
+                                       cache, st["i_ovl_kv"], st["i_ovl_gate"], self.rope_head_dim)
+            if icomp.shape[0] > 0:
+                st["i_comp"][st["i_n"]: st["i_n"] + icomp.shape[0]] = icomp
+                st["i_n"] += icomp.shape[0]
+            if ikv2.shape[0] // rate > 0:
+                st["i_ovl_kv"], st["i_ovl_gate"] = self._comp_overlap(ikv2, igate2, idx_h, iape)
+            idx_compressed = st["i_comp"][: st["i_n"]]
+        else:
+            idx_compressed = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
+
+        # ---- scorer / topk / block_bias ----
+        T = hidden.shape[0]
+        clen = compressed_kv_slice.shape[0]
+        cap = st["cap"]
+        if has_idx and clen > 0:
+            nhead = self.indexer.n_head
+            qb_w = self.indexer.wq_b.weight.data
+            if qb_w.dtype == torch.float8_e4m3fn:
                 from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
-
-                # wo_a is BLOCK-fp8. scale_adjustment halves the fp8 weight bytes
-                # (*0.5) but does NOT double this block scale, so the block dequant
-                # lands at exactly 0.5x the checkpoint's true value (measured ratio
-                # 2.000). Double it so the einsum uses the real checkpoint value.
-                cached = (
-                    dequant_block_fp8_weight_naive(
-                        self.wo_a.weight.data,
-                        self.wo_a.weight_scale_inv.data,
-                        self.wo_a.quant_config.weight_block_size,
-                        torch.float32,
-                    )
-                    * 2.0
-                ).detach()
-            elif s.numel() == w.shape[0]:
-                # per-output-row scale: dequant[r, c] = w[r, c] * s[r].
-                # The fp8 weight was *0.5'd by scale_adjustment to fit e4m3fnuz,
-                # but this per-row scale was NOT *2.0'd (it's a 1D scale, unlike
-                # the block/uint8 scales handled in gaudi_weight_wrapper). Undo the
-                # halving so the dequant matches the checkpoint's real block values.
-                cached = (w * s.view(-1, 1) * 2.0).detach()
+                wq_s = getattr(self.indexer.wq_b, "weight_scale", None)
+                if wq_s is None:
+                    wq_s = getattr(self.indexer.wq_b, "weight_scale_inv", None)
+                qb = dequant_block_fp8_weight_naive(
+                    qb_w,
+                    wq_s,
+                    getattr(getattr(self.indexer.wq_b, "quant_config", None),
+                            "weight_block_size", (128, 128)),
+                    torch.bfloat16)
             else:
-                # per-input-col scale: dequant[r, c] = w[r, c] * s[c]
-                cached = (w * s.view(1, -1)).detach()
-            self._wo_a_weight_dequant = cached
-            si = getattr(self.wo_a, "weight_scale_inv", None)
-            ss = getattr(self.wo_a, "weight_scale", None)
-            print(f"[diag] wo_a dequant: scale_inv={tuple(si.shape) if si is not None else 'NA'} "
-                  f"scale={tuple(ss.shape) if ss is not None else 'NA'} bs={getattr(self.wo_a.quant_config,'weight_block_size',None)} "
-                  f"w_dq abs_mean={float(cached.abs().mean()):.5g} abs_max={float(cached.abs().max()):.5g}", flush=True)
-        return cached
-
-    def _prep_attn_weights(self) -> dict:
-        """Read all attention fp8 linears from the checkpoint and dequantize with
-        their block scales to the exact bf16 weights (caching once).
-
-        The HPU's fused/per-row scale representation is a lossy conversion of the
-        checkpoint block scales (fused_wqa_wkv, wq_b, wo_a, wo_b all end up with
-        per-row scales that leave small element residuals). Dequantizing the
-        checkpoint's own block-fp8 weights (fp8 * e8m0, block [128,128]) recovers
-        the exact reference value. The checkpoint fp8 is e4m3fn (max 448), which
-        the HPU's e4m3fnuz decode cannot represent (>240 -> NaN), so this runs on
-        CPU as one-time load-time weight prep and caches the bf16 result on HPU.
-
-        Returns dict w/ keys: wq_a, wkv, wq_b, wo_a, wo_b (TP-sliced to this rank).
-        """
-        cached = getattr(self, "_attn_w", None)
-        if cached is not None:
-            return cached
-        import glob as _glob
-        from safetensors import safe_open
-        from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
-        from vllm.distributed import get_tensor_model_parallel_rank
-
-        path = getattr(self._hf_config, "_name_or_path", None)
-        lidx = getattr(self, "_layer_idx", -1)
-        dev = self.wq_b.weight.device
-        rank = get_tensor_model_parallel_rank()
-        P = f"layers.{lidx}.attn."
-
-        import vllm_gaudi.models.deepseek_v4 as _MOD
-        if getattr(_MOD, "_SHARD_MAP", None) is None:
-            _MOD._SHARD_MAP = {}
-            for f in _glob.glob(path + "/model-*.safetensors"):
-                with safe_open(f, framework="pt") as sf:
-                    for k in sf.keys():
-                        _MOD._SHARD_MAP[k] = f
-
-        def load(name):
-            f = _MOD._SHARD_MAP.get(name)
-            if f is None:
-                raise KeyError(name)
-            with safe_open(f, framework="pt") as sf:
-                return sf.get_tensor(name)
-
-        def dq(name):
-            w = load(P + name + ".weight")
-            s = load(P + name + ".scale").float()
-            return dequant_block_fp8_weight_naive(w, s, (128, 128), torch.float32).to(
-                torch.bfloat16
+                qb = qb_w.to(torch.bfloat16)
+            wp = self.indexer.weights_proj.weight
+            ss = self.indexer.head_dim ** -0.5
+            ws = self.indexer.n_head ** -0.5
+            q = (qr @ qb.t()).view(T, nhead, idx_h).to(torch.bfloat16)
+            q = _apply_rope(q, positions, cache, self.rope_head_dim)
+            scores = torch.matmul(q.float(), idx_compressed.float().t())
+            scores = torch.relu(scores) * ss
+            w = (hidden @ wp.t()).float() * ws
+            scores = (scores * w.unsqueeze(-1)).sum(dim=1)
+            causal_threshold = (positions + 1) // rate
+            entry = torch.arange(clen, device=scores.device)
+            future = entry.unsqueeze(0) >= causal_threshold.unsqueeze(-1)
+            scores = scores.masked_fill(future, float("-inf"))
+            k = min(self.indexer.topk_tokens, clen)
+            topk = scores.topk(k, dim=-1).indices
+            invalid = topk >= causal_threshold.unsqueeze(-1)
+            topk = torch.where(invalid, torch.full_like(topk, -1), topk)
+            valid = topk >= 0
+            safe = torch.where(valid, topk, torch.full_like(topk, clen))
+            # Static-shape block_bias [T, cap]: valid entries at safe indices,
+            # padding (beyond clen) and invalid entries -> -inf
+            bb = compressed_kv_full.new_full((1, 1, T, cap + 1), float("-inf"))
+            safe_cap = torch.where(valid, topk, torch.full_like(topk, cap))
+            bb.scatter_(-1, safe_cap.unsqueeze(0).unsqueeze(0), 0.0)
+            # Also mark real padding (beyond clen) as -inf (already done via safe_cap -> cap)
+            block_bias = bb[..., :cap][0, 0]
+        elif clen > 0 and T > 1:
+            # HCA: causal block_bias (no indexer). seq=1 -> None (matches ref).
+            # Static-shape: block_bias [T, cap], padding beyond clen -> -inf
+            causal = (positions + 1) // rate
+            entry = torch.arange(cap, device=dev)
+            block_bias = compressed_kv_full.new_full((T, cap), float("-inf"))
+            block_bias.masked_fill_(
+                (entry.unsqueeze(0) < causal.unsqueeze(-1)) & (entry.unsqueeze(0) < clen),
+                0.0
             )
-
-        wq_a = dq("wq_a")  # [q_lora_rank, hidden] replicated
-        wkv = dq("wkv")  # [head_dim, hidden] replicated
-        wq_b_full = dq("wq_b")  # [n_heads*head_dim, q_lora_rank]
-        wq_b = wq_b_full[rank * self.n_local_heads * self.head_dim:
-                         (rank + 1) * self.n_local_heads * self.head_dim]
-        wo_a_full = dq("wo_a")  # [n_groups*o_lora_rank, ...]
-        wo_a = wo_a_full[rank * self.n_local_groups * self.o_lora_rank:
-                         (rank + 1) * self.n_local_groups * self.o_lora_rank]
-        wo_b_full = dq("wo_b")  # [hidden, n_groups*o_lora_rank]
-        wo_b = wo_b_full[:, rank * self.n_local_groups * self.o_lora_rank:
-                         (rank + 1) * self.n_local_groups * self.o_lora_rank]
-        out = dict(wq_a=wq_a.to(dev), wkv=wkv.to(dev), wq_b=wq_b.to(dev),
-                   wo_a=wo_a.to(dev), wo_b=wo_b.to(dev))
-        self._attn_w = out
-        return out
-
-    def _dequant_wq_b(self) -> torch.Tensor:
-        """Dequantize the block-fp8 `wq_b` (TP-sharded ColumnParallelLinear) to
-        the true bf16 weight, caching once.
-
-        `scale_adjustment` halves the fp8 weight bytes (*0.5) to fit e4m3fnuz but
-        does NOT double this block scale (the e8m0 branch of gaudi_weight_wrapper
-        returns before scale_adjustment), so the vLLM apply path dequantizes to
-        exactly 0.5x. Mirrors `_dequant_wo_a`: dequant(halved_weight, scale) then
-        *2.0 recovers the real weight (verified == fp8*e8m0 to ~1e-6). Running the
-        query projection as a plain matmul on the real weight also avoids the
-        fused block-fp8 apply path's per-element residual."""
-        cached = getattr(self, "_wq_b_dequant", None)
-        if cached is None:
-            w = self.wq_b.weight.data.float()
-            s = getattr(self.wq_b, "weight_scale_inv", None)
-            if s is None or s.numel() == 0:
-                s = getattr(self.wq_b, "weight_scale", None)
-            s = s.float()
-            if s.dim() == 2:
-                from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
-
-                bs = getattr(self.wq_b.quant_config, "weight_block_size", None) or (128, 128)
-                cached = (
-                    dequant_block_fp8_weight_naive(
-                        self.wq_b.weight.data, s.data, bs, torch.float32
-                    )
-                    * 2.0
-                )
-            elif s.numel() == w.shape[0]:
-                cached = w * s.view(-1, 1) * 2.0
-            else:
-                cached = w * s.view(1, -1)
-            self._wq_b_dequant = cached.to(torch.bfloat16).detach()
-        return self._wq_b_dequant
+            topk = torch.empty(T, 0, dtype=torch.long, device=dev)
+        else:
+            block_bias = None
+            topk = torch.empty(T, 0, dtype=torch.long, device=dev)
+        return compressed_kv_full, st["c_n"], block_bias, topk
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # o: [T, n_local_heads, head_dim] -- inverse RoPE + wo_a (group bmm) + wo_b
@@ -694,7 +851,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # wo_a is a TP-sharded ColumnParallelLinear; its weight is laid out as
         # [n_local_groups * o_lora_rank, heads_per_group * head_dim]. Reshape to
         # [n_local_groups, o_lora_rank, heads_per_group * head_dim] for a group bmm.
-        w = self._prep_attn_weights()["wo_a"].view(
+        # Dequant block-fp8 weight on-the-fly (no CPU round-trip, no cache).
+        from vllm_gaudi.extension.ops import _dequant_fp8_weight, apply_block_fp8_linear_hpu_gemm
+        wo_a_bf16 = _dequant_fp8_weight(self.wo_a.weight, self.wo_a.weight_scale_inv)
+        w = wo_a_bf16.view(
             self.n_local_groups, self.o_lora_rank, heads_per_group * self.head_dim
         )
         o_flat = o_g.reshape(num_tokens, self.n_local_groups, heads_per_group * self.head_dim)
@@ -705,7 +865,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             _HPU_CAP.setdefault("z_einsum", {})[getattr(self, "_layer_idx", -1)] = z.detach().float().clone()
         if __import__("os").environ.get("HPU_DUMP") == "1":
             _HPU_CAP.setdefault("wo_a_dq", {})[getattr(self, "_layer_idx", -1)] = \
-                self._dequant_wo_a().detach().float().clone()
+                wo_a_bf16.detach().float().clone()
             _HPU_CAP.setdefault("wo_a_raw", {})[getattr(self, "_layer_idx", -1)] = \
                 self.wo_a.weight.detach().float().clone()
             si = getattr(self.wo_a, "weight_scale_inv", None)
@@ -719,17 +879,47 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             _HPU_CAP.setdefault("wo_b_scale", {})[getattr(self, "_layer_idx", -1)] = \
                 (bs.detach().float().clone() if bs is not None else None)
         z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
-        # wo_b is RowParallel (TP-sliced over the input = group-pair dims); each
-        # rank computes only ITS group-pair's contribution. Use the exact bf16
-        # wo_b from the checkpoint and all-reduce across TP ranks to combine all
-        # groups (matching the RowParallel reduce; HPU is not sequence parallel).
-        wo_b = self._prep_attn_weights()["wo_b"]
-        out = torch.matmul(z, wo_b.t())
+        out = apply_block_fp8_linear_hpu_gemm(
+            z, self.wo_b.weight, self.wo_b.weight_scale_inv,
+            self.wo_b.quant_config.weight_block_size,
+        )
         out = out[0] if isinstance(out, tuple) else out
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         out = tensor_model_parallel_all_reduce(out)
         _diag("op_after_wo_b", out)
+        return out
+
+    def _o_proj_compilable(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """O projection without HPU_DUMP / _diag — safe for torch.compile.
+
+        Applies fp32 composition through the full projection chain (same pattern
+        as the MoE routed/shared experts): keep all intermediates in fp32, cast
+        to bf16 only at the very end. This prevents the ulp-stacking tail from
+        multiple sequential bf16 truncations.
+        """
+        from vllm_gaudi.extension.ops import _dequant_fp8_weight
+        o = _apply_inv_rope(
+            o, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim
+        )
+        num_tokens = o.shape[0]
+        heads_per_group = self.n_local_heads // self.n_local_groups
+        o_g = o.view(num_tokens, self.n_local_groups, heads_per_group, self.head_dim)
+        wo_a_bf16 = _dequant_fp8_weight(self.wo_a.weight, self.wo_a.weight_scale_inv)
+        w = wo_a_bf16.view(
+            self.n_local_groups, self.o_lora_rank, heads_per_group * self.head_dim
+        )
+        o_flat = o_g.reshape(num_tokens, self.n_local_groups, heads_per_group * self.head_dim)
+        # fp32 group matmul — keep in fp32 (no cast to bf16)
+        z = torch.matmul(
+            o_flat.float().permute(1, 0, 2), w.float().transpose(-1, -2)
+        ).permute(1, 0, 2)
+        z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
+        # fp32 wo_b matmul — dequant to bf16 then cast to fp32 for the product
+        wo_b_bf16 = _dequant_fp8_weight(self.wo_b.weight, self.wo_b.weight_scale_inv)
+        out = (z.float() @ wo_b_bf16.float().t()).to(torch.bfloat16)
+        from vllm.distributed import tensor_model_parallel_all_reduce
+        out = tensor_model_parallel_all_reduce(out)
         return out
 
     def forward_mqa(self, q, kv, positions, output) -> None:
@@ -742,127 +932,53 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         )
         output.copy_(o)
 
-    def _compress_one(self, p: int, state_idx: int) -> torch.Tensor | None:
-        """Compress the last coff*ratio states into a single [head_dim] key.
+    def _forward_compilable(
+        self,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        past_kv: torch.Tensor | None,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """From normed qr+kv through wq_b -> RoPE -> attention -> O projection.
 
-        Mirrors ``_fused_kv_compress_norm_rope_insert_sparse_attn``: softmax over
-        the gathered score, weighted sum of kv, RMSNorm, RoPE at compressed_pos.
+        ``qr`` and ``kv`` are already normed by the eager outer (fused_wqa_wkv
+        stays in eager because the compressor needs intermediate ``qr``). No
+        Python control flow, no env var checks — safe for ``torch.compile``.
+
+        Args:
+            qr: ``[T, q_lora_rank]`` normed Q residual.
+            kv: ``[T, head_dim]`` normed KV.
+            positions: ``[T]`` absolute positions.
+            past_kv: ``[K, n_heads, D]`` past KV (window + compressed).
+            mask: ``[T, K]`` bool mask or ``None`` for decode.
+
+        Returns:
+            ``[T, D]`` attention output.
         """
-        ratio = self.compress_ratio
-        coff = self._comp_coff
-        head_dim = self.head_dim
-        gather = coff * ratio
-        dev = self._comp_kv_states.device
-        start = p - gather + 1
-        g = torch.arange(gather, device=dev)
-        pos = start + g
-        valid = pos >= 0
-        # state buffer index for each gathered position q (q -> state_idx - (p-q))
-        si = (state_idx - (p - pos)).clamp(0, self._comp_kv_states.shape[0] - 1)
-        ho = (g >= ratio).long() * head_dim
-        ar = torch.arange(head_dim, device=dev)
-        flat_idx = si[:, None] * (coff * head_dim) + ho[:, None] + ar[None, :]
-        kv_flat = self._comp_kv_states.reshape(-1)
-        score_flat = self._comp_score_states.reshape(-1)
-        kv_v = kv_flat[flat_idx]  # [gather, head_dim]
-        score_v = score_flat[flat_idx]
-        score_v = torch.where(
-            valid[:, None], score_v, torch.full_like(score_v, float("-inf"))
+        num_tokens = qr.shape[0]
+
+        from vllm_gaudi.extension.ops import apply_block_fp8_linear_hpu_gemm
+        q = apply_block_fp8_linear_hpu_gemm(
+            qr,
+            self.wq_b.weight,
+            self.wq_b.weight_scale_inv,
+            self.wq_b.quant_config.weight_block_size,
+        ).view(num_tokens, self.n_local_heads, self.head_dim)
+        q = _rmsnorm(q, self.eps)
+        q = _apply_rope(q, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+        kv = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+
+        # past_kv already includes ALL keys (window + compressed from the eager
+        # outer); do NOT append cur_kv here (decode should not attend to self).
+        o = _attn_with_sink_matmul(
+            q, past_kv, mask, self.attn_sink[: self.n_local_heads], self.scale
         )
-        w = torch.softmax(score_v, dim=0)
-        compressed = (kv_v * w).sum(0)  # [head_dim] fp32
-        compressed = _rmsnorm(compressed, self.eps, self.compressor.norm.weight.data)
-        cpos = (p // ratio) * ratio
-        cpos_t = torch.tensor([cpos], dtype=torch.long, device=dev)
-        compressed = _apply_rope(
-            compressed.unsqueeze(0), cpos_t,
-            self.rotary_emb.cos_sin_cache, self.rope_head_dim,
-        ).squeeze(0)
-        return compressed.to(self._comp_kv_states.dtype)
 
-    def _compress_tokens(self, hidden_states, positions, is_new: bool):
-        """Advance the compressor: store per-token states, emit compressed kv.
+        o = self._o_proj_compilable(o, positions)
+        return o
 
-        Returns ``(values, pos)`` where values is ``[n_compressed, head_dim]``
-        and pos is ``[n_compressed]`` (the boundary position each compressed
-        token represents), or ``(None, None)`` if none exist yet.
-        """
-        if self.compressor is None or self.compress_ratio <= 1:
-            return None, None
-        ratio = self.compress_ratio
-        coff = self._comp_coff
-        head_dim = self.head_dim
-        comp = self.compressor
-        num_tokens = hidden_states.shape[0]
-        pos_flat = positions.reshape(-1)
-        if is_new:
-            self._comp_kv_states = None
-            self._comp_score_states = None
-            self._comp_kv_cache = []
-            self._comp_kv_positions = []
-        kv_score = comp.fused_wkv_wgate(hidden_states)
-        kv_score = kv_score[0] if isinstance(kv_score, tuple) else kv_score
-        kv, score = kv_score.split([coff * head_dim, coff * head_dim], dim=-1)
-        score = score + comp.ape[pos_flat % ratio]
-        kv_f, score_f = kv.float(), score.float()
-        if self._comp_kv_states is None:
-            self._comp_kv_states = kv_f
-            self._comp_score_states = score_f
-        else:
-            self._comp_kv_states = torch.cat([self._comp_kv_states, kv_f], 0)
-            self._comp_score_states = torch.cat([self._comp_score_states, score_f], 0)
-        T_total = self._comp_kv_states.shape[0]
-        base = T_total - num_tokens
-        for i in range(num_tokens):
-            p = int(pos_flat[i])
-            if p < 0:
-                continue
-            if (p + 1) % ratio != 0:
-                continue
-            ck = self._compress_one(p, base + i)
-            if ck is not None:
-                self._comp_kv_cache.append(ck)
-                self._comp_kv_positions.append((p // ratio) * ratio)
-        if not self._comp_kv_cache:
-            return None, None
-        values = torch.stack(self._comp_kv_cache, 0).to(hidden_states.dtype)
-        pos = torch.tensor(self._comp_kv_positions, dtype=torch.long,
-                           device=hidden_states.device)
-        return values, pos
 
-    def _paged_context_kv(self):
-        """Read the prompt's roped KV from the engine's paged cache.
-
-        The engine prefills the prompt through its own path (writing roped kv to
-        the flat paged cache bound via ``bind_kv_cache``), while this attention
-        forward is only invoked for decode steps. For a single short request the
-        context tokens occupy the ``context_len`` slots immediately before the
-        current token's slot, so the prompt kv is ``key_cache[slot-ctx_len:slot]``.
-
-        Returns ``[ctx_len, 1, head_dim]`` roped kv, or None if unavailable.
-        """
-        try:
-            if getattr(self, "kv_cache", None) is None:
-                return None
-            from vllm.forward_context import get_forward_context
-            am = get_forward_context().attn_metadata
-            if am is None:
-                return None
-            sm = getattr(am, "slot_mapping", None)
-            cl = getattr(am, "context_lens_tensor", None)
-            if sm is None or cl is None:
-                return None
-            key_cache = self.kv_cache[0]
-            cur_slot = int(sm.reshape(-1)[0])
-            ctx_len = int(cl.reshape(-1)[0])
-            if ctx_len <= 0 or cur_slot - ctx_len < 0:
-                return None
-            ctx = key_cache[cur_slot - ctx_len:cur_slot]
-            if ctx.numel() == 0:
-                return None
-            return ctx
-        except Exception:
-            return None
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
         num_tokens = hidden_states.shape[0]
@@ -893,8 +1009,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                 kc_info = f"err:{e}"
             print(f"[dbg] fwd#{self._fwd_dbg_n} T={num_tokens} is_prompt={ispf} "
                   f"posmin={int(pos.min()):d} posmax={int(pos.max()):d} "
-                  f"hs={tuple(hidden_states.shape)} cache={0 if self._kv_cache is None else len(self._kv_cache)} "
-                  f"lastpos={self._last_pos} sm={sm.reshape(-1).tolist() if sm is not None else None} "
+                  f"hs={tuple(hidden_states.shape)} "
+                  f"win_n={int(self._win_n.item()) if hasattr(self, '_win_n') else 0} "
+                  f"sm={sm.reshape(-1).tolist() if sm is not None else None} "
                   f"cl={cl.reshape(-1).tolist() if cl is not None else None} "
                   f"bl={bl.reshape(-1).tolist() if bl is not None else None} kc[{kc_info}]", flush=True)
 
@@ -902,16 +1019,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             return r[0] if isinstance(r, tuple) else r
 
         _diag("attn_input", hidden_states)
-        _attn_w = self._prep_attn_weights()
-        qr_kv = torch.cat(
-            [
-                torch.matmul(hidden_states, _attn_w["wq_a"].t()),
-                torch.matmul(hidden_states, _attn_w["wkv"].t()),
-            ],
-            dim=-1,
-        )
+        # fused_wqa_wkv is a MergedColumnParallelLinear loaded as block-fp8 by
+        # Fp8LinearMethod. Use its native forward (handles merged-column output).
+        qr_kv = _out(self.fused_wqa_wkv(hidden_states))
         _diag("attn_fused_wqa_wkv", qr_kv)
-        _diag("attn_fused_wqa_wkv_weight", self.fused_wqa_wkv.weight)
         if not _DIAG_DONE["v"]:
             w = self.fused_wqa_wkv.weight
             wf = w.to(torch.float32)
@@ -934,29 +1045,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         _diag("attn_kv_normed", kv)
         if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0:
             _HPU_CAP.setdefault("attn_qr_normed", {})[0] = qr.detach().float().clone()
-        q = torch.matmul(qr, _attn_w["wq_b"].t()).view(
-            num_tokens, self.n_local_heads, self.head_dim
-        )
-        _diag("attn_q", q)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0:
-            _HPU_CAP.setdefault("attn_q_pre_bnorm", {})[0] = q.detach().float().clone()
-        # per-head q RMSNorm (no weight) then RoPE on the rope dims
-        q = _rmsnorm(q, self.eps)
-        _diag("attn_q_normed", q)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1, 2):
-            _HPU_CAP.setdefault("attn_q_normed", {})[getattr(self, "_layer_idx", -1)] = q.detach().float().clone()
-            _HPU_CAP.setdefault("attn_kv_normed", {})[getattr(self, "_layer_idx", -1)] = kv.detach().float().clone()
-        q = _apply_rope(q, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
-        kv = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
-        _diag("attn_q_roped", q)
-        _diag("attn_kv_roped", kv)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1, 2):
-            _HPU_CAP.setdefault("attn_q_roped", {})[getattr(self, "_layer_idx", -1)] = q.detach().float().clone()
-            _HPU_CAP.setdefault("attn_kv_roped", {})[getattr(self, "_layer_idx", -1)] = kv.detach().float().clone()
-        # Reset/append decision uses attn_metadata.is_prompt (reliable: True only
-        # on the genuine prefill forward, False on decode). The prompt prefill is
-        # a PADDED forward (input_ids [1,128], positions -1..4 for a 5-token
-        # prompt), so on prefill keep only the real tokens (position >= 0).
+
         import os as _odbg
         is_prompt = None
         try:
@@ -968,147 +1057,100 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         pos_flat = positions.reshape(-1)
         if os.environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0:
             _HPU_CAP.setdefault("pos_flat", {})[0] = pos_flat.detach().cpu().clone()
+
+        kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1, 2):
+            _HPU_CAP.setdefault("attn_kv_roped", {})[getattr(self, "_layer_idx", -1)] = kv_roped.detach().float().clone()
+
         if is_prompt is True:
-            # Prefill: reset caches with the real (non-padding) prompt tokens.
-            valid = pos_flat >= 0
-            self._comp_kv_states = None
-            self._comp_score_states = None
-            self._comp_kv_cache = []
-            self._comp_kv_positions = []
-            state, _shim = self._compression()
-            state.reset()
-            if bool(valid.any()):
-                self._kv_cache = [kv[valid]]
-                self._last_pos = int(pos_flat[valid].max())
-                window_kv = kv[valid]
-                window_pos = pos_flat[valid]
-                comp_valid = valid
-                real_hs = hidden_states[comp_valid]
-                real_pos = pos_flat[comp_valid]
+            # Prefill: reset window ring buffer and compressor state.
+            T = kv_roped.shape[0]
+            self._win_n.zero_()
+            self._decode_pos.zero_()
+            self._win_cache[:T] = kv_roped[:T]
+            self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
+            self._comp_reset = True
+            comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
+
+            # Build static-shape past_kv [WIN+CAP, H, D]
+            cap = self._comp_kernel_state["cap"] if self._comp_kernel_state is not None else 0
+            past_kv = torch.cat([self._win_cache, comp_full], dim=0)
+            past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+
+            # Build mask [T, WIN+CAP]. Window part: causal over first T tokens.
+            win_ids = torch.arange(self.window_size, device=pos_flat.device)
+            win_present = win_ids.unsqueeze(0) < self._win_n.unsqueeze(-1)  # [1, WIN]
+            if T <= self.window_size:
+                win_causal = pos_flat[:, None] >= pos_flat[None, :]  # [T, T]
+                win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=pos_flat.device)
+                win_mask[:, :T] = win_causal & win_present[:, :T]
             else:
-                self._kv_cache = [kv]
-                self._last_pos = int(pos_flat[-1])
-                window_kv = kv
-                window_pos = pos_flat
-                comp_valid = torch.ones_like(pos_flat, dtype=torch.bool)
-                real_hs = hidden_states
-                real_pos = pos_flat
-            # Run the public compressor over the real prompt tokens so the
-            # compressed KV + block_bias match the reference sparse path.
-            comp_v, comp_bb, n_comp = self._run_compressor(real_hs, qr[comp_valid], real_pos)
-            comp_p = None
+                start = T - self.window_size
+                win_mask = pos_flat[:, None] >= pos_flat[None, start:]  # [T, WIN]
+
+            # Compressed part: present entries with finite block_bias (or all present if None)
+            comp_ids = torch.arange(cap, device=pos_flat.device)
+            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)  # [1, CAP]
+            if comp_bb is not None:
+                comp_attend = comp_present & torch.isfinite(comp_bb)
+            else:
+                comp_attend = comp_present
+            mask = torch.cat([win_mask, comp_attend], dim=-1)  # [T, WIN+CAP]
+            attn_mask = mask
+
             if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1, 2, 3):
                 _HPU_CAP.setdefault("comp_v", {})[getattr(self, "_layer_idx", -1)] = (
-                    comp_v.detach().float().clone() if comp_v is not None else None
+                    comp_full.detach().float().clone()
                 )
-                _HPU_CAP.setdefault("comp_p", {})[getattr(self, "_layer_idx", -1)] = (
-                    comp_p
-                )
+                _HPU_CAP.setdefault("comp_p", {})[getattr(self, "_layer_idx", -1)] = comp_n.detach().cpu()
         else:
-            # Decode: the cache holds PAST tokens (prompt + prior decode). The
-            # current token is appended AFTER its own attention (so it does not
-            # attend to itself).
-            if self._kv_cache is None:
-                self._kv_cache = [kv]
-            self._last_pos = (self._last_pos if self._last_pos is not None else -1) + num_tokens
-            window_kv = torch.cat(self._kv_cache, dim=0)
-            window_pos = None
-            comp_v, comp_bb, n_comp = self._run_compressor(hidden_states, qr, pos_flat)
-            comp_p = None
-            comp_valid = None
-        if _odbg.environ.get("V4_DEBUG") == "1":
-            print(f"[diag] reset is_prompt={is_prompt} pos0={int(pos_flat[0]):d} "
-                  f"T={num_tokens} cache_n={len(self._kv_cache)} "
-                  f"cache_tok={self._kv_cache[0].shape[0] if self._kv_cache else 0} "
-                  f"last_pos={self._last_pos}", flush=True)
-        if window_kv.shape[0] > self.window_size:
-            window_kv = window_kv[-self.window_size:]
-            if window_pos is not None:
-                window_pos = window_pos[-self.window_size:]
-        # Build [window ∪ compressed] kv (reference order: sliding-window branch
-        # first, compressed entries appended) + the combined mask.
-        if comp_v is not None:
-            all_kv = torch.cat([window_kv, comp_v], dim=0)
-        else:
-            all_kv = window_kv
-        k = all_kv.unsqueeze(1).expand(
-            all_kv.shape[0], self.n_local_heads, self.head_dim
-        )
-        # Sparse/compressed attention over [window ∪ compressed].
-        #  - Prefill: attend over the REAL query tokens with a position-causal
-        #    mask for the window keys (query at position q sees keys with
-        #    position <= q) and the compressor's block_bias (causality +
-        #    indexer validity) for the compressed keys. The padding query rows
-        #    are zeroed and dropped downstream.
-        #  - Decode: the single (newest) query attends over all past keys (all
-        #    positions < current, since the current kv is not yet cached).
+            # Decode: append to ring buffer, run compressor, build static-shape mask.
+            self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
+            self._decode_pos.add_(1)
+            self._win_n.add_(1).clamp_(max=self.window_size)
+            self._comp_reset = False
+            comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
+
+            cap = self._comp_kernel_state["cap"] if self._comp_kernel_state is not None else 0
+            past_kv = torch.cat([self._win_cache, comp_full], dim=0)
+            past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
+
+            # Decode mask: all window entries are valid, compressed entries up to n are valid
+            win_mask = torch.ones(1, self.window_size, dtype=torch.bool, device=pos_flat.device)
+            comp_ids = torch.arange(cap, device=pos_flat.device)
+            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
+            mask = torch.cat([win_mask, comp_present], dim=-1)
+            attn_mask = mask
+
+        o = self._forward_compilable(qr, kv, positions, past_kv, attn_mask)
+
         if is_prompt is True:
-            q_att = q[comp_valid]  # [n_valid, H, D]
-            q_pos = pos_flat[comp_valid]
-            if window_pos is None:
-                window_pos = torch.arange(window_kv.shape[0], device=q_pos.device)
-            win_mask = q_pos[:, None] >= window_pos[None, :]  # [n_valid, n_win]
-            if comp_bb is not None:
-                mask = torch.cat([win_mask, torch.isfinite(comp_bb)], dim=-1)
-            else:
-                mask = win_mask
-            o_valid = _attn_with_sink(
-                q_att, k, mask, self.attn_sink[: self.n_local_heads], self.scale
-            )
-            o = torch.zeros_like(q)
-            o[comp_valid] = o_valid.to(o.dtype)
-            # DIAG: also compute a FULL-causal attention over the real prompt
-            # tokens only (no compressed keys), to isolate whether the sparse
-            # [window ∪ compressed] path is what differs from the reference.
             if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1):
                 import torch.nn.functional as _F
-                kf = window_kv.unsqueeze(0).unsqueeze(0).expand(1, self.n_local_heads, -1, self.head_dim)
-                _HPU_CAP.setdefault("attn_sparse", {})[0] = o_valid.detach().float().clone()
+                valid = pos_flat >= 0
+                q_att = (apply_block_fp8_linear_hpu_gemm(
+                    qr[valid],
+                    self.wq_b.weight,
+                    self.wq_b.weight_scale_inv,
+                    self.wq_b.quant_config.weight_block_size,
+                    original_out_features=self.wq_b.orig_M.data.item(),
+                    original_in_features=self.wq_b.orig_N.data.item(),
+                ).view(-1, self.n_local_heads, self.head_dim))
+                q_att = _rmsnorm(q_att, self.eps)
+                q_att = _apply_rope(q_att, pos_flat[valid], self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+                kf = self._win_cache.unsqueeze(0).unsqueeze(0).expand(1, self.n_local_heads, -1, self.head_dim)
+                _HPU_CAP.setdefault("attn_sparse", {})[0] = o[valid].detach().float().clone()
                 o_full = _F.scaled_dot_product_attention(
                     q_att.unsqueeze(0).transpose(1, 2), kf, kf, is_causal=True
                 ).transpose(1, 2).squeeze(0)
                 _HPU_CAP.setdefault("attn_full", {})[0] = o_full.detach().float().clone()
                 _HPU_CAP.setdefault("attn_qreal", {})[0] = q_att.detach().float().clone()
-        else:
-            o = _attn_with_sink(
-                q, k, None, self.attn_sink[: self.n_local_heads], self.scale
-            )
-            # Append the current decode token's kv to the cache for the NEXT step.
-            if self._kv_cache is not None:
-                self._kv_cache.append(kv)
+
         _diag("attn_sdpa_out", o)
-        import os as _os2
-        if _os2.environ.get("V4_DEBUG") == "1":
-            with torch.no_grad():
-                # token-to-token scores: [T, n_keys] averaged over heads
-                sc = (q.float() @ all_kv.float().transpose(0, 1)) * (self.head_dim**-0.5)
-                # report the LAST REAL (non-padding) query row
-                if is_prompt is True:
-                    pp = positions.reshape(-1)
-                    vidx = (pp >= 0).nonzero().reshape(-1)
-                    last_row = int(vidx[-1].item()) if vidx.numel() else sc.shape[0] - 1
-                else:
-                    last_row = sc.shape[0] - 1
-                last = sc[last_row]  # last real query row over all cached keys
-                sm = torch.softmax(last, dim=-1)
-                ent = float(-(sm * torch.log(sm + 1e-12)).sum(-1).mean())
-                nkeys = last.shape[-1]
-                uni = float(torch.log(torch.tensor(nkeys, dtype=torch.float32)))
-                topk_id, topk_v = torch.topk(sm.mean(0), min(3, nkeys))
-                comp_txt = "none"
-                if comp_v is not None:
-                    ckf = comp_v.float()
-                    comp_txt = (f"n={comp_v.shape[0]} am={float(ckf.abs().mean()):.3g} "
-                                f"mx={float(ckf.abs().max()):.3g} nan={int(torch.isnan(ckf).sum())}")
-                winlen = window_kv.shape[0] if window_kv is not None else 0
-                print(f"[diag] attn prefill={is_prompt} T={num_tokens} keys={all_kv.shape[0]} "
-                      f"(comp={0 if comp_v is None else comp_v.shape[0]}, win={winlen}) "
-                      f"entropy={ent:.4g} uniform={uni:.4g} topkey={topk_id.tolist()} topw={[round(x,3) for x in topk_v.tolist()]} "
-                      f"comp_kv[{comp_txt}]", flush=True)
         import os as _oob
         if _oob.environ.get("HPU_DUMP") == "1":
             _HPU_CAP.setdefault("attn_pre_o", {})[getattr(self, "_layer_idx", -1)] = o.detach().float().clone()
-        return self._o_proj(o, positions)
+        return o
 
 
 _HPU_CAP: dict = {"attn_in": {}, "attn_out": {}}
@@ -1156,23 +1198,18 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             prefix=f"{prefix}.ffn",
             use_sequence_parallel=self.use_sequence_parallel,
         )
-        # Clean-bf16 shared expert. The fused MoE dequants the shared expert with
-        # per-row scales that are ~hundreds off (shared_out ~30x too small).
-        # Dequant the checkpoint's own block-fp8 shared w1/w2/w3 to bf16 and run
-        # clean matmuls (same pattern as _prep_attn_weights).
-        se = getattr(self.ffn, "shared_experts", None)
-        if se is not None:
-            se._v4_ckpt_path = getattr(config, "_name_or_path", None)
-            se._v4_layer_idx = getattr(self, "_layer_idx", -1)
-            _se_li = getattr(self, "_layer_idx", -1)
-
-            def _se_clean_forward(x, _se=se):
-                out = _hpu_v4_shared_mlp_forward(_se, x)
-                if __import__("os").environ.get("HPU_DUMP") == "1" and _se_li in (0, 1):
-                    _HPU_CAP.setdefault("moe_shared", {})[_se_li] = out.detach().float().clone()
-                return out
-
-            se.forward = _se_clean_forward
+        # Shared expert uses native block-fp8 GEMM via Fp8LinearMethod.apply()
+        # (gate_up_proj and down_proj are ReplicatedLinear loaded as block-fp8).
+        # No monkeypatch needed -- the default forward already dispatches through
+        # the HPU block-fp8 path.
+        self.ffn._v4_ckpt_path = _v4_resolve_ckpt_dir(getattr(config, "_name_or_path", None) or "")
+        self.ffn._v4_layer_idx = getattr(self, "_layer_idx", -1)
+        # Register empty native-fp8 routed buffers at construction so state_dict
+        # carries them for the snapshot pipeline (fresh load fills them in
+        # load_weights; snapshot restore fills them directly). This also frees
+        # the dead FusedMoE routed weights first so the fp8 buffers and the
+        # fp4 FusedMoE copies never coexist in HBM.
+        _register_v4_fp8_placeholders(self.ffn, config)
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1202,20 +1239,97 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             torch.empty(3, dtype=torch.float32), requires_grad=False
         )
 
+    def _forward_inner(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pure tensor math: mHC pre/fused → attn → mHC fused → ffn.
+
+        No HPU_DUMP, no V4_DEBUG, no try/except, no ``os.environ`` —
+        safe for ``torch.compile`` on HPU.
+        """
+        if residual is None:
+            if x.dim() == 2:
+                residual, post_mix, res_mix, x = _mhc_pre_broadcast_compilable(
+                    x,
+                    self.hc_attn_fn_broadcast,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    self.hc_mult,
+                    self.attn_norm.weight.data,
+                    self.rms_norm_eps,
+                )
+            else:
+                from vllm.model_executor.kernels.mhc import mhc_pre_torch
+
+                residual = x
+                post_mix, res_mix, x = mhc_pre_torch(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                )
+        else:
+            residual, post_mix, res_mix, x = _mhc_fused_post_pre_compilable(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                self.hc_mult,
+                self.attn_norm.weight.data,
+                self.rms_norm_eps,
+            )
+
+        x = self.attn(positions, x, None)
+
+        residual, post_mix, res_mix, x = _mhc_fused_post_pre_compilable(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            self.hc_mult,
+            self.ffn_norm.weight.data,
+            self.rms_norm_eps,
+        )
+
+        x = self.ffn(x, input_ids)
+        return x, residual, post_mix, res_mix
+
     def forward(self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None):
         import os
         if not getattr(self, "_moe_scale_fixed", False):
             self._moe_scale_fixed = True
-            # FIXED 2026-08-27: scale_adjustment (VLLM_SCALE_ADJUSTMENT=1) already
-            # doubles ALL fp8 block scales (after the uint8 e8m0 decode for the
-            # routed experts) in gaudi_weight_wrapper, and *0.5's the fp8 weights.
-            # The previous code doubled the routed/shared expert block scales a
-            # SECOND time here, so the dequant value was 2x too large -> the MoE
-            # output blew up monotonically in the deep layers (layers 41-42 ffn_out
-            # 1.3->12) and the model echoed the prompt. Removing the doubling bounds
-            # the magnitudes and lets the model produce sensible output. No manual
-            # scale doubling is applied (scale_adjustment is the single source of
-            # the fp8 conversion).
         if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) == 0 \
                 and not getattr(self, "_routed_w_captured", False):
             self._routed_w_captured = True
@@ -1261,96 +1375,13 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             print(f"[v4dec] x.dim={x.dim()} x.shape={tuple(x.shape)} residual_none={residual is None} "
                   f"hc_mult={self.hc_mult} attn_fn0={tuple(self.hc_attn_fn.shape)}")
         _diag("dec_x_in", x)
-        # mHC pre (first layer) / fused post+pre (subsequent) for the attn block.
-        if residual is None:
-            if x.dim() == 2:
-                residual, post_mix, res_mix, x = _mhc_pre_broadcast(
-                    x,
-                    self.hc_attn_fn_broadcast,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                    self.hc_mult,
-                    self.attn_norm.weight.data,
-                    self.rms_norm_eps,
-                )
-            else:
-                from vllm.model_executor.kernels.mhc import mhc_pre_torch
 
-                residual = x
-                post_mix, res_mix, x = mhc_pre_torch(
-                    x,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.rms_norm_eps,
-                    self.hc_eps,
-                    self.hc_eps,
-                    self.hc_post_alpha,
-                    self.hc_sinkhorn_iters,
-                )
-        else:
-            residual, post_mix, res_mix, x = _mhc_fused_post_pre(
-                x,
-                residual,
-                post_mix,
-                res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
-                self.hc_mult,
-                self.attn_norm.weight.data,
-                self.rms_norm_eps,
-            )
-
-        _diag("dec_after_attn_mhcpre", x)
-        import os as _hdbg
-        if _hdbg.environ.get("HPU_DUMP") == "1":
-            _HPU_CAP["attn_in"][self._layer_idx] = x.detach().float().clone()
-        x = self.attn(positions, x, None)
-        if _hdbg.environ.get("HPU_DUMP") == "1":
-            _HPU_CAP["attn_out"][self._layer_idx] = x.detach().float().clone()
-        _diag("dec_after_attn", x)
-
-        global _MHC_PHASE, _MHC_LAYER
-        _MHC_PHASE = "ffn"
-        _MHC_LAYER = self._layer_idx
-        residual, post_mix, res_mix, x = _mhc_fused_post_pre(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
-            self.hc_mult,
-            self.ffn_norm.weight.data,
-            self.rms_norm_eps,
+        x, residual, post_mix, res_mix = self._forward_inner(
+            x, positions, input_ids, post_mix, res_mix, residual
         )
-        _diag("dec_after_ffn_pre", x)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1):
-            _HPU_CAP.setdefault("ffn_norm_w", {})[getattr(self, "_layer_idx", -1)] = \
-                self.ffn_norm.weight.detach().float().clone()
-            _HPU_CAP.setdefault("ffn_in", {})[getattr(self, "_layer_idx", -1)] = x.detach().float().clone()
 
-        x = self.ffn(x, input_ids)
+        _diag("dec_after_attn", x)
         _diag("dec_after_ffn", x)
-        if __import__("os").environ.get("HPU_DUMP") == "1" and getattr(self, "_layer_idx", -1) in (0, 1):
-            _HPU_CAP.setdefault("ffn_out", {})[getattr(self, "_layer_idx", -1)] = x.detach().float().clone()
         return x, residual, post_mix, res_mix
 
 
@@ -1428,6 +1459,16 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         self._mtp_hidden_buffer = None
 
     def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds=None):
+        # Graph break sources (this method stays eager):
+        #   1. Layer loop ``for idx, layer in enumerate(islice(...))`` — Python
+        #      dynamic loop; torch.compile cannot unroll a variable-length layer
+        #      sequence.
+        #   2. ``V4_DEBUG`` block — ``try/except`` + ``os.environ`` + ``print``.
+        #   3. ``HPU_DUMP`` save block — ``try/except`` + ``os.environ`` +
+        #      ``torch.save``.
+        #   4. ``_diag()`` calls — Python-level diagnostic.
+        # Individual layer forwards ARE compiled via
+        # ``DeepseekV4HPUDecoderLayer._forward_inner()`` (``@torch.compile``).
         from itertools import islice
 
         from vllm.distributed import get_pp_group
@@ -1519,6 +1560,34 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             hidden_states = hidden_states.view(*hidden_shape[:2], self.config.hidden_size)
         return hidden_states
 
+    def _prep_v4_routed_all(self) -> None:
+        """Pre-convert every layer's routed experts fp4 -> native fp8 (load time).
+
+        Called from ``load_weights`` (fresh load) so the native-fp8 buffers are
+        filled before snapshot capture; the forward then reads them directly
+        (no per-token fp4->fp8 requant). Idempotent.
+        """
+        import time as _t
+        t0 = _t.time()
+        n = 0
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "packed_w1_weight") \
+                    and not getattr(ffn, "_v4_fp8_filled", False):
+                _register_v4_routed_packed(ffn, "cpu")
+                n += 1
+        print(f"[v4] prepped {n} layers' routed fp4 buffers in {_t.time() - t0:.1f}s", flush=True)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Routed-expert weights (.experts.) are bypassed: the FusedMoE params
+        # are freed at construction and the native-fp8 path reads the packed
+        # fp4 from the checkpoint directly. Filter them out so the (freed)
+        # FusedMoE params are not repopulated, then build the fp8 buffers.
+        weights = ((n, w) for (n, w) in weights if ".experts." not in n)
+        loaded = super().load_weights(weights)
+        self._prep_v4_routed_all()
+        return loaded
+
 
 class DeepseekV4ForCausalLM(_NvDeepseekV4ForCausalLM):
     """HPU DeepSeek V4. Reuses the NVIDIA top-level (embed/norm/logits/MoE) but
@@ -1565,16 +1634,200 @@ class DeepseekV4ForCausalLM(_NvDeepseekV4ForCausalLM):
         _DIAG_DONE["v"] = True
         return logits
 
+    def warmup(self, device: torch.device) -> None:
+        """Run one forward with expected prefill and decode shapes to trigger
+        HPU graph compilation (``torch.compile`` compiles lazily on first call
+        for each shape).
 
-def _prep_v4_shared_weights(se) -> tuple:
-    """Dequantize the checkpoint's block-fp8 shared-expert w1/w2/w3 to exact bf16."""
+        Call once after model load, before the first inference request.
+        """
+        self.eval()
+        with torch.no_grad():
+            prefill_ids = torch.zeros((1, 128), dtype=torch.long, device=device)
+            prefill_pos = torch.arange(128, dtype=torch.long, device=device).unsqueeze(0)
+            _ = self.model(
+                prefill_ids, prefill_pos, None,
+            )
+            decode_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
+            decode_pos = torch.tensor([[128]], dtype=torch.long, device=device)
+            _ = self.model(
+                decode_ids, decode_pos, None,
+            )
+
+
+def _hpu_v4_shared_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
+    """Shared expert forward using native block-fp8 GEMM + fp32 composition.
+
+    ``self`` is the shared_experts module with ``gate_up_proj`` (fused
+    gate+up, ReplicatedLinear) and ``down_proj`` (ReplicatedLinear), both
+    loaded as block-fp8 by Fp8LinearMethod. Dequants on-the-fly on HPU.
+    The gate/up matmuls run bf16 (fast); the silu/clamp/product run in fp32
+    to avoid compounding bf16 rounding into a multi-ulp tail (same as the
+    routed experts). Returns fp32; the MoE forward casts to bf16 at the end.
+    """
+    from vllm_gaudi.extension.ops import apply_block_fp8_linear_hpu_gemm
+    gu = self.gate_up_proj
+    dp = self.down_proj
+    gu_out = apply_block_fp8_linear_hpu_gemm(
+        x, gu.weight, gu.weight_scale_inv, gu.quant_config.weight_block_size,
+    )
+    gate, up = gu_out.chunk(2, dim=-1)
+    limit = getattr(self, "swiglu_limit", getattr(self, "limit", 10.0))
+    gate = torch.clamp(gate.float(), max=limit)
+    up = torch.clamp(up.float(), min=-limit, max=limit)
+    h = torch.nn.functional.silu(gate) * up  # fp32
+    out = apply_block_fp8_linear_hpu_gemm(
+        h.to(x.dtype), dp.weight, dp.weight_scale_inv, dp.quant_config.weight_block_size,
+    )
+    return out.float()
+
+
+_FP4_VALUES = (
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
+
+
+def _v4_resolve_ckpt_dir(name_or_path: str) -> str:
+    """Resolve a local dir holding the checkpoint safetensors.
+
+    For a local path returns it as-is; for a hub id resolves the HF cache
+    snapshot dir.
+    """
+    import glob as _g
+    import os
+    p = name_or_path or ""
+    if p and os.path.isdir(p) and _g.glob(os.path.join(p, "model-*.safetensors")):
+        return p
+    name = p.replace("/", "--")
+    root = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    mdir = os.path.join(root, "hub", f"models--{name}")
+    for snap in sorted(_g.glob(os.path.join(mdir, "snapshots", "*"))):
+        if _g.glob(os.path.join(snap, "model-*.safetensors")):
+            return snap
+    return p
+
+
+def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Dequantize MXFP4 packed expert weight to bf16.
+
+    ``blocks`` [R, C] uint8: each byte holds two e2m1 nibbles (lo = even col,
+    hi = odd col). ``scales`` [R, G], one per 32 columns: either raw uint8 e8m0
+    exponent bytes (real scale = 2^(b-127)) or float8_e8m0fnu (the value is
+    already the scale). Returns [R, 2*C] bf16, matching the reference
+    (transformers dequants fp4 -> bf16 and computes in bf16).
+    """
+    G = scales.shape[-1]
+    R, C = blocks.shape
+    B = C // G  # bytes per group -> 32 values per group (B == 16)
+    # The checkpoint stores packed fp4 as int8; view as uint8 so the nibble
+    # shifts below are LOGICAL (0..15), not arithmetic (which sign-extends the
+    # MSB and maps ~50% of bytes to negative LUT indices, destroying the
+    # negative fp4 values).
+    blk = blocks.view(torch.uint8).reshape(R, G, B)
+    lut = torch.tensor(_FP4_VALUES, dtype=torch.bfloat16, device=blocks.device)
+    lo = (blk & 0x0F).to(torch.long)
+    hi = (blk >> 4).to(torch.long)
+    sub = torch.empty(R, G, B * 2, dtype=torch.bfloat16, device=blocks.device)
+    sub[:, :, 0::2] = lut[lo]
+    sub[:, :, 1::2] = lut[hi]
+    if scales.dtype == torch.uint8:
+        s = torch.pow(2.0, scales.float() - 127.0).to(torch.bfloat16).reshape(R, G, 1)
+    else:
+        s = scales.to(torch.bfloat16).reshape(R, G, 1)
+    sub = sub * s
+    return sub.reshape(R, C * 2).contiguous()
+
+
+def _free_v4_fused_moe_routed(moe) -> None:
+    """Free the bypassed FusedMoE's routed-expert weights to reclaim HBM.
+
+    The routed experts are computed by the custom fp8 path, so the FusedMoE's
+    packed fp4 ``w13_weight``/``w2_weight`` (and scales) are dead weight. This
+    must happen BEFORE the (much larger) native-fp8 buffers are allocated so
+    the two never coexist (fp8 ~2x fp4; together they exceed per-card HBM).
+    """
+    try:
+        re_ = moe.experts.routed_experts
+        for attr in ("w13_weight", "w2_weight", "w13_weight_scale",
+                     "w2_weight_scale"):
+            p = getattr(re_, attr, None)
+            if p is not None and p.numel() > 0:
+                setattr(re_, attr, torch.nn.Parameter(torch.empty(0), requires_grad=False))
+    except Exception:
+        pass
+
+
+def _register_v4_fp8_placeholders(moe, config) -> None:
+    """Register EMPTY native-fp8 routed-expert buffers at construction.
+
+    Shapes come from the model config (``hidden_size``, ``moe_intermediate_size``)
+    and the per-rank expert count, so they are known before any weights are
+    read. Registering at construction means ``state_dict`` always carries them,
+    so the snapshot pipeline (capture + fast restore) captures/restores them
+    without re-reading the checkpoint. ``_register_v4_routed_packed`` fills them
+    on fresh load; the dead FusedMoE routed weights are freed here first so the
+    packed buffers and the fp4 FusedMoE copies never coexist in HBM.
+
+    We store the checkpoint's native **packed fp4** (34 GB/rank) — NOT
+    pre-converted fp8 (69 GB/rank, which does not fit alongside the rest of the
+    model on 4x96 GB). The forward dequants only the active experts fp4 -> bf16
+    with the sign-correct LUT (``_dequant_v4_fp4``).
+    """
+    if hasattr(moe, "packed_w1_weight"):
+        return
+    try:
+        n_local = moe.experts_end_idx - moe.experts_start_idx
+        hidden = config.hidden_size
+        inter = config.moe_intermediate_size
+    except Exception:
+        return
+    # Free the dead FusedMoE routed weights BEFORE allocating the packed buffers.
+    _free_v4_fused_moe_routed(moe)
+    moe.register_buffer("packed_w1_weight",
+                        torch.empty(n_local, inter, hidden // 2, dtype=torch.uint8))
+    moe.register_buffer("packed_w1_scale",
+                        torch.empty(n_local, inter, hidden // 32, dtype=torch.float32))
+    moe.register_buffer("packed_w3_weight",
+                        torch.empty(n_local, inter, hidden // 2, dtype=torch.uint8))
+    moe.register_buffer("packed_w3_scale",
+                        torch.empty(n_local, inter, hidden // 32, dtype=torch.float32))
+    moe.register_buffer("packed_w2_weight",
+                        torch.empty(n_local, hidden, inter // 2, dtype=torch.uint8))
+    moe.register_buffer("packed_w2_scale",
+                        torch.empty(n_local, hidden, inter // 32, dtype=torch.float32))
+    # Persisted ready flag: 0 until the packed buffers are filled (fresh load via
+    # _register_v4_routed_packed, OR snapshot restore). Captured/restored by the
+    # snapshot so restore does not rebuild the buffers.
+    moe.register_buffer("_v4_fp8_ready", torch.zeros((), dtype=torch.int8))
+
+
+def _register_v4_routed_packed(moe, dev) -> None:
+    """Load packed fp4 routed experts into registered buffers at load time.
+
+    Reads the checkpoint safetensors for all local experts and stacks the
+    packed fp4 weights + e8m0 scales into registered buffers (34 GB/rank).
+    Because this runs at load time (not lazily on first forward),
+    ``moe.state_dict()`` carries them for the snapshot pipeline. The forward
+    dequants only the active experts fp4 -> bf16 (``_dequant_v4_fp4``, which
+    is sign-correct for the int8-packed bytes).
+
+    Also frees the bypassed FusedMoE's routed weights to reclaim their HBM.
+    """
+    if hasattr(moe, "packed_w1_weight") and (
+            getattr(moe, "_v4_fp8_filled", False)
+            or bool(getattr(moe, "_v4_fp8_ready", torch.tensor(0)).item())):
+        return
+
     import glob as _g
     from safetensors import safe_open
-    from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
     import vllm_gaudi.models.deepseek_v4 as _MOD
 
-    path = getattr(se, "_v4_ckpt_path", None)
-    lidx = getattr(se, "_v4_layer_idx", -1)
+    # Ensure the dead FusedMoE routed weights are freed before building.
+    _free_v4_fused_moe_routed(moe)
+
+    path = getattr(moe, "_v4_ckpt_path", None)
+    lidx = getattr(moe, "_v4_layer_idx", -1)
     if getattr(_MOD, "_SHARD_MAP", None) is None:
         _MOD._SHARD_MAP = {}
         for f in _g.glob(path + "/model-*.safetensors"):
@@ -1589,27 +1842,249 @@ def _prep_v4_shared_weights(se) -> tuple:
         with safe_open(f, framework="pt") as sf:
             return sf.get_tensor(name)
 
-    def dq(name):
-        w = load(name + ".weight")
-        s = load(name + ".scale").float()
-        return dequant_block_fp8_weight_naive(w, s, (128, 128), torch.float32).to(
-            torch.bfloat16
+    # e8m0 scales decode to their real float32 value (float8_e8m0fnu's .float()
+    # IS the scale; raw uint8 bytes decode as 2^(b-127)).
+    def _scale_float(t):
+        if t.dtype == torch.float8_e8m0fnu:
+            return t.float()
+        if t.dtype == torch.uint8:
+            return torch.pow(2.0, t.float() - 127.0)
+        return t.float()
+
+    start, end = moe.experts_start_idx, moe.experts_end_idx
+
+    w1_list, s1_list, w3_list, s3_list, w2_list, s2_list = [], [], [], [], [], []
+    for g in range(start, end):
+        P = f"layers.{lidx}.ffn.experts.{g}."
+        # Keep packed weights as uint8 bytes (bit-preserving int8 view).
+        w1_list.append(load(P + "w1.weight").view(torch.uint8))
+        s1_list.append(_scale_float(load(P + "w1.scale")))
+        w3_list.append(load(P + "w3.weight").view(torch.uint8))
+        s3_list.append(_scale_float(load(P + "w3.scale")))
+        w2_list.append(load(P + "w2.weight").view(torch.uint8))
+        s2_list.append(_scale_float(load(P + "w2.scale")))
+
+    moe.register_buffer("packed_w1_weight", torch.stack(w1_list, dim=0))
+    moe.register_buffer("packed_w1_scale", torch.stack(s1_list, dim=0))
+    moe.register_buffer("packed_w3_weight", torch.stack(w3_list, dim=0))
+    moe.register_buffer("packed_w3_scale", torch.stack(s3_list, dim=0))
+    moe.register_buffer("packed_w2_weight", torch.stack(w2_list, dim=0))
+    moe.register_buffer("packed_w2_scale", torch.stack(s2_list, dim=0))
+    moe._v4_fp8_filled = True
+    if hasattr(moe, "_v4_fp8_ready"):
+        moe._v4_fp8_ready.fill_(1)
+
+
+def _dequant_v4_fp4_to_fp8(
+    blocks: torch.Tensor,
+    scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequant MXFP4 packed weights to bf16, then dynamic-quant to fp8.
+
+    Handles both 2D [R, C] and 3D [B, R, C] inputs (batched experts).
+
+    Args:
+        blocks: uint8 tensor of packed fp4 nibbles, shape [R, C] or [B, R, C].
+        scales: uint8 e8m0 exponent bytes, shape [R, G] or [B, R, G].
+
+    Returns:
+        fp8_weight: uint8 view of float8_e4m3fn, same shape as blocks but with
+            the column dim doubled (since fp4 packing halves it).
+        per_32_scales: float32 per-32-group scales (amax/448, then *0.5 for
+            e4m3fnuz range), shape [R, G] or [B, R, G].
+    """
+    is_3d = blocks.dim() == 3
+    if is_3d:
+        B, R, C = blocks.shape
+        G = scales.shape[-1]
+        # view as uint8: logical nibble shifts (see _dequant_v4_fp4 docstring)
+        blk = blocks.view(torch.uint8).reshape(B, R, G, C // G)
+        s_raw = scales
+    else:
+        R, C = blocks.shape
+        G = scales.shape[-1]
+        blk = blocks.view(torch.uint8).reshape(R, G, C // G)
+        s_raw = scales
+
+    # --- Step 1: dequant fp4 -> bf16 ---
+    lut = torch.tensor(_FP4_VALUES, dtype=torch.bfloat16, device=blocks.device)
+    lo = (blk & 0x0F).to(torch.long)
+    hi = (blk >> 4).to(torch.long)
+    if is_3d:
+        sub = torch.empty(B, R, G, (C // G) * 2, dtype=torch.bfloat16, device=blocks.device)
+        sub[:, :, :, 0::2] = lut[lo]
+        sub[:, :, :, 1::2] = lut[hi]
+    else:
+        sub = torch.empty(R, G, (C // G) * 2, dtype=torch.bfloat16, device=blocks.device)
+        sub[:, :, 0::2] = lut[lo]
+        sub[:, :, 1::2] = lut[hi]
+
+    # Decode e8m0 scales: real_scale = 2^(byte - 127)
+    if s_raw.dtype == torch.uint8:
+        s_val = torch.pow(2.0, s_raw.float() - 127.0).to(torch.bfloat16)
+    else:
+        s_val = s_raw.to(torch.bfloat16)
+
+    if is_3d:
+        sub = sub * s_val.unsqueeze(-1)
+        bf16_weight = sub.reshape(B, R, C * 2).contiguous()
+    else:
+        sub = sub * s_val.unsqueeze(-1)
+        bf16_weight = sub.reshape(R, C * 2).contiguous()
+
+    # --- Step 2: dynamic quant bf16 -> fp8 with per-32-group scales ---
+    # Reshape to [*, G, 32] for per-group amax and quantization
+    if is_3d:
+        bf16_view = bf16_weight.reshape(B, R, G, 32)
+    else:
+        bf16_view = bf16_weight.reshape(R, G, 32)
+
+    # amax per group of 32 columns
+    amax = bf16_view.abs().max(dim=-1, keepdim=True).values  # [*, G, 1]
+    # Scale = amax / 448 (fp8 max), then *0.5 to fit e4m3fnuz (max 240)
+    per_32_scales = (amax / 448.0) * 0.5  # [*, G, 1]
+    # Avoid division by zero
+    per_32_scales = per_32_scales.clamp(min=1e-12)
+
+    # Quantize: bf16 / scale -> fp8 (reshape to [*, G, 32] so scale [*, G, 1] broadcasts)
+    inv_scale = 1.0 / per_32_scales.to(torch.float32)
+    fp8_view = torch.ops.hpu.cast_to_fp8_v2(
+        bf16_view, inv_scale, False, False, torch.float8_e4m3fn
+    )[0]
+
+    # Return fp8 as float8_e4m3fn (HPU can store/decode it correctly for these
+    # small values) + per-32 scales as float32 (squeezed last dim).
+    return fp8_view.reshape(*bf16_weight.shape), per_32_scales.squeeze(-1).to(torch.float32)
+
+
+def _make_block_scales(
+    per_32_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Convert per-32-column scales to [128, 128] block scales via max-pool.
+
+    Groups 4 adjacent per-32 scales along the column dimension into 128-wide
+    blocks. The row dimension is left as-is (each row is its own block).
+
+    Args:
+        per_32_scales: float32 [R, G] where G = num_32col_groups.
+
+    Returns:
+        block_scales: float32 [R_blocks, N_blocks] where R_blocks = R,
+            N_blocks = G // 4 (each block covers 128 columns = 4 * 32).
+    """
+    R, G = per_32_scales.shape
+    assert G % 4 == 0, f"G must be divisible by 4, got G={G}"
+    # Reshape to [R, G//4, 4] and max over the last dim
+    grouped = per_32_scales.reshape(R, G // 4, 4)
+    block_scales = grouped.max(dim=-1).values  # [R, G//4]
+    return block_scales
+
+
+def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch.Tensor:
+    """Batched fp8 routed expert computation (no per-expert Python loops).
+
+    Batches the fp4→fp8 dequant and block-fp8 GEMMs across all active local
+    experts. Uses a pre-allocated fixed-size masked buffer for token data.
+
+    For each active expert:
+      h = silu(clamp(x@w1^T, <=limit)) * clamp(x@w3^T, +-limit)
+      out = h@w2^T * weight
+    """
+    # The packed fp4 routed buffers are prepared ONCE at load time
+    # (_register_v4_routed_packed, called from load_weights) or restored from the
+    # snapshot (_v4_fp8_ready=1). There is deliberately NO runtime-load fallback
+    # here: a missing buffer means a load/restore bug and must fail loudly, never
+    # re-read the checkpoint in the forward.
+    if not bool(getattr(moe, "_v4_fp8_ready", torch.tensor(0)).item()):
+        raise RuntimeError(
+            "DeepSeek V4 routed fp4 buffers not ready (expected pre-registration "
+            "at load or snapshot restore); refusing to load from checkpoint at runtime."
         )
+    if moe.packed_w1_weight.device != flat.device:
+        for _name in ("packed_w1_weight", "packed_w1_scale",
+                      "packed_w2_weight", "packed_w2_scale",
+                      "packed_w3_weight", "packed_w3_scale"):
+            setattr(moe, _name, getattr(moe, _name).to(flat.device))
 
-    P = f"layers.{lidx}.ffn.shared_experts."
-    return dq(P + "w1"), dq(P + "w2"), dq(P + "w3")
+    start, end = moe.experts_start_idx, moe.experts_end_idx
+    limit = getattr(moe, "swiglu_limit", 10.0)
+    H = flat.shape[1]
+    inter = moe.packed_w1_weight.shape[1]
+    n_local = end - start
+
+    # Dequant ALL local experts fp4 -> bf16 into fixed buffers (one call, fixed shape;
+    # graph-compilable, reused per layer). GU_all [n_local, 2*inter, H], DN_all [n_local, H, inter].
+    def _deq_batched(packed, scale):
+        n = packed.shape[0]; R, C = packed.shape[1], packed.shape[-1]; G = scale.shape[-1]
+        return _dequant_v4_fp4(packed.reshape(-1, C), scale.reshape(-1, G)).view(n, R, C * 2).to(flat.dtype)
+    GU_all = torch.cat([
+        _deq_batched(moe.packed_w1_weight, moe.packed_w1_scale),
+        _deq_batched(moe.packed_w3_weight, moe.packed_w3_scale),
+    ], dim=1)  # [n_local, 2*inter, H]
+    DN_all = _deq_batched(moe.packed_w2_weight, moe.packed_w2_scale)  # [n_local, H, inter]
+
+    # Vectorized per-pair single graph. The gather (GU_all[le]) works inside the compiled
+    # graph on HPU when combined with the fp32 composition (validated compiled==eager).
+    T, K = topk_ids.shape
+    N = T * K
+    tidx = torch.arange(T, device=flat.device).repeat_interleave(K)  # [N]
+    local = (topk_ids >= start) & (topk_ids < end)  # [T,K]
+    le = (topk_ids - start).clamp(0, n_local - 1).reshape(-1)  # [N]
+    wt = topk_weights.reshape(-1)  # [N]
+    lmask = local.reshape(-1)  # [N]
+
+    xp = flat[tidx].contiguous()                    # [N, H]
+    gu_p = GU_all[le].contiguous()                  # [N, 2*inter, H]
+    dn_p = DN_all[le].contiguous()                  # [N, H, inter]
+
+    guo = torch.bmm(xp.unsqueeze(1), gu_p.transpose(1, 2)).squeeze(1).float()  # [N, 2*inter]
+    gate, up = guo[:, :inter], guo[:, inter:]
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    h = torch.nn.functional.silu(gate) * up  # fp32 [N, inter]
+
+    eout = torch.bmm(h.to(flat.dtype).unsqueeze(1), dn_p.transpose(1, 2)).squeeze(1).float()  # [N, H]
+    eout = eout * wt.float()[:, None] * lmask.float()[:, None]  # fp32, zero non-local pairs
+
+    # fp32 accumulate over the per-token pairs, cast to bf16 at the very end.
+    out = torch.zeros((T, H), dtype=torch.float32, device=flat.device).index_add(0, tidx, eout)
+    return out.to(flat.dtype)
 
 
-def _hpu_v4_shared_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
-    """Clean-bf16 shared expert: silu(x@w1^T)*(x@w3^T)@w2^T from checkpoint dequant."""
-    w = getattr(self, "_v4_clean_shared_w", None)
-    if w is None:
-        w = _prep_v4_shared_weights(self)
-        dev = x.device
-        self._v4_clean_shared_w = w = tuple(t.to(dev) for t in w)
-    w1, w2, w3 = w
-    h = torch.nn.functional.silu(torch.matmul(x, w1.t())) * torch.matmul(x, w3.t())
-    return torch.matmul(h, w2.t())
+def _make_block_scales_batched(
+    per_32_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Batched version of _make_block_scales for [B, R, G] input."""
+    B, R, G = per_32_scales.shape
+    assert G % 4 == 0, f"G must be divisible by 4, got G={G}"
+    grouped = per_32_scales.reshape(B, R, G // 4, 4)
+    return grouped.max(dim=-1).values
+
+
+def _dequant_block_fp8_naive(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size_m: int = 1,
+    block_size_n: int = 128,
+) -> torch.Tensor:
+    """Dequantize block-fp8 (e4m3fn) weight to bf16.
+
+    Args:
+        weight: fp8 (float8_e4m3fn) [M, N]
+        weight_scale: float32 [M_blocks, N_blocks] where M_blocks = M // block_size_m,
+            N_blocks = N // block_size_n
+        block_size_m: row block size (1 for per-row blocks)
+        block_size_n: column block size (128 for 128-col blocks)
+
+    Returns:
+        bf16 weight [M, N]
+    """
+    M, N = weight.shape
+    M_blocks, N_blocks = weight_scale.shape
+    w_view = weight.view(M_blocks, block_size_m, N_blocks, block_size_n)
+    s_view = weight_scale.view(M_blocks, 1, N_blocks, 1)
+    dequant = w_view.to(torch.bfloat16) * s_view.to(torch.bfloat16)
+    return dequant.reshape(M, N).contiguous()
 
 
 def _hpu_deepseek_v4_moe_forward(
@@ -1617,29 +2092,62 @@ def _hpu_deepseek_v4_moe_forward(
     hidden_states: torch.Tensor,
     input_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """HPU DeepSeek V4 MoE forward.
+    """HPU DeepSeek V4 MoE forward (clean torch, reference-exact bf16).
 
-    The upstream FusedMoE path passes ``router_logits=hidden_states`` (routing on
-    the raw post-norm input). That routes with the wrong logits (~3x off). Compute
-    the actual gate logits here, then run the experts with them. Kept in the plugin
-    so upstream vLLM stays pristine.
+    Replaces the stock HPU fused ``mixture_of_experts`` path (which dequants fp8
+    with per-row scales -> lossy, and can't handle the official fp4 routed
+    experts). Here we route with the real gate logits (sqrt-softplus topk, or the
+    hash tid2eid table for layers 0-2), dequant the active experts fp4 -> bf16,
+    and run clean matmuls matching the transformers reference.
     """
+    import re as _moe_re
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
     org_shape = hidden_states.shape
-    _diag("moe_in", hidden_states)
-    router_logits = self.gate(hidden_states)[0]
+    flat = hidden_states.reshape(-1, self.hidden_size)
+    _diag("moe_in", flat)
+    m = _moe_re.search(r"\.(\d+)\.ffn$", self.prefix or "")
+    lidx = int(m.group(1)) if m else 0
+
+    router_logits = self.gate(flat)[0]
+    scores = torch.sqrt(torch.nn.functional.softplus(router_logits))
+    top_k = self.n_activated_experts
+    if self.gate.tid2eid is not None:
+        if input_ids is None:
+            raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+        topk_ids = self.gate.tid2eid[input_ids.reshape(-1)].long()
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        bias = self.gate.e_score_correction_bias
+        sel = scores if bias is None else scores + bias.to(scores.dtype)
+        _, topk_ids = torch.topk(sel, top_k, dim=-1, sorted=False)
+        topk_weights = scores.gather(1, topk_ids)
+    topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    topk_weights = topk_weights * self.routed_scaling_factor
+
     if os.environ.get("HPU_DUMP") == "1":
-        import re as _moe_re
-        m = _moe_re.search(r"\.(\d+)\.ffn$", self.prefix or "")
-        lidx = int(m.group(1)) if m else 0
         _HPU_CAP.setdefault("router_logits", {})[lidx] = (
             router_logits.detach().float().clone()
         )
-        _HPU_CAP.setdefault("moe_in", {})[lidx] = hidden_states.detach().float().clone()
-    final_hidden_states = self.experts(
-        hidden_states=hidden_states,
-        router_logits=router_logits,
-        input_ids=input_ids,
-    )
+        _HPU_CAP.setdefault("moe_in", {})[lidx] = flat.detach().float().clone()
+        _HPU_CAP.setdefault("topk_ids", {})[lidx] = topk_ids.detach().clone()
+        _HPU_CAP.setdefault("topk_weights", {})[lidx] = (
+            topk_weights.detach().float().clone()
+        )
+
+    routed = _compute_v4_routed(self, flat, topk_ids, topk_weights)
+    if os.environ.get("HPU_DUMP") == "1":
+        _HPU_CAP.setdefault("routed_out", {})[lidx] = routed.detach().float().clone()
+
+    # Routed experts are TP-sharded (this rank computes only its expert range);
+    # all-reduce to the full routed output. The shared expert is computed full
+    # (replicated) from the checkpoint, so it is NOT all-reduced (avoids 4x).
+    if self.tp_size > 1:
+        routed = tensor_model_parallel_all_reduce(routed)
+    if self.shared_experts is not None:
+        routed = routed.float() + self.shared_experts(flat).float()
+    final_hidden_states = routed.to(torch.bfloat16)
+
     _diag("moe_out", final_hidden_states)
     if os.environ.get("HPU_DUMP") == "1":
         _HPU_CAP.setdefault("moe_out", {})[lidx] = (
@@ -1651,6 +2159,22 @@ def _hpu_deepseek_v4_moe_forward(
 # Install the HPU MoE forward on the shared upstream class (module import applies
 # the patch once). The top-level/mtp classes remain unregistered for now.
 DeepseekV4MoE.forward = _hpu_deepseek_v4_moe_forward  # type: ignore[method-assign]
+
+
+def _hpu_sel_deepseek_v4_mxfp4_moe_backend(config):
+    """HPU: no MXFP4 MoE kernel. The clean-bf16 forward dequants fp4->bf16 and
+    computes the routed experts itself (bypassing the FusedMoE), so the FusedMoE
+    only needs to construct/load without a kernel -> no-op NONE backend."""
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+
+    return Mxfp4MoeBackend.NONE, None
+
+
+# The official DeepSeek-V4-Flash checkpoint has fp4 (MXFP4) routed experts; the
+# CUDA/ROCm MXFP4 backend selector has no HPU candidate and would raise. Patch it
+# to the no-op backend on HPU (see _hpu_deepseek_v4_moe_forward).
+import vllm.model_executor.layers.quantization.mxfp4 as _mx
+_mx.select_deepseek_v4_mxfp4_moe_backend = _hpu_sel_deepseek_v4_mxfp4_moe_backend
 
 DeepSeekV4MTP = None
 DSparkDeepseekV4ForCausalLM = None
