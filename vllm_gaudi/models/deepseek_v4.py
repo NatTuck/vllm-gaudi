@@ -495,15 +495,31 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._win_n = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
         self._decode_pos = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
 
-        # Compressor kernel state (capacity buffers + counters)
+        # Compressor kernel state — flat tensor attributes, no dict
         vllm_config = kwargs.get("vllm_config", None) or (args[0] if args else None)
         self._hf_config = getattr(vllm_config, "model_config", None).hf_config
         self._compress_cache = None
-        self._comp_kernel_state = None
         self._comp_coff = 2 if self.compress_ratio == 4 else 1
-        self._comp_reset = False
-        # Compressor capacity (set by _init_comp_kernel_state, read by forward)
         self._cap = 0
+        # Window buffers (allocated at first compressor use)
+        self._c_win_kv = torch.empty(0)
+        self._c_win_gate = torch.empty(0)
+        self._c_win_n = torch.tensor(0, dtype=torch.int64)
+        self._i_win_kv = torch.empty(0)
+        self._i_win_gate = torch.empty(0)
+        self._i_win_n = torch.tensor(0, dtype=torch.int64)
+        # Compressed KV capacity buffers
+        self._c_comp = torch.empty(0)
+        self._c_n = torch.tensor(0, dtype=torch.int64)
+        self._i_comp = torch.empty(0)
+        self._i_n = torch.tensor(0, dtype=torch.int64)
+        # Overlap buffers
+        self._c_ovl_kv = torch.empty(0)
+        self._c_ovl_gate = torch.empty(0)
+        self._c_ovl_n = torch.tensor(0, dtype=torch.int64)
+        self._i_ovl_kv = torch.empty(0)
+        self._i_ovl_gate = torch.empty(0)
+        self._i_ovl_n = torch.tensor(0, dtype=torch.int64)
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -569,157 +585,127 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
 
 
-    def _run_compressor(self, hidden_states, q_residual, positions):
-        """Run the graph-compilable CSA compressor/indexer over real tokens ->
-        (compressed_kv_full, compressed_n, block_bias_full). Returns static-shape
-        [CAP, D] buffer (padded with zeros past count), scalar count, and
-        [T, CAP] block_bias (or None for decode)."""
-        if self.compressor is None or self.compress_ratio <= 1:
-            D = self.head_dim
-            dev = hidden_states.device
-            empty = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
-            return empty, torch.tensor(0, dtype=torch.int64, device=dev), None, None
-        reset = getattr(self, "_comp_reset", False)
-        self._comp_reset = False
-        ckv_full, c_n, bb, _topk = self._compressor_compilable(
-            hidden_states, q_residual, positions, reset=reset
-        )
-        if ckv_full is None:
-            cap = self._cap
-            dev = hidden_states.device
-            D = self.head_dim
-            empty = torch.zeros(max(cap, 1), D, dtype=torch.bfloat16, device=dev)
-            return empty, torch.tensor(0, dtype=torch.int64, device=dev), None, None
-        return ckv_full, c_n, bb, None
-
-    # ------------------------------------------------------------------
-    # Graph-compilable CSA compressor + indexer kernel (layer 2, ratio 4).
-    # Replaces the eager transformers public compressor (`_run_compressor`)
-    # with tensor ops. State (window buffer, running compressed list,
-    # overlap) is kept as capacity buffers + counters so the core compiles;
-    # returns (compressed_kv [n,D], block_bias [T,n], topk) in the same
-    # contract as `_run_compressor`.
-    # ------------------------------------------------------------------
-    def _get_compress_cache(self, cap: int) -> torch.Tensor:
-        if self._compress_cache is not None and self._compress_cache.shape[0] >= cap:
-            return self._compress_cache
+    def _make_compress_cache(self):
+        """Build the yarn compress RoPE cos/sin cache once at init."""
+        if self._compress_cache is not None:
+            return
+        rate = self.compress_ratio
+        D = self.head_dim
+        cap = 4096
+        self._cap = cap
+        dev = self.compressor.ape.device
         from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4CSACompressor,
         )
         pub = DeepseekV4CSACompressor(self._hf_config)
-        dev = self.compressor.ape.device
         inv = pub.rotary_emb.compress_inv_freq.float().to(dev)
         scale = pub.rotary_emb.compress_attention_scaling
-        p = torch.arange(cap, dtype=torch.float32, device=dev)
+        p = torch.arange(cap * rate + 16, dtype=torch.float32, device=dev)
         freqs = p.unsqueeze(1) * inv.unsqueeze(0)
         cos = freqs.cos() * scale
         sin = freqs.sin() * scale
         self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
-        return self._compress_cache
-
-    def _init_comp_kernel_state(self, dev):
-        if self._comp_kernel_state is not None:
-            return self._comp_kernel_state
-        rate = self.compress_ratio
-        D = self.head_dim
         idx_h = self.indexer.head_dim if (rate == 4 and self.indexer is not None) else D
-        cap = 4096
-        self._cap = cap
-        st = {
-            "rate": rate, "D": D, "idx_h": idx_h, "cap": cap, "dev": dev,
-            "c_win_kv": None, "c_win_gate": None, "c_win_n": 0,
-            "c_comp": torch.zeros(cap, D, dtype=torch.bfloat16, device=dev), "c_n": 0,
-            "c_ovl_kv": None, "c_ovl_gate": None,
-            "i_win_kv": None, "i_win_gate": None, "i_win_n": 0,
-            "i_comp": torch.zeros(cap, idx_h, dtype=torch.bfloat16, device=dev), "i_n": 0,
-            "i_ovl_kv": None, "i_ovl_gate": None,
-        }
-        self._comp_kernel_state = st
-        return st
+        max_win = 2 * rate
+        self._c_win_kv = torch.zeros(max_win, 2 * D, dtype=torch.bfloat16, device=dev)
+        self._c_win_gate = torch.zeros(max_win, 2 * D, dtype=torch.bfloat16, device=dev)
+        self._c_comp = torch.zeros(cap, D, dtype=torch.bfloat16, device=dev)
+        self._c_ovl_kv = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
+        self._c_ovl_gate = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
+        self._i_win_kv = torch.zeros(max_win, 2 * idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_win_gate = torch.zeros(max_win, 2 * idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_comp = torch.zeros(cap, idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_ovl_kv = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_ovl_gate = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
 
     def _comp_rmsnorm(self, x, w):
         xf = x.float()
         out = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
         return (out * w.float()).to(x.dtype)
 
-    def _comp_store(self, buf_kv, buf_gate, buf_n, kv, gate, rate):
-        if buf_n > 0 and buf_kv is not None:
-            kv = torch.cat([buf_kv[:buf_n], kv], dim=0)
-            gate = torch.cat([buf_gate[:buf_n], gate], dim=0)
-        total = kv.shape[0]
+    def _comp_store_shift(self, buf, n, new, rate):
+        """Write ``new`` into fixed buffer ``buf`` at position ``n``, then
+        extract window-aligned rows and shift leftovers to front.
+        Returns (window_count, leftover_count)."""
+        T = new.shape[0]
+        total = n + T
+        buf[n:total] = new
         usable = (total // rate) * rate
         left = total - usable
-        return kv[:usable], gate[:usable], kv[usable:].clone(), gate[usable:].clone(), left
+        if left > 0:
+            buf[:left] = buf[usable:total].clone()
+        return usable // rate, left
 
-    def _comp_windows(self, chunk_kv, chunk_gate, first_pos, Dk, ape, norm_w,
-                      cache, ovl_kv, ovl_gate, rope_dim):
-        rate = self.compress_ratio
-        nw = chunk_kv.shape[0] // rate
+    def _comp_windows(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
+                      cache, ovl_n, ovl_kv, ovl_gate, rope_dim):
+        nw = ck.shape[0] // rate
         if nw == 0:
-            return chunk_kv.new_zeros((0, Dk))
-        ck = chunk_kv.view(nw, rate, 2 * Dk)
-        cg = chunk_gate.view(nw, rate, 2 * Dk) + ape
-        nk = chunk_kv.new_zeros(nw, 2 * rate, Dk)
+            return ck.new_zeros((0, Dk))
+        ckv = ck.view(nw, rate, 2 * Dk)
+        cgv = cg.view(nw, rate, 2 * Dk) + ape
+        nk = ck.new_zeros(nw, 2 * rate, Dk)
         ng = cg.new_full((nw, 2 * rate, Dk), float("-inf"))
-        nk[:, rate:] = ck[:, :, Dk:].to(chunk_kv.dtype)
-        ng[:, rate:] = cg[:, :, Dk:]
+        nk[:, rate:] = ckv[:, :, Dk:].to(ck.dtype)
+        ng[:, rate:] = cgv[:, :, Dk:]
         if nw > 1:
-            nk[1:, :rate] = ck[:-1, :, :Dk].to(chunk_kv.dtype)
-            ng[1:, :rate] = cg[:-1, :, :Dk]
-        if ovl_kv is not None:
-            nk[0, :rate] = ovl_kv.to(chunk_kv.dtype)
-            ng[0, :rate] = ovl_gate.to(cg.dtype)
+            nk[1:, :rate] = ckv[:-1, :, :Dk].to(ck.dtype)
+            ng[1:, :rate] = cgv[:-1, :, :Dk]
+        if ovl_n > 0:
+            nk[0, :rate] = ovl_kv[:rate].to(ck.dtype)
+            ng[0, :rate] = ovl_gate[:rate].to(cg.dtype)
         soft = torch.softmax(ng.float(), dim=1)
-        comp = (nk.float() * soft).sum(dim=1).to(chunk_kv.dtype)
+        comp = (nk.float() * soft).sum(dim=1).to(ck.dtype)
         comp = self._comp_rmsnorm(comp, norm_w)
-        pos = torch.arange(nw, device=chunk_kv.device) * rate + first_pos
+        pos = torch.arange(nw, device=ck.device) * rate + first_pos
         comp = _apply_rope(comp, pos, cache, rope_dim)
         return comp
 
-    def _comp_overlap(self, chunk_kv, chunk_gate, Dk, ape):
-        if chunk_kv.shape[0] == 0:
-            return None, None
-        last = chunk_kv.view(-1, self.compress_ratio, 2 * Dk)[-1]
-        lastg = (chunk_gate.view(-1, self.compress_ratio, 2 * Dk) + ape)[-1]
-        return last[:, :Dk].clone(), lastg[:, :Dk].clone()
-
-    def _comp_windows_hca(self, chunk_kv, chunk_gate, first_pos, Dk, ape, norm_w,
+    def _comp_windows_hca(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
                           cache, rope_dim):
-        """Compress a batch of full HCA windows (no Ca/Cb, no overlap)."""
-        rate = self.compress_ratio
+        nw = ck.shape[0] // rate
+        if nw == 0:
+            return ck.new_zeros((0, Dk))
+        ckv = ck.view(nw, rate, Dk)
+        cgv = cg.view(nw, rate, Dk) + ape
+        soft = torch.softmax(cgv.float(), dim=1)
+        comp = (ckv.float() * soft).sum(dim=1).to(torch.bfloat16)
+        comp = self._comp_rmsnorm(comp, norm_w)
+        pos = torch.arange(nw, device=ck.device) * rate + first_pos
+        comp = _apply_rope(comp, pos, cache, rope_dim)
+        return comp
+
+    def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
         if nw == 0:
-            return chunk_kv.new_zeros((0, Dk))
-        ck = chunk_kv.view(nw, rate, Dk)
-        cg = chunk_gate.view(nw, rate, Dk) + ape
-        soft = torch.softmax(cg.float(), dim=1)
-        comp = (ck.float() * soft).sum(dim=1).to(torch.bfloat16)
-        comp = self._comp_rmsnorm(comp, norm_w)
-        pos = torch.arange(nw, device=chunk_kv.device) * rate + first_pos
-        comp = _apply_rope(comp, pos, cache, rope_dim)
-        return comp
+            ovl_n.zero_()
+        else:
+            last = chunk_kv.view(-1, rate, 2 * Dk)[-1]
+            lastg = (chunk_gate.view(-1, rate, 2 * Dk) + ape)[-1]
+            ovl_kv[:rate] = last[:, :Dk]
+            ovl_gate[:rate] = lastg[:, :Dk]
+            ovl_n.copy_(torch.tensor(rate, dtype=torch.int64, device=ovl_n.device))
 
-    def _compressor_compilable(self, hidden, qr, positions, reset=False):
+    def _compressor_compilable(self, hidden, qr, positions, is_prompt):
         if self.compressor is None or self.compress_ratio <= 1:
             return None, None, None, None
         rate = self.compress_ratio
         D = self.head_dim
         dev = hidden.device
-        st = self._init_comp_kernel_state(dev)
-        if reset:
-            st["c_win_kv"] = st["c_win_gate"] = None
-            st["c_win_n"] = 0
-            st["c_n"] = 0
-            st["c_ovl_kv"] = st["c_ovl_gate"] = None
-            st["i_win_kv"] = st["i_win_gate"] = None
-            st["i_win_n"] = 0
-            st["i_n"] = 0
-            st["i_ovl_kv"] = st["i_ovl_gate"] = None
-        cache = self._get_compress_cache(st["cap"] * rate + 16)
+        self._make_compress_cache()
+        cache = self._compress_cache
+
+        # Reset all state on prefill
+        zero = torch.tensor(0, dtype=torch.int64, device=dev)
+        self._c_win_n = torch.where(is_prompt > 0, zero, self._c_win_n)
+        self._c_n = torch.where(is_prompt > 0, zero, self._c_n)
+        self._c_ovl_n = torch.where(is_prompt > 0, zero, self._c_ovl_n)
+        self._i_win_n = torch.where(is_prompt > 0, zero, self._i_win_n)
+        self._i_n = torch.where(is_prompt > 0, zero, self._i_n)
+        self._i_ovl_n = torch.where(is_prompt > 0, zero, self._i_ovl_n)
 
         c = self.compressor
         fused = c.fused_wkv_wgate.weight.data
-        coff = getattr(self, "_comp_coff", 2 if rate == 4 else 1)
+        coff = self._comp_coff
         kv_out = coff * D
         kv_w = fused[:kv_out]
         gate_w = fused[kv_out:]
@@ -728,29 +714,30 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         kv = hidden @ kv_w.t()
         gate = hidden @ gate_w.t()
-        ckv, cgate, wkv, wgate, wleft = self._comp_store(
-            st["c_win_kv"], st["c_win_gate"], st["c_win_n"], kv, gate, rate)
-        st["c_win_kv"] = wkv if wleft > 0 else None
-        st["c_win_gate"] = wgate if wleft > 0 else None
-        st["c_win_n"] = wleft
-        if rate == 4:
-            comp = self._comp_windows(ckv, cgate, st["c_n"] * rate, D, ape, norm_w,
-                                      cache, st["c_ovl_kv"], st["c_ovl_gate"], self.rope_head_dim)
-        else:
-            comp = self._comp_windows_hca(ckv, cgate, st["c_n"] * rate, D, ape, norm_w,
-                                          cache, self.rope_head_dim)
-        if comp.shape[0] > 0:
-            st["c_comp"][st["c_n"]: st["c_n"] + comp.shape[0]] = comp
-            st["c_n"] += comp.shape[0]
-        if rate == 4 and ckv.shape[0] // rate > 0:
-            st["c_ovl_kv"], st["c_ovl_gate"] = self._comp_overlap(ckv, cgate, D, ape)
-        compressed_kv_slice = st["c_comp"][: st["c_n"]]
-        compressed_kv_full = st["c_comp"]
+        nw_c, left_c = self._comp_store_shift(self._c_win_kv, self._c_win_n, kv, rate)
+        self._c_win_n = torch.tensor(left_c, dtype=torch.int64, device=dev)
+        usable_c = nw_c * rate
+        if usable_c > 0:
+            ck = self._c_win_kv[:usable_c].clone()
+            cg = self._c_win_gate[:usable_c].clone()
+            if rate == 4:
+                comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
+                                          norm_w, cache, self._c_ovl_n,
+                                          self._c_ovl_kv, self._c_ovl_gate, self.rope_head_dim)
+            else:
+                comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
+                                              norm_w, cache, self.rope_head_dim)
+            self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
+            self._c_n += comp.shape[0]
+            if rate == 4:
+                self._comp_fill_overlap(ck, cg, D, rate, ape,
+                                        self._c_ovl_kv, self._c_ovl_gate, self._c_ovl_n)
+        compressed_kv_full = self._c_comp
 
         # ---- indexer (only CSA, ratio 4) ----
         has_idx = rate == 4 and self.indexer is not None
         if has_idx:
-            idx_h = st["idx_h"]
+            idx_h = self._i_comp.shape[-1]
             idx = self.indexer
             ifused = idx.compressor.fused_wkv_wgate.weight.data
             ikv_w = ifused[: 2 * idx_h]
@@ -759,26 +746,28 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             inorm_w = idx.compressor.norm.weight
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
-            ikv2, igate2, iwkv, iwg, iwleft = self._comp_store(
-                st["i_win_kv"], st["i_win_gate"], st["i_win_n"], ikv, igate, rate)
-            st["i_win_kv"] = iwkv if iwleft > 0 else None
-            st["i_win_gate"] = iwg if iwleft > 0 else None
-            st["i_win_n"] = iwleft
-            icomp = self._comp_windows(ikv2, igate2, st["i_n"] * rate, idx_h, iape, inorm_w,
-                                       cache, st["i_ovl_kv"], st["i_ovl_gate"], self.rope_head_dim)
-            if icomp.shape[0] > 0:
-                st["i_comp"][st["i_n"]: st["i_n"] + icomp.shape[0]] = icomp
-                st["i_n"] += icomp.shape[0]
-            if ikv2.shape[0] // rate > 0:
-                st["i_ovl_kv"], st["i_ovl_gate"] = self._comp_overlap(ikv2, igate2, idx_h, iape)
-            idx_compressed = st["i_comp"][: st["i_n"]]
+            nw_i, left_i = self._comp_store_shift(self._i_win_kv, self._i_win_n, ikv, rate)
+            self._i_win_n = torch.tensor(left_i, dtype=torch.int64, device=dev)
+            usable_i = nw_i * rate
+            if usable_i > 0:
+                ik = self._i_win_kv[:usable_i].clone()
+                ig = self._i_win_gate[:usable_i].clone()
+                icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
+                                           inorm_w, cache, self._i_ovl_n,
+                                           self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
+                self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
+                self._i_n += icomp.shape[0]
+                self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
+                                        self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
+            idx_compressed = self._i_comp
         else:
+            idx_h = D
             idx_compressed = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
 
         # ---- scorer / topk / block_bias ----
         T = hidden.shape[0]
-        clen = compressed_kv_slice.shape[0]
-        cap = st["cap"]
+        clen = self._c_n
+        cap = self._cap
         if has_idx and clen > 0:
             nhead = self.indexer.n_head
             qb_w = self.indexer.wq_b.weight.data
@@ -788,8 +777,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                 if wq_s is None:
                     wq_s = getattr(self.indexer.wq_b, "weight_scale_inv", None)
                 qb = dequant_block_fp8_weight_naive(
-                    qb_w,
-                    wq_s,
+                    qb_w, wq_s,
                     getattr(getattr(self.indexer.wq_b, "quant_config", None),
                             "weight_block_size", (128, 128)),
                     torch.bfloat16)
@@ -800,7 +788,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             ws = self.indexer.n_head ** -0.5
             q = (qr @ qb.t()).view(T, nhead, idx_h).to(torch.bfloat16)
             q = _apply_rope(q, positions, cache, self.rope_head_dim)
-            scores = torch.matmul(q.float(), idx_compressed.float().t())
+            scores = torch.matmul(q.float(), idx_compressed[:clen].float().t())
             scores = torch.relu(scores) * ss
             w = (hidden @ wp.t()).float() * ws
             scores = (scores * w.unsqueeze(-1)).sum(dim=1)
@@ -814,28 +802,40 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             topk = torch.where(invalid, torch.full_like(topk, -1), topk)
             valid = topk >= 0
             safe = torch.where(valid, topk, torch.full_like(topk, clen))
-            # Static-shape block_bias [T, cap]: valid entries at safe indices,
-            # padding (beyond clen) and invalid entries -> -inf
             bb = compressed_kv_full.new_full((1, 1, T, cap + 1), float("-inf"))
             safe_cap = torch.where(valid, topk, torch.full_like(topk, cap))
             bb.scatter_(-1, safe_cap.unsqueeze(0).unsqueeze(0), 0.0)
-            # Also mark real padding (beyond clen) as -inf (already done via safe_cap -> cap)
             block_bias = bb[..., :cap][0, 0]
         elif clen > 0 and T > 1:
-            # HCA: causal block_bias (no indexer). seq=1 -> None (matches ref).
-            # Static-shape: block_bias [T, cap], padding beyond clen -> -inf
             causal = (positions + 1) // rate
             entry = torch.arange(cap, device=dev)
             block_bias = compressed_kv_full.new_full((T, cap), float("-inf"))
             block_bias.masked_fill_(
                 (entry.unsqueeze(0) < causal.unsqueeze(-1)) & (entry.unsqueeze(0) < clen),
-                0.0
-            )
+                0.0)
             topk = torch.empty(T, 0, dtype=torch.long, device=dev)
         else:
             block_bias = None
             topk = torch.empty(T, 0, dtype=torch.long, device=dev)
-        return compressed_kv_full, st["c_n"], block_bias, topk
+        return compressed_kv_full, self._c_n, block_bias, topk
+
+    def _run_compressor(self, hidden_states, q_residual, positions, is_prompt):
+        """Run the graph-compilable CSA compressor/indexer over real tokens.
+        Returns (compressed_kv_full [CAP,D], compressed_n, block_bias [T,CAP] or None, _)."""
+        if self.compressor is None or self.compress_ratio <= 1:
+            D = self.head_dim
+            dev = hidden_states.device
+            return (torch.zeros(0, D, dtype=torch.bfloat16, device=dev),
+                    torch.tensor(0, dtype=torch.int64, device=dev), None, None)
+        ckv_full, c_n, bb, _ = self._compressor_compilable(
+            hidden_states, q_residual, positions, is_prompt)
+        if ckv_full is None:
+            cap = max(self._cap, 1)
+            dev = hidden_states.device
+            D = self.head_dim
+            return (torch.zeros(cap, D, dtype=torch.bfloat16, device=dev),
+                    torch.tensor(0, dtype=torch.int64, device=dev), None, None)
+        return ckv_full, c_n, bb, None
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # o: [T, n_local_heads, head_dim] -- inverse RoPE + wo_a (group bmm) + wo_b
@@ -1002,7 +1002,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
 
         pos_flat = positions.reshape(-1)
-        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
+        is_prompt = torch.tensor(1, dtype=torch.int64, device=pos_flat.device)
+        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
 
         cap = self._cap
         past_kv = torch.cat([self._win_cache, comp_full], dim=0)
@@ -1037,7 +1038,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._win_n.add_(1).clamp_(max=self.window_size)
 
         pos_flat = positions.reshape(-1)
-        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat)
+        is_prompt = torch.tensor(0, dtype=torch.int64, device=pos_flat.device)
+        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
 
         cap = self._cap
         past_kv = torch.cat([self._win_cache, comp_full], dim=0)
