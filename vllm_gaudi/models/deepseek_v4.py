@@ -624,35 +624,27 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         return (out * w.float()).to(x.dtype)
 
     def _comp_store_shift(self, buf, n, new, rate):
-        """Write ``new`` into fixed buffer ``buf`` at position ``n``, then
-        extract window-aligned rows and shift leftovers to front.
-        Returns (window_count, leftover_count)."""
         T = new.shape[0]
         total = n + T
         buf[n:total] = new
         usable = (total // rate) * rate
         left = total - usable
-        if left > 0:
-            buf[:left] = buf[usable:total].clone()
+        buf[:left] = buf[usable:total].clone()
         return usable // rate, left
 
     def _comp_windows(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
                       cache, ovl_n, ovl_kv, ovl_gate, rope_dim):
         nw = ck.shape[0] // rate
-        if nw == 0:
-            return ck.new_zeros((0, Dk))
         ckv = ck.view(nw, rate, 2 * Dk)
         cgv = cg.view(nw, rate, 2 * Dk) + ape
         nk = ck.new_zeros(nw, 2 * rate, Dk)
         ng = cg.new_full((nw, 2 * rate, Dk), float("-inf"))
         nk[:, rate:] = ckv[:, :, Dk:].to(ck.dtype)
         ng[:, rate:] = cgv[:, :, Dk:]
-        if nw > 1:
-            nk[1:, :rate] = ckv[:-1, :, :Dk].to(ck.dtype)
-            ng[1:, :rate] = cgv[:-1, :, :Dk]
-        if ovl_n > 0:
-            nk[0, :rate] = ovl_kv[:rate].to(ck.dtype)
-            ng[0, :rate] = ovl_gate[:rate].to(cg.dtype)
+        nk[1:, :rate] = ckv[:-1, :, :Dk].to(ck.dtype)
+        ng[1:, :rate] = cgv[:-1, :, :Dk]
+        nk[0, :rate] = torch.where(ovl_n > 0, ovl_kv[:rate].to(ck.dtype), nk[0, :rate])
+        ng[0, :rate] = torch.where(ovl_n > 0, ovl_gate[:rate].to(cg.dtype), ng[0, :rate])
         soft = torch.softmax(ng.float(), dim=1)
         comp = (nk.float() * soft).sum(dim=1).to(ck.dtype)
         comp = self._comp_rmsnorm(comp, norm_w)
@@ -676,14 +668,17 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
-        if nw == 0:
-            ovl_n.zero_()
-        else:
-            last = chunk_kv.view(-1, rate, 2 * Dk)[-1]
-            lastg = (chunk_gate.view(-1, rate, 2 * Dk) + ape)[-1]
-            ovl_kv[:rate] = last[:, :Dk]
-            ovl_gate[:rate] = lastg[:, :Dk]
-            ovl_n.copy_(torch.tensor(rate, dtype=torch.int64, device=ovl_n.device))
+        ovl_n.copy_(torch.where(
+            nw > 0,
+            torch.tensor(rate, dtype=torch.int64, device=ovl_n.device),
+            torch.tensor(0, dtype=torch.int64, device=ovl_n.device)))
+        # Pad chunk with rate dummy rows to make [-1] safe when usable<rate
+        safe_kv = torch.cat([chunk_kv, chunk_kv.new_zeros(rate, 2 * Dk)], dim=0)
+        safe_ga = torch.cat([chunk_gate + ape, chunk_gate.new_zeros(rate, 2 * Dk)], dim=0)
+        last = safe_kv.view(-1, rate, 2 * Dk)[-1]
+        lastg = safe_ga.view(-1, rate, 2 * Dk)[-1]
+        ovl_kv[:rate] = last[:, :Dk]
+        ovl_gate[:rate] = lastg[:, :Dk]
 
     def _compressor_compilable(self, hidden, qr, positions, is_prompt):
         if self.compressor is None or self.compress_ratio <= 1:
@@ -717,21 +712,20 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         nw_c, left_c = self._comp_store_shift(self._c_win_kv, self._c_win_n, kv, rate)
         self._c_win_n = torch.tensor(left_c, dtype=torch.int64, device=dev)
         usable_c = nw_c * rate
-        if usable_c > 0:
-            ck = self._c_win_kv[:usable_c].clone()
-            cg = self._c_win_gate[:usable_c].clone()
-            if rate == 4:
-                comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
-                                          norm_w, cache, self._c_ovl_n,
-                                          self._c_ovl_kv, self._c_ovl_gate, self.rope_head_dim)
-            else:
-                comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
-                                              norm_w, cache, self.rope_head_dim)
-            self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
-            self._c_n += comp.shape[0]
-            if rate == 4:
-                self._comp_fill_overlap(ck, cg, D, rate, ape,
-                                        self._c_ovl_kv, self._c_ovl_gate, self._c_ovl_n)
+        ck = self._c_win_kv[:usable_c].clone()
+        cg = self._c_win_gate[:usable_c].clone()
+        if rate == 4:
+            comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
+                                      norm_w, cache, self._c_ovl_n,
+                                      self._c_ovl_kv, self._c_ovl_gate, self.rope_head_dim)
+        else:
+            comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
+                                          norm_w, cache, self.rope_head_dim)
+        self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
+        self._c_n += comp.shape[0]
+        if rate == 4:
+            self._comp_fill_overlap(ck, cg, D, rate, ape,
+                                    self._c_ovl_kv, self._c_ovl_gate, self._c_ovl_n)
         compressed_kv_full = self._c_comp
 
         # ---- indexer (only CSA, ratio 4) ----
@@ -749,16 +743,15 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             nw_i, left_i = self._comp_store_shift(self._i_win_kv, self._i_win_n, ikv, rate)
             self._i_win_n = torch.tensor(left_i, dtype=torch.int64, device=dev)
             usable_i = nw_i * rate
-            if usable_i > 0:
-                ik = self._i_win_kv[:usable_i].clone()
-                ig = self._i_win_gate[:usable_i].clone()
-                icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
-                                           inorm_w, cache, self._i_ovl_n,
-                                           self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
-                self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
-                self._i_n += icomp.shape[0]
-                self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
-                                        self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
+            ik = self._i_win_kv[:usable_i].clone()
+            ig = self._i_win_gate[:usable_i].clone()
+            icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
+                                       inorm_w, cache, self._i_ovl_n,
+                                       self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
+            self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
+            self._i_n += icomp.shape[0]
+            self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
+                                    self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
             idx_compressed = self._i_comp
         else:
             idx_h = D
