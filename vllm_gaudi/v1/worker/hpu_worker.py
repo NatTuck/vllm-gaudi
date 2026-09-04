@@ -761,12 +761,6 @@ def init_worker_distributed_environment(
 ) -> None:
     parallel_config = vllm_config.parallel_config
     """Initialize the distributed environment."""
-    # HCŁ backend for HPU uses LOCAL_RANK / WORLD_SIZE env vars to determine
-    # which physical HPU each process should attach to. With spawn-based
-    # workers (HPU default) these are not inherited from the parent, so set
-    # them here before init_process_group.
-    os.environ["LOCAL_RANK"] = str(local_rank)
-    os.environ["WORLD_SIZE"] = str(parallel_config.world_size)
     init_distributed_environment(parallel_config.world_size, rank, distributed_init_method, local_rank, backend='hccl')
 
     dummy_tensor_hpu = torch.ones(1).to('hpu')
