@@ -486,13 +486,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             requires_grad=False,
         )
         # Window KV cache as ring buffer with tensor counter
-        # The base class sets self.window_size=config.sliding_window, but the
-        # vllm config may resolve sliding_window differently; force to 128.
         self._win_cache_device = self.fused_wqa_wkv.weight.device
         self.window_size = 128
         self._win_cache = torch.zeros(
             self.window_size, self.head_dim,
-            dtype=torch.bfloat16, device=self.fused_wqa_wkv.weight.device,
+            dtype=torch.bfloat16, device=self._win_cache_device,
         )
         self._win_n = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
         self._decode_pos = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
