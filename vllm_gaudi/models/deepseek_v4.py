@@ -1013,11 +1013,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             win_mask = pos_flat[:, None] >= pos_flat[None, start:]
 
         comp_ids = torch.arange(cap, device=pos_flat.device)
-        comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
+        comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)  # [1, CAP]
         if comp_bb is not None:
-            comp_attend = comp_present & torch.isfinite(comp_bb)
+            comp_attend = comp_present & torch.isfinite(comp_bb)  # [T, CAP]
         else:
-            comp_attend = comp_present
+            comp_attend = comp_present.expand(T, -1)  # [1, CAP] -> [T, CAP]
         mask = torch.cat([win_mask, comp_attend], dim=-1)
 
         return self._forward_compilable(qr, kv, positions, past_kv, mask)
