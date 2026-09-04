@@ -991,6 +991,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         T = kv_roped.shape[0]
         self._win_n.zero_()
         self._decode_pos.zero_()
+        # Re-create _win_cache at the correct size if it was overwritten
+        if self._win_cache.shape[0] != self.window_size:
+            self._win_cache = torch.zeros(
+                self.window_size, self.head_dim,
+                dtype=torch.bfloat16, device=self._win_cache.device,
+            )
         self._win_cache[:T] = kv_roped[:T]
         self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
 
