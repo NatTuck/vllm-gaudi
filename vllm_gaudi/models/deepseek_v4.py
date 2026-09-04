@@ -487,6 +487,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         )
         # Window KV cache as ring buffer with tensor counter
         self._win_cache_device = self.fused_wqa_wkv.weight.device
+        _ws = getattr(self, "window_size", 128)
+        print(f"[HPU_ATTN] window_size from base={_ws}, forcing to 128", flush=True)
         self.window_size = 128
         self._win_cache = torch.zeros(
             self.window_size, self.head_dim,
@@ -991,14 +993,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         T = kv_roped.shape[0]
         self._win_n.zero_()
         self._decode_pos.zero_()
-        # Re-create _win_cache at the correct size if it was overwritten
-        if self._win_cache.shape[0] != self.window_size:
-            self._win_cache = torch.zeros(
-                self.window_size, self.head_dim,
-                dtype=torch.bfloat16, device=self._win_cache.device,
-            )
-        self._win_cache[:T] = kv_roped[:T]
-        self._win_n.copy_(torch.tensor(T, dtype=torch.int64))
+        n_win = min(T, self.window_size)
+        self._win_cache[:n_win] = kv_roped[:n_win]
+        self._win_n.copy_(torch.tensor(n_win, dtype=torch.int64))
 
         pos_flat = positions.reshape(-1)
         is_prompt = torch.tensor(1, dtype=torch.int64, device=pos_flat.device)
