@@ -12,7 +12,7 @@ import os
 import time
 from contextlib import suppress
 from tqdm import tqdm
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields
 from typing import (TYPE_CHECKING, Any, Callable, NamedTuple, Optional, TypeAlias, Union, cast)
 if os.getenv("QUANT_CONFIG", None) is not None:
     from neural_compressor.torch.quantization import finalize_calibration
@@ -67,7 +67,7 @@ from vllm.model_executor.model_loader import get_model, get_model_loader
 from vllm.platforms import current_platform
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargsItem)
-from vllm.multimodal.utils import group_mm_kwargs_by_modality
+from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.sampling_params import SamplingType
@@ -802,7 +802,7 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
 
     mamba_like_arch = [
         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
-        "Qwen3NextForCausalLM"
+        "Qwen3NextForCausalLM", "NemotronHForCausalLM"
     ]
     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
         return
@@ -828,14 +828,25 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
             # Extract layer index from name (e.g., "model.layers.5.mixer" -> 5)
             if not any(pattern in layer_name for pattern in mamba_like_layer):
                 continue
-            parts = layer_name.split('.')
-            layer_idx = int(parts[-2])  # "model.layers.5.mixer" -> 5
-
             # Access the actual layer
             if '.mixer' in layer_name:
-                layer = model.model.layers[layer_idx]
-                layer.mamba.cache_group_idx = group_idx
+                # Only the mamba state cache registers under a name ending in
+                # ".mixer". Nemotron-H nests attention under the same attribute
+                # ("model.layers.N.mixer.attn"), which must be skipped here (it
+                # would also break the int(parts[-2]) index parsing).
+                if not layer_name.endswith('.mixer'):
+                    continue
+                layer_idx = int(layer_name.split('.')[-2])  # "...layers.5.mixer" -> 5
+                layer = _get_decoder_layer_by_idx(model, layer_idx)
+                # The Mamba block is exposed as ".mamba" (Granite) or ".mixer"
+                # (Nemotron-H) depending on the model.
+                mamba_mixer = getattr(layer, 'mamba', None)
+                if mamba_mixer is None:
+                    mamba_mixer = getattr(layer, 'mixer', None)
+                if mamba_mixer is not None:
+                    mamba_mixer.cache_group_idx = group_idx
             elif 'linear_attn' in layer_name:
+                layer_idx = int(layer_name.split('.')[-2])
                 layer = _get_decoder_layer_by_idx(model, layer_idx)
                 if layer is not None and hasattr(layer, "linear_attn"):
                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
@@ -880,7 +891,7 @@ def apply_model_specific_patches(model_runner):
 
     is_llama4 = is_hpu_llama4_model(model_runner.model)
     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
-    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5_moe")
+    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
     is_gemma4 = model_type in ("gemma4", )
 
     model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
@@ -2082,7 +2093,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 # Input all modalities at once
                 mm_kwargs_combined: BatchedTensorInputs = {}
-                for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+                for _, _, mm_kwargs_group in group_and_batch_mm_kwargs(
                         mm_kwargs,
                         device=self.device,
                         pin_memory=self.pin_memory,
@@ -2125,7 +2136,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-        for _, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+        for _, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
                 mm_kwargs,
                 device=self.device,
                 pin_memory=self.pin_memory,
@@ -4230,6 +4241,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       pad_to: Optional[int] = None,
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
         htorch.core.mark_step()
+        # Async scheduling: repair -1 placeholders before penalties read them.
+        self.input_batch.update_async_output_token_ids()
         _ps_t0 = time.time()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
         _ps_t1 = time.time()
@@ -4936,6 +4949,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 req_id: i
                 for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
             }
+            # Async scheduling: keep output_token_ids the right length with a -1
+            # placeholder while the real id is still copying to CPU; spliced in
+            # next step by update_async_output_token_ids. Unconditional, since
+            # the list is read per-request -- the batch-wide no_penalties flag
+            # only gates the repair, not the append.
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                if i not in invalid_req_indices_set:
+                    self.requests[req_id].output_token_ids.append(-1)
             # For the output, postprocessed_sampled_token_ids will be filled during serialization
         else:
             prefill_sampled_token_ids_device = prefill_sampled_token_ids
@@ -5051,12 +5072,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     finished_sending=finished_sending,
                     finished_recving=finished_recving,
                 ))
-            return AsyncHPUModelRunnerOutput(
+            async_output = AsyncHPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
                 sampled_token_ids=sampled_token_ids,
                 invalid_req_indices=self.invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
             )
+            # Hand the async CPU copy + ready event to the input batch for the
+            # next step's placeholder splice (see update_async_output_token_ids).
+            self.input_batch.set_async_sampled_token_ids(
+                async_output._sampled_token_ids_cpu,
+                async_output._async_copy_ready_event,
+            )
+            return async_output
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -5246,7 +5274,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._compile_methods()
                 self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
                 self._regional_compilation(self.model)
-                self.sampler = self._compile(self.sampler)
+                # Run the logits-processor stage eagerly: it reads the growing
+                # output_token_ids lists, which otherwise recompile the sampler
+                # every decode step once penalties are active. Needs
+                # fullgraph=False (a disabled callee is unsupported under
+                # fullgraph).
+                Sampler.apply_logits_processors = torch.compiler.disable(  # type: ignore[method-assign]
+                    Sampler.apply_logits_processors)
+                self.sampler = self._compile(self.sampler, fullgraph=False)
             else:
                 self.model = self._compile(self.model)
 
@@ -5304,8 +5339,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         module = self._compile(module)
         setattr_nested(model, name, module)
 
-    def _compile(self, module):
-        return torch.compile(module, **self.compile_config.get_compile_args())
+    def _compile(self, module, **config_overrides):
+        """Compile a module with the runner's compile config.
+
+        Args:
+            module: Module to compile.
+            **config_overrides: HPUCompileConfig overrides, for compiling a
+                single submodule under different settings than the model.
+        """
+        config = HPUCompileConfig(**config_overrides) if config_overrides else self.compile_config
+        return torch.compile(module, **config.get_compile_args())
 
     def _use_graphs(self, attn_metadata, batch_size):
         if self.model_config.enforce_eager:
@@ -6222,10 +6265,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         dummy_text = dummy_builder.get_dummy_text({modality: count})
         mm_data_items = processor.info.parse_mm_data({modality: mm_items}, validate=False)
 
+        # Upstream vllm#53093 removed the text components (str prompt +
+        # tokenization_kwargs) from ProcessorInputs; the prompt is now a
+        # pre-tokenized list[int] and tokenization happens in the caller.
+        # Mirror get_dummy_processor_inputs' tokenization exactly.
+        tokenizer = processor.info.ctx.tokenizer
+        if tokenizer is None:
+            dummy_prompt: list[int] = []
+        else:
+            dummy_prompt = tokenizer.encode(
+                dummy_text,
+                **processor.info.default_tok_params.get_encode_kwargs(),
+            )
+
         return ProcessorInputs(
-            prompt=dummy_text,
+            prompt=dummy_prompt,
             mm_data_items=mm_data_items,
-            tokenization_kwargs={"truncation": False},
         )
 
     def _get_mm_warmup_processor(self):
@@ -6275,7 +6330,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # but not read from the cache
         assert dummy_mm_item is not None, "Item should not already be cached"
 
-        return next(mm_kwargs_group for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+        return next(mm_kwargs_group for _, _, mm_kwargs_group in group_and_batch_mm_kwargs(
             [(modality, dummy_mm_item)] * batch,
             device=self.device,
             pin_memory=self.pin_memory,
@@ -6919,6 +6974,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 profile_bs = max(profile_bs, int(cfg.split(",")[0]))
         self._gdn_max_reqs = max(self._original_max_num_seqs, profile_bs)
 
+        # Mamba/GDN state tensors, keyed by (spec, position within the group).
+        # Before vLLM #51718 a KVCacheTensor.shared_by listed at most one layer
+        # per group, so propagating one state tensor across it gave every layer
+        # of a group its own storage while layers at the same position in
+        # different groups shared one. #51718 turned that field into `.layers`,
+        # which coalesces *all* of a group's layers at distinct byte offsets, so
+        # propagating across it now collapses a whole group onto one state.
+        # State slots are selected per group (compact GDN:
+        # base_slot * num_gdn_groups + g_offset + 1; otherwise the group's own
+        # block table), so only the tensor identity can separate layers inside a
+        # group. Key by position to restore the pre-#51718 sharing.
+        mamba_state_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+        def _mamba_state_tensors(spec: MambaSpec, layer_pos: int, num_slots: int) -> tuple[torch.Tensor, ...]:
+            key = (spec, layer_pos, num_slots)
+            tensors = mamba_state_cache.get(key)
+            if tensors is None:
+                tensors = tuple(
+                    torch.zeros((num_slots, *shape), dtype=dtype, device=self.device)
+                    for shape, dtype in zip(spec.shapes, spec.dtypes))
+                mamba_state_cache[key] = tensors
+            return tensors
+
         if self.use_hybrid_cache and self.num_mamba_like_layers > 0:
             # Build layer_name -> spec lookup for skipping raw buffer
             # allocation for GDN/linear_attention groups (they use
@@ -6938,36 +7016,46 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 torch.compile's aot_autograd does not support input mutations
                 on views with different dtypes (the raw buffer is bf16 but
                 GDN states may be float32)."""
-                for ln in kv_cache_tensor.shared_by:
+                for ln in kv_cache_tensor.layers:
                     spec = _layer_spec.get(ln)
                     if isinstance(spec, FullAttentionSpec):
                         continue
                     if isinstance(spec, MambaSpec) and \
                             spec.mamba_type in _GDN_MAMBA_TYPES:
                         continue
-                    # Standard Mamba2 or unknown spec — needs raw buffer
+                    if isinstance(spec, MambaSpec) and len(set(spec.dtypes)) > 1:
+                        # Mixed-dtype standard Mamba2 (e.g. Nemotron-H: bf16
+                        # conv_state + float32 ssm_state) gets its own
+                        # contiguous tensors below, not as_strided views of the
+                        # shared raw buffer — aot_autograd rejects in-place
+                        # mutation of differently-typed views of one input.
+                        continue
+                    # Standard Mamba2 (uniform dtype) or unknown spec — needs
+                    # raw buffer for the as_strided interleaved layout.
                     return True
                 return False
 
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 if not _needs_raw_buffer(kv_cache_tensor):
                     continue
-                # taking into account dummy block
-                size = (kv_cache_tensor.size + kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes)
+                # Pad by one dummy block sized to THIS tensor's spec. Its
+                # coalesced layers share one (standard Mamba2) spec; group 0 may
+                # be a smaller attention spec in hybrid models and under-pad the
+                # buffer, letting the last as_strided view run past the end.
+                raw_spec = _layer_spec[kv_cache_tensor.layers[0]]
+                size = kv_cache_tensor.size + raw_spec.page_size_bytes
                 tensor = torch.zeros(size // 2, dtype=torch.bfloat16, device=self.device)
-                for layer_name in kv_cache_tensor.shared_by:
+                for layer_name in kv_cache_tensor.layers:
                     kv_caches[layer_name] = tensor
 
             for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
                 kv_cache_spec = group.kv_cache_spec
-                for layer_name in group.layer_names:
+                for layer_pos, layer_name in enumerate(group.layer_names):
                     kv_cache_spec = group.kv_cache_spec
-                    for kk in kv_cache_config.kv_cache_tensors:
-                        if layer_name in kk.shared_by:
-                            kv_cache_tensor_size = kk.size
-                            break
-                    num_blocks = \
-                        kv_cache_tensor_size // kv_cache_spec.page_size_bytes
+                    # PR #51718: KVCacheTensor.size is now the total backing
+                    # allocation across all layers (num_blocks * bytes_per_block),
+                    # not a per-layer size. Use the engine block count directly.
+                    num_blocks = kv_cache_config.num_blocks
                     if isinstance(kv_cache_spec, FullAttentionSpec):
                         attn_kernel_block_size = kernel_block_size_by_gid[group_idx]
                         # Virtual block splitting: each scheduler block of
@@ -6999,45 +7087,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # Total slots: max_num_reqs * num_gdn_groups + 2
                         # (slot 0 unused, last slot for -1 padding).
                         self._compact_gdn_group_ids.add(group_idx)
-                        if isinstance(kv_caches.get(layer_name), tuple):
-                            continue
                         gdn_max_reqs = self._gdn_max_reqs
                         compact_total = gdn_max_reqs * self._gdn_spec_factor * self._num_gdn_groups + 2
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (compact_total, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
                         logger.debug("GDN compact tensor: %d slots (max_reqs=%d * groups=%d + 2) vs baseline %d",
                                      compact_total, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
-                        # Propagate to all layers sharing the same kv_cache_tensor.
-                        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                            if layer_name not in kv_cache_tensor.shared_by:
-                                continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
-                            break
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation
                         # using contiguous tensors with num_blocks+1 slots.
-                        if isinstance(kv_caches.get(layer_name), tuple):
-                            continue
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (num_blocks + 1, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
-                        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                            if layer_name not in kv_cache_tensor.shared_by:
-                                continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
-                            break
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, num_blocks + 1)
+                    elif isinstance(kv_cache_spec, MambaSpec) and \
+                            len(set(kv_cache_spec.dtypes)) > 1:
+                        # Mixed-dtype standard Mamba2 (e.g. Nemotron-H: bf16
+                        # conv_state + float32 ssm_state). as_strided views of a
+                        # single raw buffer would alias one storage with two
+                        # dtypes; aot_autograd cannot compile the decode graph
+                        # then ("input mutations on views with different
+                        # dtypes"). Allocate separate contiguous tensors, like
+                        # the GDN path above, so each state is its own input.
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, num_blocks + 1)
                     elif isinstance(kv_cache_spec, MambaSpec):
-                        # Standard Mamba2 and other MambaSpec types: use the
-                        # original as_strided interleaved layout from the raw
-                        # shared buffer.
+                        # Standard Mamba2 with uniform dtype: use the original
+                        # as_strided interleaved layout from the raw shared
+                        # buffer (same-dtype view mutations compile fine).
                         raw = kv_caches[layer_name]
                         offset = 0
                         state_tensors = []
@@ -7066,14 +7139,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         elif self.use_naive_mamba_cache_sharing and self.num_mamba_like_layers > 0:
             for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
                 kv_cache_spec = group.kv_cache_spec
-                for layer_name in group.layer_names:
+                for layer_pos, layer_name in enumerate(group.layer_names):
                     kv_cache_spec = group.kv_cache_spec
-                    for kk in kv_cache_config.kv_cache_tensors:
-                        if layer_name in kk.shared_by:
-                            kv_cache_tensor_size = kk.size
-                            break
-                    num_blocks = \
-                        kv_cache_tensor_size // kv_cache_spec.page_size_bytes
+                    # PR #51718: KVCacheTensor.size is now the total backing
+                    # allocation across all layers (num_blocks * bytes_per_block),
+                    # not a per-layer size. Use the engine block count directly.
+                    num_blocks = kv_cache_config.num_blocks
                     if isinstance(kv_cache_spec, FullAttentionSpec):
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                               kv_cache_spec.num_kv_heads,
@@ -7087,59 +7158,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             self._compact_gdn_enabled:
                         # GDN/linear_attention: compact allocation.
                         self._compact_gdn_group_ids.add(group_idx)
-                        if isinstance(kv_caches.get(layer_name), tuple):
-                            continue
                         gdn_max_reqs = self._gdn_max_reqs
                         compact_total = gdn_max_reqs * self._gdn_spec_factor * self._num_gdn_groups + 2
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (compact_total, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
-                        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                            if layer_name not in kv_cache_tensor.shared_by:
-                                continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
-                            break
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation.
-                        if isinstance(kv_caches.get(layer_name), tuple):
-                            continue
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (num_blocks + 1, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
-                        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                            if layer_name not in kv_cache_tensor.shared_by:
-                                continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
-                            break
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, num_blocks + 1)
                     elif isinstance(kv_cache_spec, MambaSpec):
-                        # skip if already created by another layer sharing the same kv cache tensor
-                        if layer_name in kv_caches:
-                            continue
-                        state_tensors = []
-                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                            target_shape = (num_blocks + 1, *shape)
-                            tensor = torch.zeros(target_shape, dtype=dtype, device=self.device)
-                            state_tensors.append(tensor)
-                        # find other layers sharing the same kv cache tensor and
-                        # populate all of them with the same tensor pair
-                        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                            if layer_name not in kv_cache_tensor.shared_by:
-                                continue
-                            for shared_layer in kv_cache_tensor.shared_by:
-                                kv_caches[shared_layer] = tuple(state_tensors)
-                            break
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, num_blocks + 1)
                     else:
                         pass
         else:  # non-hybrid scenario
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                for layer_name in kv_cache_tensor.shared_by:
+                for layer_name in kv_cache_tensor.layers:
                     # Get the correct spec for this layer
                     kv_cache_spec = None
                     for group in kv_cache_config.kv_cache_groups:
@@ -7163,46 +7195,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             f"UniformTypeKVCacheSpecs has no per-layer spec for {layer_name}")
                         kv_cache_spec = per_layer_spec
 
-                    # For heterogeneous models (e.g., Gemma4 with UniformTypeKVCacheSpecs),
-                    # the page_size_bytes is the sum of all layer specs' page sizes, but
-                    # the actual tensor might not align perfectly. Round down to the largest
-                    # usable number of blocks rather than asserting perfect alignment.
-                    remainder = kv_cache_tensor.size % kv_cache_spec.page_size_bytes
-                    if remainder != 0:
-                        usable_size = kv_cache_tensor.size - remainder
-                        waste_pct = remainder * 100.0 / kv_cache_tensor.size
-                        logger.warning(
-                            "KV cache tensor size (%s bytes) does not "
-                            "perfectly align with page_size_bytes (%s bytes). "
-                            "This is expected for heterogeneous models like Gemma4 with mixed "
-                            "attention types. Using %s bytes "
-                            "(%s bytes unused, %.2f%% waste).", f"{kv_cache_tensor.size:,}",
-                            f"{kv_cache_spec.page_size_bytes:,}", f"{usable_size:,}", f"{remainder:,}", waste_pct)
-                        # Use only the aligned portion of the tensor
-                        kv_cache_tensor = replace(kv_cache_tensor, size=usable_size)
-
-                    num_blocks = \
-                        kv_cache_tensor.size // kv_cache_spec.page_size_bytes
-                    # `num_blocks` is the number of blocks the model runner can use.
-                    # `kv_cache_config.num_blocks` is the number of blocks that
-                    # KVCacheManager may allocate.
-                    # Since different GPUs may have different number of layers and
-                    # different memory capacities, `num_blocks` can be different on
-                    # different GPUs, and `kv_cache_config.num_blocks` is set to
-                    # the min of all `num_blocks`. Verify it here.
-                    # For heterogeneous models where we rounded down the tensor size,
-                    # num_blocks may be slightly less than expected - this is acceptable.
-                    if num_blocks < kv_cache_config.num_blocks:
-                        if remainder != 0:
-                            # This is expected for heterogeneous models after alignment
-                            logger.warning(
-                                "After alignment, num_blocks=%d is less than "
-                                "kv_cache_config.num_blocks=%d. "
-                                "This is expected for heterogeneous models like Gemma4.", num_blocks,
-                                kv_cache_config.num_blocks)
-                        else:
-                            # Unexpected - still assert in this case
-                            assert num_blocks >= kv_cache_config.num_blocks
+                    # PR #51718: KVCacheTensor.size is now the total backing
+                    # allocation across all layers, so the old per-tensor
+                    # `size // page_size_bytes` over-counts blocks by the layer
+                    # count and OOMs. Use the engine block count directly; it is
+                    # the authoritative per-layer block count for every model
+                    # (including heterogeneous ones like Gemma4).
+                    num_blocks = kv_cache_config.num_blocks
                     if isinstance(kv_cache_spec, FullAttentionSpec):
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                               kv_cache_spec.num_kv_heads,

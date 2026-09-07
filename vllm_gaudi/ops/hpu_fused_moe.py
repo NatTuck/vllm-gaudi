@@ -45,6 +45,11 @@ _MOE_ACTIVATION_ALIASES = {
     "gelu_pytorch_tanh": "gelu",
     "gelu_new": "gelu",
     "quick_gelu": "gelu",
+    # Non-gated squared-ReLU (Nemotron-H). The model's activation config value is
+    # "relu2_no_mul"; the Habana MoeActivationMode_t enum spells it "relu2". The
+    # no-gate/no-multiply behaviour is selected separately via is_gated=False
+    # (see VllmMixtureOfExpertsOpFP8PerChannel), not by this activation name.
+    "relu2_no_mul": "relu2",
 }
 
 
@@ -622,6 +627,44 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             return output.view(*input_shape)
 
 
+def _launch_shared_experts_overlap(runner: MoERunnerBase, shared_experts_input: torch.Tensor | None) -> bool:
+    """Start the shared-expert multi-stream overlap, tolerating either upstream API.
+
+    Upstream keeps flip-flopping on how the aux-stream launch is spelled: vllm#51838
+    added ``SharedExperts.maybe_forward_async`` plus a ``shared_experts_overlapping``
+    kwarg on ``MoERunner._apply_quant_method``, vllm#52024 reverted to
+    ``MoERunner._maybe_sync_shared_experts_stream``, and vllm#52033 re-landed the
+    #51838 shape. Feature-detect so the next flip does not break the HPU fast path.
+
+    On Gaudi every shape is a no-op — upstream gates the multi-stream path on
+    ``current_platform.is_cuda_alike()`` — so falling through to "no overlap" on an
+    unrecognised future shape stays functionally correct.
+
+    Args:
+        runner: The upstream ``MoERunner`` (``self`` of the patched forward).
+        shared_experts_input: Shared-expert input, or None when there are none.
+
+    Returns:
+        True iff the launch was asynchronous, meaning the caller must pass
+        ``shared_experts_overlapping=True`` down to ``_apply_quant_method``.
+    """
+    sync_stream = getattr(runner, "_maybe_sync_shared_experts_stream", None)
+    if sync_stream is not None:
+        # vllm#52024 shape: runner-side sync, overlap decided internally.
+        sync_stream(shared_experts_input)
+        return False
+
+    shared_experts = getattr(runner, "_shared_experts", None)
+    if shared_experts is None or shared_experts_input is None:
+        return False
+
+    # vllm#51838 / vllm#52033 shape: launch on the aux stream, await it later.
+    forward_async = getattr(shared_experts, "maybe_forward_async", None)
+    if forward_async is None:
+        return False
+    return bool(forward_async(shared_experts_input))
+
+
 def patched_fused_moe_forward(
     self,
     hidden_states: torch.Tensor,
@@ -667,15 +710,10 @@ def patched_fused_moe_forward(
         # is initialized on routed_experts (which the runner holds directly), so
         # unlike the old FusedMoE-layer-based init we do NOT need the layer here.
         self.routed_experts._ensure_moe_quant_config_init()
-        # Sync the aux/main stream for shared-expert multi-stream overlap,
-        # mirroring upstream MoERunner._forward_impl. vllm PR #52024 reverted the
-        # dual-stream decode work: SharedExperts.maybe_forward_async was removed
-        # (folded back into maybe_sync_shared_experts_stream, re-exposed on the
-        # runner as _maybe_sync_shared_experts_stream), and _apply_quant_method no
-        # longer takes a shared_experts_overlapping flag — overlap is decided
-        # internally. On HPU (not CUDA-alike) this is a no-op and the shared
-        # experts run synchronously inside _apply_quant_method.
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        # Start the shared-expert aux stream before routed dispatch, mirroring
+        # upstream MoERunner._forward_impl. Version-tolerant: see
+        # _launch_shared_experts_overlap.
+        shared_experts_overlapping = _launch_shared_experts_overlap(self, shared_experts_input)
         # Apply the gate if the runner holds it (mirrors _forward_impl).
         if self.gate is not None:
             if self._fse_fuse_gate:
@@ -685,14 +723,16 @@ def patched_fused_moe_forward(
                 router_logits, _ = self.gate(hidden_states)
         # Core MoERunner._apply_quant_method takes no layer argument — it reads
         # everything it needs off the runner (self.routed_experts / self.router).
-        # Call it exactly as upstream _forward_impl does. vllm PR #52024 dropped
-        # the shared_experts_overlapping argument: overlap is decided internally
-        # and the shared-expert output is stashed on self._shared_experts.
+        # Call it exactly as upstream _forward_impl does. Only pass
+        # shared_experts_overlapping when an async launch actually happened: that
+        # is the only case in which the kwarg is guaranteed to exist upstream.
+        extra_quant_kwargs = {"shared_experts_overlapping": True} if shared_experts_overlapping else {}
         shared_output, fused_hidden = self._apply_quant_method(
             hidden_states=hidden_states,
             router_logits=router_logits,
             shared_experts_input=shared_experts_input,
             input_ids=input_ids,
+            **extra_quant_kwargs,
         )
         result = self._maybe_combine(shared_output, fused_hidden)
     else:
@@ -788,6 +828,9 @@ def create_fused_moe_router(
     zero_expert_type: str | None = None,
     num_logical_experts: int | None = None,
     hash_indices_table: torch.Tensor | None = None,
+    # Deepseek V4 vision routing bias parameters
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ) -> FusedMoERouter:
     """
     Factory function to create the appropriate FusedMoERouter subclass based on
@@ -835,6 +878,12 @@ def create_fused_moe_router(
     Hash Indices Table:
         hash_indices_table: Used to map input_ids to experts, needed for
             Deepseek V4
+
+    Vision routing bias arguments (upstream vLLM PR 54566+):
+        bias_vl: Vision routing bias for image tokens (Deepseek V4).
+        image_sentinel_lo: First of five consecutive in-vocab image sentinel
+            ids (0 = vision routing disabled). Both are forwarded to
+            FusedTopKBiasRouter, which owns the vision-bias routing path.
 
     Returns:
         An instance of the appropriate FusedMoERouter subclass
@@ -904,6 +953,8 @@ def create_fused_moe_router(
             hash_indices_table=hash_indices_table,
             num_fused_shared_experts=num_fused_shared_experts,
             shared_expert_weight=shared_expert_weight,
+            bias_vl=bias_vl,
+            image_sentinel_lo=image_sentinel_lo,
         )
 
     return FusedTopKRouter(
@@ -942,3 +993,37 @@ MoERunnerBase.forward = _patched_default_moe_runner_forward
 vllm.model_executor.layers.fused_moe.layer.get_compressed_expert_map = get_compressed_expert_map
 vllm.model_executor.layers.fused_moe.router.router_factory.create_fused_moe_router = create_fused_moe_router
 vllm.model_executor.layers.fused_moe.layer.create_fused_moe_router = create_fused_moe_router
+
+# Enable non-gated (is_act_and_mul=False) MoE on HPU.
+#
+# vLLM's FusedMoEConfig.__post_init__ ends with a guard that raises
+# NotImplementedError for non-gated activations on any platform that is not
+# CUDA/XPU/ROCm -- that guard lives in vLLM Python core and has no HPU branch,
+# so it fires even though the Habana fused-MoE kernel now handles non-gated
+# experts directly. Relax it: run the original __post_init__ and swallow only
+# that guard. We identify the guard by CONFIG STATE (a non-gated activation),
+# not by the exception message -- the message is prose upstream can reword at
+# will, whereas ``is_act_and_mul`` is a stable public property. The guard is the
+# final statement of __post_init__, so all other configuration has already
+# completed by the time it fires -- swallowing it leaves a fully-initialized
+# config. Drop this once vLLM core adds HPU to the supported-platform list.
+from vllm.model_executor.layers.fused_moe import config as _vllm_moe_config  # noqa: E402
+
+_orig_moe_config_post_init = _vllm_moe_config.FusedMoEConfig.__post_init__
+
+
+def _patched_moe_config_post_init(self):
+    try:
+        _orig_moe_config_post_init(self)
+    except NotImplementedError:
+        # Swallow ONLY vLLM core's non-gated-activation platform guard, which on
+        # HPU (is_cuda_alike()/is_xpu() both False) fires for every non-gated
+        # activation. Identify it by config state, not the exception message: a
+        # non-gated config (is_act_and_mul False) is the exact and only case the
+        # guard targets. Any NotImplementedError from a gated config is unrelated
+        # -- re-raise it untouched.
+        if self.is_act_and_mul:
+            raise
+
+
+_vllm_moe_config.FusedMoEConfig.__post_init__ = _patched_moe_config_post_init

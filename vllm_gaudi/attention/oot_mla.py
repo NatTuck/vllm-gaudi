@@ -55,6 +55,21 @@ class HPUMLAAttention(MLAAttention):
         self.fused_scaled_dot_product_attention = None if HPUFusedSDPA is None \
             else ModuleFusedSDPA(HPUFusedSDPA)
 
+    def bind_kv_cache(self, kv_cache) -> None:
+        """Store the HPU per-layer KV-cache tuple unchanged.
+
+        vllm#51718 changed ``vllm.v1.worker.utils.bind_kv_cache`` to delegate
+        binding to each layer's own ``bind_kv_cache`` and added
+        ``MLAAttention.bind_kv_cache`` whose body is
+        ``self.kv_cache = kv_cache.squeeze(1)`` — it assumes a single packed
+        ``[B, H=1, N, C]`` tensor. On HPU the model runner allocates a per-layer
+        ``(key_cache, value_cache, key_scales, value_scales)`` tuple for MLA
+        layers and ``forward_impl`` consumes it directly (``kv_cache[0]``), so
+        the upstream ``.squeeze`` raises ``AttributeError: 'tuple' object has no
+        attribute 'squeeze'``. Keep the tuple as-is for the HPU path.
+        """
+        self.kv_cache = kv_cache
+
     def forward(
         self,
         q: torch.Tensor,
@@ -263,6 +278,11 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # accept-and-ignore the kwarg to keep the constructor signature in sync
         # with the base MultiHeadLatentAttentionWrapper / deepseek_v2 call site.
         allow_short_prefill_indexer_scoring_skip: bool = False,
+        # Added upstream by vllm#53906 (GLM-5.3-Flash). Opt-in fusion of the q_a
+        # and kv_a RMSNorms into one launch; the kernel behind it
+        # (vllm.models.common.ops.fused_q_kv_rmsnorm) is Triton/CUDA-only, so we
+        # accept-and-ignore the kwarg and keep HPU on the unfused path.
+        fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         # Skip MultiHeadLatentAttentionWrapper.__init__() because it creates
         # MLAAttention → FlashAttnPrefillBackend which crashes on HPU.
@@ -299,6 +319,12 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # dense MLA and the indexer must never be invoked (its kernels and the
         # DeepseekV32IndexerBackend are CUDA-only).
         self.skip_topk = skip_topk or self.is_sparse
+        # vllm#53906 added `self.fuse_qkv_rmsnorm`, which the base
+        # MultiHeadLatentAttentionWrapper.forward (inherited here, since we do not
+        # override forward) reads to pick the fused RMSNorm path. Because we bypass
+        # super().__init__(), replicate the assignment - pinned False because the
+        # fused kernel is Triton/CUDA-only.
+        self.fuse_qkv_rmsnorm = False
         # vllm#45964 (DCP query replication) added `self.dcp_q_replicate`, which
         # the base MultiHeadLatentAttentionWrapper.forward (inherited here, since
         # we do not override forward) reads and forwards to mla_attn. Because we
