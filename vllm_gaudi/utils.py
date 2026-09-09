@@ -75,7 +75,7 @@ def async_h2d_update(source: torch.Tensor, dest: torch.Tensor, indices: list[int
         indices: List of row indices in dest to update
         device: Target device
     """
-    idx = torch.tensor(indices, dtype=torch.long, device=device)
+    idx = torch.tensor(indices, dtype=torch.long, device="cpu").to(device, non_blocking=True)
     vals = source[indices].to(device, non_blocking=True)
     dest.index_copy_(0, idx, vals)
 
