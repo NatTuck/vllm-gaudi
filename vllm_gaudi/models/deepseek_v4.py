@@ -37,7 +37,7 @@ from vllm.sequence import IntermediateTensors
 
 
 
-_DIAG_DONE = {"v": False}
+_DIAG_DONE = {"v": True}  # diag disabled: the per-layer device-sync prints throttle the first eager forward
 
 
 def _diag(name: str, t: torch.Tensor, *, layer: int | None = None) -> None:
@@ -599,7 +599,18 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4CSACompressor,
         )
-        pub = DeepseekV4CSACompressor(self._hf_config)
+        from transformers import AutoConfig
+        # vllm's hf_config (vllm.transformers_utils.configs.deepseek_v4) exposes
+        # only the legacy compress_ratios and drops the transformers fields the
+        # public CSA compressor reads (compress_rates, rope_parameters). Rebuild
+        # a real transformers config from the checkpoint dir so its __post_init__
+        # derives compress_rates/layer_types/rope_parameters as the CPU reference
+        # does.
+        ckpt = _v4_resolve_ckpt_dir(
+            getattr(self._hf_config, "_name_or_path", "") or ""
+        )
+        pub_cfg = AutoConfig.from_pretrained(ckpt)
+        pub = DeepseekV4CSACompressor(pub_cfg)
         inv = pub.rotary_emb.compress_inv_freq.float().to(dev)
         scale = pub.rotary_emb.compress_attention_scaling
         p = torch.arange(cap * rate + 16, dtype=torch.float32, device=dev)
@@ -609,8 +620,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
         idx_h = self.indexer.head_dim if (rate == 4 and self.indexer is not None) else D
         max_tokens = rate * 2 + 128  # prefill up to 128 tokens + leftover
-        self._c_win_kv = torch.zeros(max_tokens, 2 * D, dtype=torch.bfloat16, device=dev)
-        self._c_win_gate = torch.zeros(max_tokens, 2 * D, dtype=torch.bfloat16, device=dev)
+        # The stored per-token kv/gate width is coff*D (CSA rate4 keeps two
+        # streams -> 2*D; HCA keeps one -> D). Sizing by coff*D keeps the
+        # window buffer width == the projected kv width for both layer types.
+        cwid = self._comp_coff * D
+        self._c_win_kv = torch.zeros(max_tokens, cwid, dtype=torch.bfloat16, device=dev)
+        self._c_win_gate = torch.zeros(max_tokens, cwid, dtype=torch.bfloat16, device=dev)
         self._c_comp = torch.zeros(cap, D, dtype=torch.bfloat16, device=dev)
         self._c_ovl_kv = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
         self._c_ovl_gate = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
@@ -637,6 +652,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
     def _comp_windows(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
                       cache, ovl_n, ovl_kv, ovl_gate, rope_dim):
         nw = ck.shape[0] // rate
+        if nw == 0:
+            return ck.new_zeros((0, Dk))
         ckv = ck.view(nw, rate, 2 * Dk)
         cgv = cg.view(nw, rate, 2 * Dk) + ape
         nk = ck.new_zeros(nw, 2 * rate, Dk)
@@ -670,17 +687,22 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
+        # nw is a Python int; wrap it as a device tensor so torch.where is valid
+        # in eager too (dynamo otherwise constant-folds the python bool).
         ovl_n.copy_(torch.where(
-            nw > 0,
+            chunk_kv.new_tensor(nw) > 0,
             torch.tensor(rate, dtype=torch.int64, device=ovl_n.device),
             torch.tensor(0, dtype=torch.int64, device=ovl_n.device)))
-        # Pad chunk with rate dummy rows to make [-1] safe when usable<rate
-        safe_kv = torch.cat([chunk_kv, chunk_kv.new_zeros(rate, 2 * Dk)], dim=0)
-        safe_ga = torch.cat([chunk_gate + ape, chunk_gate.new_zeros(rate, 2 * Dk)], dim=0)
-        last = safe_kv.view(-1, rate, 2 * Dk)[-1]
-        lastg = safe_ga.view(-1, rate, 2 * Dk)[-1]
-        ovl_kv[:rate] = last[:, :Dk]
-        ovl_gate[:rate] = lastg[:, :Dk]
+        # Pad chunk with rate dummy rows to make [-1] safe when usable<rate.
+        # Only meaningful when at least one full window closed; when nw==0 the
+        # chunk is empty and there is no overlap to carry (ovl_n already 0).
+        if nw > 0:
+            safe_kv = torch.cat([chunk_kv, chunk_kv.new_zeros(rate, 2 * Dk)], dim=0)
+            safe_ga = torch.cat([chunk_gate + ape, chunk_gate.new_zeros(rate, 2 * Dk)], dim=0)
+            last = safe_kv.view(-1, rate, 2 * Dk)[-1]
+            lastg = safe_ga.view(-1, rate, 2 * Dk)[-1]
+            ovl_kv[:rate] = last[:, :Dk]
+            ovl_gate[:rate] = lastg[:, :Dk]
 
     def _compressor_compilable(self, hidden, qr, positions, is_prompt):
         if self.compressor is None or self.compress_ratio <= 1:
@@ -761,21 +783,31 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         # ---- scorer / topk / block_bias ----
         T = hidden.shape[0]
-        clen = self._c_n
+        # clen is used as a python int (slice bounds, arange, min(), topk k,
+        # full_like fill). The underlying counter is a 0-dim tensor for the
+        # graph-compilable parts; materialize it here for the data-dependent
+        # topk logic, which is correct in eager (== correct everywhere).
+        clen = int(self._c_n)
         cap = self._cap
         if has_idx and clen > 0:
             nhead = self.indexer.n_head
             qb_w = self.indexer.wq_b.weight.data
             if qb_w.dtype == torch.float8_e4m3fn:
+                # indexer.wq_b is block-fp8 that force-channel-fp8 converted to
+                # per-row fp8. Dequant correctly on HPU for the scale rank that
+                # is actually stored: per-row (1-D) or block (2-D).
                 from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
                 wq_s = getattr(self.indexer.wq_b, "weight_scale", None)
                 if wq_s is None:
                     wq_s = getattr(self.indexer.wq_b, "weight_scale_inv", None)
-                qb = dequant_block_fp8_weight_naive(
-                    qb_w, wq_s,
-                    getattr(getattr(self.indexer.wq_b, "quant_config", None),
-                            "weight_block_size", (128, 128)),
-                    torch.bfloat16)
+                bs = getattr(getattr(self.indexer.wq_b, "quant_config", None),
+                             "weight_block_size", (128, 128))
+                if wq_s is not None and wq_s.dim() == 2:
+                    qb = dequant_block_fp8_weight_naive(qb_w, wq_s, bs, torch.bfloat16)
+                else:
+                    s = wq_s if wq_s is not None else torch.ones(
+                        qb_w.shape[0], device=qb_w.device, dtype=torch.float32)
+                    qb = (qb_w.float() * s.reshape(-1, 1)).to(torch.bfloat16)
             else:
                 qb = qb_w.to(torch.bfloat16)
             wp = self.indexer.weights_proj.weight
@@ -987,40 +1019,62 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         return qr, kv
 
     def forward_prefill(self, positions, hidden_states):
-        """Prefill: write T tokens to ring buffer, reset+run compressor, causal mask."""
+        """Prefill across a (possibly padded) prefill batch.
+
+        vllm pads the prefill to a fixed length; only rows with position >= 0
+        are real tokens. Only real tokens may enter the window cache and the
+        compressor (padding would corrupt window/compressed state). The query
+        side (qr/kv/positions) stays the full batch so the returned hidden has
+        the padded shape vllm expects; padding query rows are masked to attend
+        the zero pad-key slots so their (discarded) output stays finite.
+        """
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
         T = kv_roped.shape[0]
-        self._win_n.zero_()
-        self._decode_pos.zero_()
-        n_win = min(T, self.window_size)
-        self._win_cache[:n_win] = kv_roped[:n_win]
-        self._win_n.copy_(torch.tensor(n_win, dtype=torch.int64))
-
         pos_flat = positions.reshape(-1)
-        is_prompt = torch.tensor(1, dtype=torch.int64, device=pos_flat.device)
-        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
+        real = pos_flat >= 0
+        nreal = int(real.long().sum())
+        dev = kv_roped.device
+
+        self._win_n.zero_()
+        n_win = min(nreal, self.window_size)
+        self._win_cache[:n_win] = kv_roped[real][:n_win]
+        self._win_n.copy_(torch.tensor(n_win, dtype=torch.int64, device=dev))
+        # decode appends at the next free ring slot = number of real tokens seen.
+        self._decode_pos.copy_(torch.tensor(nreal, dtype=torch.int64, device=dev))
+
+        is_prompt = torch.tensor(1, dtype=torch.int64, device=dev)
+        comp_full, comp_n, comp_bb, _topk = self._run_compressor(
+            hidden_states[real], qr[real], pos_flat[real], is_prompt)
 
         cap = self._cap
         past_kv = torch.cat([self._win_cache, comp_full], dim=0)
         past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
 
-        win_ids = torch.arange(self.window_size, device=pos_flat.device)
-        win_present = win_ids.unsqueeze(0) < self._win_n.unsqueeze(-1)
-        if T <= self.window_size:
-            win_causal = pos_flat[:, None] >= pos_flat[None, :]
-            win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=pos_flat.device)
-            win_mask[:, :T] = win_causal & win_present[:, :T]
-        else:
-            start = T - self.window_size
-            win_mask = pos_flat[:, None] >= pos_flat[None, start:]
+        # Window mask over the full padded T. Real query rows attend real window
+        # keys causally; padding query rows attend the zero pad-key slots (finite).
+        win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=dev)
+        if nreal > 0:
+            real_pos = pos_flat[real]
+            if nreal <= self.window_size:
+                win_causal = real_pos[:, None] >= real_pos[None, :]
+                win_mask[:nreal, :nreal] = win_causal
+            else:
+                start = nreal - self.window_size
+                win_mask[:nreal, :] = real_pos[:, None] >= real_pos[None, start:]
+        if nreal < T:
+            win_mask[nreal:] = True
 
-        comp_ids = torch.arange(cap, device=pos_flat.device)
-        comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)  # [1, CAP]
-        if comp_bb is not None:
-            comp_attend = comp_present & torch.isfinite(comp_bb)  # [T, CAP]
-        else:
-            comp_attend = comp_present.expand(T, -1)  # [1, CAP] -> [T, CAP]
+        comp_attend = torch.zeros(T, cap, dtype=torch.bool, device=dev)
+        if nreal > 0 and cap > 0:
+            comp_ids = torch.arange(cap, device=dev)
+            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)  # [1, CAP]
+            if comp_bb is not None:
+                comp_attend[:nreal] = comp_present & torch.isfinite(comp_bb[:, :cap])
+            else:
+                comp_attend[:nreal] = comp_present.expand(nreal, -1)
+        if nreal < T:
+            comp_attend[nreal:] = True
         mask = torch.cat([win_mask, comp_attend], dim=-1)
 
         return self._forward_compilable(qr, kv, positions, past_kv, mask)
@@ -1041,10 +1095,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         past_kv = torch.cat([self._win_cache, comp_full], dim=0)
         past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
 
-        win_mask = torch.ones(1, self.window_size, dtype=torch.bool, device=pos_flat.device)
+        # Decode attends its real past context in the window: the first _win_n
+        # slots (ring not yet full) or all slots once the ring is full.
+        win_ids = torch.arange(self.window_size, device=pos_flat.device)
+        win_present = (win_ids < self._win_n).unsqueeze(0)  # [1, WIN]
         comp_ids = torch.arange(cap, device=pos_flat.device)
         comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
-        mask = torch.cat([win_mask, comp_present], dim=-1)
+        mask = torch.cat([win_present, comp_present], dim=-1)
 
         return self._forward_compilable(qr, kv, positions, past_kv, mask)
 
