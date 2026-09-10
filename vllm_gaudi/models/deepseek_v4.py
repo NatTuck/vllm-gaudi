@@ -693,8 +693,15 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         (otherwise it clobbers the first ``left`` window rows), and the gate
         buffer must be written alongside the kv buffer.
         """
+        # FIXME(Step 5.5/6): host-sync the counter to a Python int; HPU eager
+        # mis-handles tensor slice bounds (`buf[tensor:tensor]`). The paged-KV
+        # rework removes this counter entirely.
+        n = int(n) if torch.is_tensor(n) else n
         T = kv_new.shape[0]
         total = n + T
+        if __import__("os").environ.get("V4_COMP_DEBUG") == "1":
+            print(f"[store] n={n} T={T} kv_new={tuple(kv_new.shape)} "
+                  f"buf={tuple(kv_buf.shape)} total={total}", flush=True)
         kv_buf[n:total] = kv_new
         gate_buf[n:total] = gate_new
         usable = (total // rate) * rate
@@ -765,7 +772,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             ovl_kv[:rate] = last[:, :Dk]
             ovl_gate[:rate] = lastg[:, :Dk]
 
+    @torch.compiler.disable
     def _compressor_compilable(self, hidden, qr, positions, is_prompt):
+        # FIXME(Step 5.5/6): this method uses data-dependent tensor slice bounds
+        # (`buf[n:total]` with tensor n/total), which miscompile inside the
+        # compiled layer region (RuntimeError: expanded size 0 vs 1024). Run it
+        # eagerly (graph break) until the paged-KV rework makes the compressor
+        # fully graph-safe with fixed shapes / slot_mapping.
         if self.compressor is None or self.compress_ratio <= 1:
             return None, None, None, None
         rate = self.compress_ratio
@@ -794,6 +807,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         ape = c.ape
         norm_w = c.norm.weight
 
+        if __import__("os").environ.get("V4_COMP_DEBUG") == "1":
+            print(f"[comp] hidden={tuple(hidden.shape)} qr={tuple(qr.shape)} "
+                  f"c_win_n={self._c_win_n} rate={rate}", flush=True)
         kv = hidden @ kv_w.t()
         gate = hidden @ gate_w.t()
         _nw_c, left_c, ck, cg = self._comp_store_shift(
@@ -1143,6 +1159,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
     def forward_decode(self, positions, hidden_states):
         """Decode: append 1 token to ring buffer, run compressor (no reset), full mask."""
+        # Decode may pass a 1-D [H] hidden; the compressor/rope assume [T, H].
+        if hidden_states.dim() == 1:
+            hidden_states = hidden_states.unsqueeze(0)
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
         self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
