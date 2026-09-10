@@ -183,12 +183,18 @@ def _attn_with_sink_matmul(
     sink: torch.Tensor,
     scaling: float,
 ) -> torch.Tensor:
-    """Graph-compilable V4 attention via explicit ``torch.bmm`` (no einsum,
-    no ``torch.ops.hpu.sdpa_recomp_fwd``). Matches the FusedSDPA version's
-    contract: the sink is folded into the last key column (zero-valued key
-    with per-head sink logit bias). ``torch.bmm`` compiles on
-    ``hpu_backend`` and avoids HPU runtime bugs (e.g. segfault with
-    ``sdpa_recomp_fwd`` for large prefill shapes).
+    """FALLBACK (unused): fp32 ``torch.bmm`` V4 attention, no FusedSDPA.
+
+    The forward now uses ``_attn_with_sink_fsdpa`` (fp32 QK^T + fp32 softmax,
+    bf16 probs -> bf16 AV), which matches the reference kernel precision much
+    better (Step 8 gate: 1.95% >2 bf16 ulp vs 6.28% for this fp32 path) and
+    was verified to compile and run at T=1..512, K up to window+compressed cap
+    with no segfault. Keep this as the strictly-more-precise fallback in case
+    the FusedSDPA kernel regresses; it is intentionally more precise and a
+    little slower, which does not contradict the current goals.
+
+    Matches the FusedSDPA contract: the sink is folded into the last key column
+    (zero-valued key with per-head sink logit bias).
 
     q [T,H,D]; k (= v) [K,H,D]; mask [T,K] bool (True=allow) or None.
     Returns [T,H,D].
@@ -1035,7 +1041,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         # past_kv already includes ALL keys (window + compressed from the eager
         # outer); do NOT append cur_kv here (decode should not attend to self).
-        o = _attn_with_sink_matmul(
+        # FusedSDPA path: fp32 QK^T + fp32 softmax, bf16 probs -> bf16 AV,
+        # matching the reference kernel precision (verified at T=1..512,
+        # K up to window+compressed cap).
+        o = _attn_with_sink_fsdpa(
             q, past_kv, mask, self.attn_sink[: self.n_local_heads], self.scale
         )
 
