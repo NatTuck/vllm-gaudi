@@ -660,14 +660,25 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             w = w.t()
         return w
 
-    def _comp_store_shift(self, buf, n, new, rate):
-        T = new.shape[0]
+    def _comp_store_shift(self, kv_buf, gate_buf, n, kv_new, gate_new, rate):
+        """Append new (kv, gate) tokens, return the window-aligned prefix to
+        compress plus the leftover count, and compact the leftover to the front.
+
+        The window MUST be captured BEFORE the leftover is moved to the front
+        (otherwise it clobbers the first ``left`` window rows), and the gate
+        buffer must be written alongside the kv buffer.
+        """
+        T = kv_new.shape[0]
         total = n + T
-        buf[n:total] = new
+        kv_buf[n:total] = kv_new
+        gate_buf[n:total] = gate_new
         usable = (total // rate) * rate
         left = total - usable
-        buf[:left] = buf[usable:total].clone()
-        return usable // rate, left
+        ck = kv_buf[:usable].clone()
+        cg = gate_buf[:usable].clone()
+        kv_buf[:left] = kv_buf[usable:total].clone()
+        gate_buf[:left] = gate_buf[usable:total].clone()
+        return usable // rate, left, ck, cg
 
     def _comp_windows(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
                       cache, ovl_n, ovl_kv, ovl_gate, rope_dim):
@@ -753,11 +764,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         kv = hidden @ kv_w.t()
         gate = hidden @ gate_w.t()
-        nw_c, left_c = self._comp_store_shift(self._c_win_kv, self._c_win_n, kv, rate)
+        _nw_c, left_c, ck, cg = self._comp_store_shift(
+            self._c_win_kv, self._c_win_gate, self._c_win_n, kv, gate, rate)
         self._c_win_n = torch.tensor(left_c, dtype=torch.int64, device=dev)
-        usable_c = nw_c * rate
-        ck = self._c_win_kv[:usable_c].clone()
-        cg = self._c_win_gate[:usable_c].clone()
         if rate == 4:
             comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
                                       norm_w, cache, self._c_ovl_n,
@@ -784,11 +793,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             inorm_w = idx.compressor.norm.weight
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
-            nw_i, left_i = self._comp_store_shift(self._i_win_kv, self._i_win_n, ikv, rate)
+            _nw_i, left_i, ik, ig = self._comp_store_shift(
+                self._i_win_kv, self._i_win_gate, self._i_win_n, ikv, igate, rate)
             self._i_win_n = torch.tensor(left_i, dtype=torch.int64, device=dev)
-            usable_i = nw_i * rate
-            ik = self._i_win_kv[:usable_i].clone()
-            ig = self._i_win_gate[:usable_i].clone()
             icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
                                        inorm_w, cache, self._i_ovl_n,
                                        self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
