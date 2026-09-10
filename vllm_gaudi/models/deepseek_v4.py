@@ -1247,9 +1247,16 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
         return x, residual, post_mix, res_mix
 
     def forward(self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None):
-        x, residual, post_mix, res_mix = self._forward_inner_prefill(
-            x, positions, input_ids, post_mix, res_mix, residual
-        )
+        # Dispatch on the (bucketed, static) token count so the compiled layer
+        # region is actually invoked: prefill has T > 1, decode has T == 1.
+        if positions.numel() > 1:
+            x, residual, post_mix, res_mix = self._forward_inner_prefill(
+                x, positions, input_ids, post_mix, res_mix, residual
+            )
+        else:
+            x, residual, post_mix, res_mix = self._forward_inner_decode(
+                x, positions, input_ids, post_mix, res_mix, residual
+            )
         return x, residual, post_mix, res_mix
 
 
@@ -1371,35 +1378,20 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             positions = positions.reshape(-1)
 
         residual, post_mix, res_mix = None, None, None
-        is_prefill = positions.shape[-1] > 1
         import os as _os
         _dbg = _os.environ.get("V4_DEBUG") == "1"
-        if is_prefill:
-            for idx, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer),
-                start=self.start_layer,
-            ):
-                if _dbg:
-                    print(f"[v4model] layer {idx} in", flush=True)
-                hidden_states, residual, post_mix, res_mix = layer._forward_inner_prefill(
-                    hidden_states, positions, input_ids, post_mix, res_mix, residual
-                )
-                if _dbg:
-                    print(f"[v4model] layer {idx} out", flush=True)
-                _diag(f"after_layer", hidden_states, layer=idx)
-        else:
-            for idx, layer in enumerate(
-                islice(self.layers, self.start_layer, self.end_layer),
-                start=self.start_layer,
-            ):
-                if _dbg:
-                    print(f"[v4model] layer {idx} in", flush=True)
-                hidden_states, residual, post_mix, res_mix = layer._forward_inner_decode(
-                    hidden_states, positions, input_ids, post_mix, res_mix, residual
-                )
-                if _dbg:
-                    print(f"[v4model] layer {idx} out", flush=True)
-                _diag(f"after_layer", hidden_states, layer=idx)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            if _dbg:
+                print(f"[v4model] layer {idx} in", flush=True)
+            hidden_states, residual, post_mix, res_mix = layer(
+                hidden_states, positions, input_ids, post_mix, res_mix, residual
+            )
+            if _dbg:
+                print(f"[v4model] layer {idx} out", flush=True)
+            _diag(f"after_layer", hidden_states, layer=idx)
         _DIAG_DONE["v"] = True
 
         import os as _hdump
