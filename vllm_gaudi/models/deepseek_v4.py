@@ -433,6 +433,24 @@ def _mhc_fused_post_pre_compilable(
     )
 
 
+def _mhc_post_compilable(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """mHC post block, einsum-free.
+
+    Equivalent to ``mhc_post_torch`` but uses ``torch.matmul`` (the upstream
+    ``torch.einsum`` is not graph-compilable on ``hpu_backend``).
+    """
+    mixed_residual = torch.matmul(
+        comb_res_mix.float().transpose(-1, -2), residual.float()
+    )
+    post_term = post_layer_mix.float() * x.unsqueeze(-2).float()
+    return (mixed_residual + post_term).to(residual.dtype)
+
+
 def _hc_head(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
@@ -1455,11 +1473,11 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        from vllm.model_executor.kernels.mhc import mhc_post_torch
-
         # Reconstruct the multi-stream [T, hc_mult, H] hidden state from the
         # 2D ffn output + the mHC residual/mixes, then collapse it via hc_head.
-        hidden_states = mhc_post_torch(hidden_states, residual, post_mix, res_mix)
+        # einsum-free HPU version (upstream mhc_post_torch uses torch.einsum,
+        # which is not graph-compilable on hpu_backend).
+        hidden_states = _mhc_post_compilable(hidden_states, residual, post_mix, res_mix)
         if _dbg:
             print(f"[v4model] after mhc_post shape={tuple(hidden_states.shape)}", flush=True)
         hidden_states = _hc_head(
