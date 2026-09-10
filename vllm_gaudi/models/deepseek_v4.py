@@ -588,7 +588,14 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
 
     def _make_compress_cache(self):
-        """Build the yarn compress RoPE cos/sin cache once at init."""
+        """Build the yarn compress RoPE cos/sin cache once at init.
+
+        Must be called OUTSIDE any compiled region (it constructs a transformers
+        ``AutoConfig``/``DeepseekV4CSACompressor``). It is invoked once per layer
+        from ``DeepseekV4HPUModel.load_weights`` after the weights are loaded.
+        """
+        if self.compressor is None or self.compress_ratio <= 1:
+            return
         if self._compress_cache is not None:
             return
         rate = self.compress_ratio
@@ -723,7 +730,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         rate = self.compress_ratio
         D = self.head_dim
         dev = hidden.device
-        self._make_compress_cache()
+        # Built once at load time (see _make_compress_cache); never build here.
         cache = self._compress_cache
 
         # Reset all state on prefill
@@ -1466,6 +1473,21 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
                 n += 1
         print(f"[v4] prepped {n} layers' routed fp4 buffers in {_t.time() - t0:.1f}s", flush=True)
 
+    def _prep_compress_caches(self) -> None:
+        """Build every layer's compressor RoPE cache at load time.
+
+        ``_make_compress_cache`` constructs a transformers config/module, so it
+        is graph-unsafe and must run outside the compiled forward (Step 4.5).
+        """
+        n = 0
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            attn = getattr(layer, "attn", None)
+            if attn is not None and hasattr(attn, "_make_compress_cache"):
+                attn._make_compress_cache()
+                if getattr(attn, "_compress_cache", None) is not None:
+                    n += 1
+        print(f"[v4] built compress caches for {n} layers", flush=True)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Routed-expert weights (.experts.) are bypassed: the FusedMoE params
         # are freed at construction and the native-fp8 path reads the packed
@@ -1474,6 +1496,7 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         weights = ((n, w) for (n, w) in weights if ".experts." not in n)
         loaded = super().load_weights(weights)
         self._prep_v4_routed_all()
+        self._prep_compress_caches()
         return loaded
 
 
