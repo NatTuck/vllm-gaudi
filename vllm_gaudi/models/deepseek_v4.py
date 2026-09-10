@@ -635,12 +635,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._c_win_gate = torch.zeros(max_tokens, cwid, dtype=torch.bfloat16, device=dev)
         self._c_comp = torch.zeros(cap, D, dtype=torch.bfloat16, device=dev)
         self._c_ovl_kv = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
-        self._c_ovl_gate = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
+        # gates are fp32 to match the reference position_bias precision
+        self._c_ovl_gate = torch.zeros(rate, D, dtype=torch.float32, device=dev)
         self._i_win_kv = torch.zeros(max_tokens, 2 * idx_h, dtype=torch.bfloat16, device=dev)
         self._i_win_gate = torch.zeros(max_tokens, 2 * idx_h, dtype=torch.bfloat16, device=dev)
         self._i_comp = torch.zeros(cap, idx_h, dtype=torch.bfloat16, device=dev)
         self._i_ovl_kv = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
-        self._i_ovl_gate = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
+        self._i_ovl_gate = torch.zeros(rate, idx_h, dtype=torch.float32, device=dev)
 
     def _comp_rmsnorm(self, x, w):
         xf = x.float()
@@ -688,15 +689,19 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         ckv = ck.view(nw, rate, 2 * Dk)
         cgv = cg.view(nw, rate, 2 * Dk) + ape
         nk = ck.new_zeros(nw, 2 * rate, Dk)
-        ng = cg.new_full((nw, 2 * rate, Dk), float("-inf"))
+        # Gates stay fp32 (position_bias is fp32 in the reference), so the
+        # softmax sees the same values as the reference.
+        ng = cgv.new_full((nw, 2 * rate, Dk), float("-inf"))
         nk[:, rate:] = ckv[:, :, Dk:].to(ck.dtype)
         ng[:, rate:] = cgv[:, :, Dk:]
         nk[1:, :rate] = ckv[:-1, :, :Dk].to(ck.dtype)
         ng[1:, :rate] = cgv[:-1, :, :Dk]
         nk[0, :rate] = torch.where(ovl_n > 0, ovl_kv[:rate].to(ck.dtype), nk[0, :rate])
-        ng[0, :rate] = torch.where(ovl_n > 0, ovl_gate[:rate].to(cg.dtype), ng[0, :rate])
-        soft = torch.softmax(ng.float(), dim=1)
-        comp = (nk.float() * soft).sum(dim=1).to(ck.dtype)
+        ng[0, :rate] = torch.where(ovl_n > 0, ovl_gate[:rate].to(ng.dtype), ng[0, :rate])
+        # Match the reference: softmax in fp32, cast to the value dtype, then
+        # product/sum in the value dtype.
+        soft = torch.softmax(ng.float(), dim=1).to(nk.dtype)
+        comp = (nk * soft).sum(dim=1)
         comp = self._comp_rmsnorm(comp, norm_w)
         pos = torch.arange(nw, device=ck.device) * rate + first_pos
         comp = _apply_rope(comp, pos, cache, rope_dim)
@@ -709,8 +714,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             return ck.new_zeros((0, Dk))
         ckv = ck.view(nw, rate, Dk)
         cgv = cg.view(nw, rate, Dk) + ape
-        soft = torch.softmax(cgv.float(), dim=1)
-        comp = (ckv.float() * soft).sum(dim=1).to(torch.bfloat16)
+        # Match the reference: softmax fp32 -> value dtype, product/sum in value dtype.
+        soft = torch.softmax(cgv.float(), dim=1).to(ckv.dtype)
+        comp = (ckv * soft).sum(dim=1)
         comp = self._comp_rmsnorm(comp, norm_w)
         pos = torch.arange(nw, device=ck.device) * rate + first_pos
         comp = _apply_rope(comp, pos, cache, rope_dim)
@@ -759,7 +765,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         kv_out = coff * D
         kv_w = fused[:kv_out]
         gate_w = fused[kv_out:]
-        ape = c.ape.to(torch.bfloat16)
+        # position_bias stays fp32 (matches the reference; bf16 would round the
+        # softmax logits differently).
+        ape = c.ape
         norm_w = c.norm.weight
 
         kv = hidden @ kv_w.t()
@@ -789,7 +797,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             ifused = self._comp_weight(idx.compressor.fused_wkv_wgate, hidden.shape[-1])
             ikv_w = ifused[: 2 * idx_h]
             igate_w = ifused[2 * idx_h:]
-            iape = idx.compressor.ape.to(torch.bfloat16)
+            iape = idx.compressor.ape
             inorm_w = idx.compressor.norm.weight
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
