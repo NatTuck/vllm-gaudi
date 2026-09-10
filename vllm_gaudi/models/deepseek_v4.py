@@ -552,7 +552,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         bf16, matching how the linear's own forward dequantizes it. Handles
         block-scaled fp8 (scale is [out/blk, in/blk]), per-output-row scale,
         and per-tensor scale."""
-        w = lin.weight.data
+        w = lin.weight.detach()
         if w.dtype.is_floating_point:
             return w
         wf = w.float()
@@ -566,7 +566,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                 bs = (128, 128)
             from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
             return dequant_block_fp8_weight_naive(
-                lin.weight.data, s.data, bs, torch.float32
+                lin.weight.detach(), s.detach(), bs, torch.float32
             ).to(torch.bfloat16)
         if s.numel() == wf.shape[0] or (s.dim() == 2 and s.shape[0] == wf.shape[0]):
             return (wf * s.reshape(-1, 1)).to(torch.bfloat16)
@@ -639,6 +639,19 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         xf = x.float()
         out = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
         return (out * w.float()).to(x.dtype)
+
+    @staticmethod
+    def _comp_weight(lin, in_features: int) -> torch.Tensor:
+        """Linear weight as ``[out_features, in_features]``.
+
+        The HPU compile stack can lazily store a linear's weight transposed
+        (observed mid-first-forward on the compressor linears); normalize to the
+        ``[out, in]`` layout the forward math (``x @ W.t()``) assumes.
+        """
+        w = lin.weight.detach()
+        if w.dim() == 2 and w.shape[-1] != in_features:
+            w = w.t()
+        return w
 
     def _comp_store_shift(self, buf, n, new, rate):
         T = new.shape[0]
@@ -723,7 +736,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._i_ovl_n = torch.where(is_prompt > 0, zero, self._i_ovl_n)
 
         c = self.compressor
-        fused = c.fused_wkv_wgate.weight.data
+        fused = self._comp_weight(c.fused_wkv_wgate, hidden.shape[-1])
         coff = self._comp_coff
         kv_out = coff * D
         kv_w = fused[:kv_out]
@@ -757,7 +770,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if has_idx:
             idx_h = self._i_comp.shape[-1]
             idx = self.indexer
-            ifused = idx.compressor.fused_wkv_wgate.weight.data
+            ifused = self._comp_weight(idx.compressor.fused_wkv_wgate, hidden.shape[-1])
             ikv_w = ifused[: 2 * idx_h]
             igate_w = ifused[2 * idx_h:]
             iape = idx.compressor.ape.to(torch.bfloat16)
@@ -791,7 +804,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         cap = self._cap
         if has_idx and clen > 0:
             nhead = self.indexer.n_head
-            qb_w = self.indexer.wq_b.weight.data
+            qb_w = self.indexer.wq_b.weight.detach()
             if qb_w.dtype == torch.float8_e4m3fn:
                 # indexer.wq_b is block-fp8 that force-channel-fp8 converted to
                 # per-row fp8. Dequant correctly on HPU for the scale rank that
