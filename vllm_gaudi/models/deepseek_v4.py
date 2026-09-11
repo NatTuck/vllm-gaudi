@@ -1962,14 +1962,25 @@ def _check_v4_routed_ready(moe) -> None:
 
 
 def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch.Tensor:
-    """Batched fp8 routed expert computation (no per-expert Python loops).
+    """Compiled active-expert fp4 routed experts (pure torch, no built-in op).
 
-    Batches the fp4→fp8 dequant and block-fp8 GEMMs across all active local
-    experts. Uses a pre-allocated fixed-size masked buffer for token data.
+    The built-in ``torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights`` cannot
+    express DSv4's activation ``silu(clamp(gate, max=limit)) * clamp(up, +-limit)``
+    (the non-bias path supports silu/gelu only; the gpt-oss bias path hardcodes
+    beta=1), so the MXFP4 logic is implemented here in pure compiled torch.
+
+    Only the experts actually routed to are dequantized. Each token selects K
+    experts, so at most ``T*K`` distinct local experts are active; we gather
+    ``G = min(n_local, T*K)`` experts (a static, graph-safe bound — the
+    ``_gather_swigluoai_moe`` pattern) and dequantize just those fp4 -> bf16.
+    This replaces the previous all-expert per-forward dequant (n_local experts,
+    ~3.2 GB/layer/forward). The expert MLP runs densely over the G gathered
+    experts (static shapes; no ``[T*K, 2*inter, H]`` per-pair materialization).
 
     For each active expert:
       h = silu(clamp(x@w1^T, <=limit)) * clamp(x@w3^T, +-limit)
       out = h@w2^T * weight
+    Accumulation is fp32 (cast to bf16 at the end).
     """
     # The packed fp4 routed buffers are prepared ONCE at load time
     # (_register_v4_routed_packed, called from load_weights) or restored from the
@@ -1985,47 +1996,57 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
             setattr(moe, _name, getattr(moe, _name).to(flat.device))
 
     start, end = moe.experts_start_idx, moe.experts_end_idx
-    limit = getattr(moe, "swiglu_limit", 10.0)
+    limit = float(getattr(moe, "swiglu_limit", 10.0) or 10.0)
     H = flat.shape[1]
     inter = moe.packed_w1_weight.shape[1]
     n_local = end - start
-
-    # Dequant ALL local experts fp4 -> bf16 into fixed buffers (one call, fixed shape;
-    # graph-compilable, reused per layer). GU_all [n_local, 2*inter, H], DN_all [n_local, H, inter].
-    def _deq_batched(packed, scale):
-        n = packed.shape[0]; R, C = packed.shape[1], packed.shape[-1]; G = scale.shape[-1]
-        return _dequant_v4_fp4(packed.reshape(-1, C), scale.reshape(-1, G)).view(n, R, C * 2).to(flat.dtype)
-    GU_all = torch.cat([
-        _deq_batched(moe.packed_w1_weight, moe.packed_w1_scale),
-        _deq_batched(moe.packed_w3_weight, moe.packed_w3_scale),
-    ], dim=1)  # [n_local, 2*inter, H]
-    DN_all = _deq_batched(moe.packed_w2_weight, moe.packed_w2_scale)  # [n_local, H, inter]
-
-    # Vectorized per-pair single graph. The gather (GU_all[le]) works inside the compiled
-    # graph on HPU when combined with the fp32 composition (validated compiled==eager).
     T, K = topk_ids.shape
-    N = T * K
-    tidx = torch.arange(T, device=flat.device).repeat_interleave(K)  # [N]
-    local = (topk_ids >= start) & (topk_ids < end)  # [T,K]
-    le = (topk_ids - start).clamp(0, n_local - 1).reshape(-1)  # [N]
-    wt = topk_weights.reshape(-1)  # [N]
-    lmask = local.reshape(-1)  # [N]
 
-    xp = flat[tidx].contiguous()                    # [N, H]
-    gu_p = GU_all[le].contiguous()                  # [N, 2*inter, H]
-    dn_p = DN_all[le].contiguous()                  # [N, H, inter]
+    # Per-(token, local-expert) combine weight, static shape, sync-free scatter
+    # (mirrors _gather_swigluoai_moe). Non-local pairs are zeroed here.
+    local_ids = topk_ids - start                       # [T, K] global -> local
+    in_range = (local_ids >= 0) & (local_ids < n_local)
+    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))
+    gate_w = flat.new_zeros((T, n_local), dtype=torch.float32)
+    gate_w.scatter_add_(
+        1, safe_ids,
+        torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).to(torch.float32))
+    # Hit count per local expert; <= T*K distinct experts are active.
+    hit = flat.new_zeros((n_local,), dtype=torch.float32)
+    hit.scatter_add_(0, safe_ids.reshape(-1), in_range.reshape(-1).to(torch.float32))
 
-    guo = torch.bmm(xp.unsqueeze(1), gu_p.transpose(1, 2)).squeeze(1).float()  # [N, 2*inter]
-    gate, up = guo[:, :inter], guo[:, inter:]
+    # Gather the (at most) T*K most-used local experts. Because at most T*K are
+    # active, every routed expert is included; the arbitrary choice among the
+    # zero-hit experts contributes nothing (gate_w == 0). Sorted ascending so the
+    # accumulation order matches the reference's expert-index order.
+    g = min(n_local, T * K)
+    gather_ids = torch.topk(hit, g, sorted=False).indices
+    gather_ids, _ = torch.sort(gather_ids)
+
+    def _deq_gathered(packed, scale, idx):
+        p = packed[idx]
+        s = scale[idx]
+        n = p.shape[0]
+        R, C = p.shape[1], p.shape[-1]
+        Gs = s.shape[-1]
+        return _dequant_v4_fp4(p.reshape(-1, C), s.reshape(-1, Gs)).view(n, R, C * 2).to(flat.dtype)
+
+    w13_g = torch.cat([
+        _deq_gathered(moe.packed_w1_weight, moe.packed_w1_scale, gather_ids),
+        _deq_gathered(moe.packed_w3_weight, moe.packed_w3_scale, gather_ids),
+    ], dim=1)  # [G, 2*inter, H]
+    w2_g = _deq_gathered(moe.packed_w2_weight, moe.packed_w2_scale, gather_ids)  # [G, H, inter]
+
+    # Dense expert MLP over the gathered experts (static shapes).
+    xe = flat.unsqueeze(0).expand(g, T, H)                 # [G, T, H] view
+    gu = torch.bmm(xe, w13_g.transpose(1, 2))              # [G, T, 2*inter] bf16
+    gate, up = gu[..., :inter].float(), gu[..., inter:].float()
     gate = torch.clamp(gate, max=limit)
     up = torch.clamp(up, min=-limit, max=limit)
-    h = torch.nn.functional.silu(gate) * up  # fp32 [N, inter]
-
-    eout = torch.bmm(h.to(flat.dtype).unsqueeze(1), dn_p.transpose(1, 2)).squeeze(1).float()  # [N, H]
-    eout = eout * wt.float()[:, None] * lmask.float()[:, None]  # fp32, zero non-local pairs
-
-    # fp32 accumulate over the per-token pairs, cast to bf16 at the very end.
-    out = torch.zeros((T, H), dtype=torch.float32, device=flat.device).index_add(0, tidx, eout)
+    h = (torch.nn.functional.silu(gate) * up).to(flat.dtype)  # [G, T, inter]
+    y = torch.bmm(h, w2_g.transpose(1, 2)).float()         # [G, T, H] fp32
+    gate_wg = gate_w.index_select(1, gather_ids).t().unsqueeze(-1)  # [G, T, 1]
+    out = (y * gate_wg).sum(0)                             # [T, H] fp32
     return out.to(flat.dtype)
 
 
