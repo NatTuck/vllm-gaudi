@@ -1148,13 +1148,16 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
     def _write_paged_swa_cache(self, kv_roped):
         """Write roped KV into the paged SWA cache (VLLM_DSV4_PAGED_KV).
 
-        Uses a contiguous flat view of the packed slab (stashed by the model
-        runner) so the scatter avoids strided views, which HPU's graph compiler
-        rejects.
+        Uses a 2-D view of the packed slab (stashed by the model runner) so the
+        scatter indexes dim 0 (blocks) rather than the whole flat slab: HPU index
+        ops fail when the indexed dim >= 2**31 and the slab is ~1.9e10 elements,
+        but the 2-D dim-0 size is only ``num_blocks+1``. The page is viewed 3-D
+        ``(num_blocks+1, block_size, head_dim)`` and slots are written with
+        advanced indexing on ``(block, off)``; this compiles as a single graph
+        (see ``src/stepP1_probe4.py``).
 
-        The SWA cache is a strided view into the packed slab, so scatter by
-        (block, offset) in place using the group's slot_mapping from the HPU
-        attention metadata.
+        Scatter by (block, off) in place using the group's slot_mapping from the
+        HPU attention metadata.
         """
         from vllm.forward_context import get_forward_context
 
@@ -1165,23 +1168,21 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         gid = getattr(self.swa_cache_layer, "_kv_cache_gid", None)
         if gid is None or gid not in aux:
             return
-        slab = getattr(self.swa_cache_layer, "_dsv4_flat_slab", None)
-        if slab is None:
+        slab2d = getattr(self.swa_cache_layer, "_dsv4_slab2d", None)
+        if slab2d is None:
             return
         info = aux[gid]
         slots = info["slot_mapping"]
         bs = info["block_size"]
         head_dim = self.head_dim
         kv = kv_roped.reshape(-1, head_dim)
-        T = kv.shape[0]
+        off = self.swa_cache_layer._dsv4_page_off
+        page_elems = self.swa_cache_layer._dsv4_page_elems
+        # 3-D page view: (num_blocks+1, block_size, head_dim); slot-major within a page.
+        page = slab2d[:, off:off + page_elems].view(-1, bs, head_dim)
         blocks = torch.div(slots, bs, rounding_mode="floor")
         offs = slots % bs
-        # Flat scatter into the contiguous slab: element index =
-        # layer_offset + block*block_stride_elems + off*head_dim + d.
-        base = (self.swa_cache_layer._dsv4_flat_offset + blocks * self.swa_cache_layer._dsv4_flat_stride +
-                offs * head_dim)
-        idx = base.unsqueeze(1) + torch.arange(head_dim, device=kv.device, dtype=slots.dtype).unsqueeze(0)
-        slab[idx] = kv
+        page[blocks, offs] = kv
 
     def forward_prefill(self, positions, hidden_states):
         """Prefill across a (possibly padded) prefill batch.

@@ -6987,14 +6987,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         elem = torch.tensor([], dtype=dtype).element_size()
                         kv_caches[layer_name] = packed_backing.view(-1, block_stride)[:, offset:offset +
                                                                                           page_bytes].view(dtype)
-                        # Stash a contiguous flat view + element offset/stride so
-                        # the forward can scatter without a strided view (HPU's
-                        # graph compiler rejects strided_view/as_strided_scatter).
+                        # Stash a 2-D view of the packed backing + this group's
+                        # element offset. The forward builds the page slice from it
+                        # and scatter/gathers slots with advanced indexing on
+                        # (block, off). A 1-D whole-slab index is impossible: HPU
+                        # index ops fail when the *indexed dim* >= 2**31 and the
+                        # slab is ~1.9e10 elements; the 2-D view indexes dim 0
+                        # (num_blocks+1) which is small. See stepP1_probe4.py.
                         _layer = self.vllm_config.compilation_config.static_forward_context.get(layer_name)
-                        if _layer is not None and page_bytes % elem == 0:
-                            _layer._dsv4_flat_slab = packed_backing.view(dtype)
-                            _layer._dsv4_flat_offset = offset // elem
-                            _layer._dsv4_flat_stride = block_stride // elem
+                        if _layer is not None and page_bytes % elem == 0 and block_stride % elem == 0:
+                            _layer._dsv4_slab2d = packed_backing.view(dtype).view(-1, block_stride // elem)
+                            _layer._dsv4_page_off = offset // elem
+                            _layer._dsv4_page_elems = page_bytes // elem
                         continue
 
                     if isinstance(kv_cache_spec, FullAttentionSpec):
