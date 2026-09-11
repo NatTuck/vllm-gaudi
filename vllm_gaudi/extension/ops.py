@@ -948,8 +948,11 @@ def apply_block_fp8_linear_hpu(
             bias,
         )
         return output.to(dtype=input.dtype).view(*input.shape[:-1], -1)
-    orig_M = getattr(layer, "orig_M", None)
-    orig_N = getattr(layer, "orig_N", None)
+    # Static pad sizes as Python ints (set in fp8_block_linear_postprocess_weights).
+    # Using the registered orig_M/orig_N Parameters here would host-sync (.item())
+    # inside the compiled region and graph-break on every block-fp8 linear.
+    orig_M = getattr(layer, "orig_M_val", None)
+    orig_N = getattr(layer, "orig_N_val", None)
     return apply_block_fp8_linear_hpu_dequant(
         input,
         layer.weight,
@@ -978,8 +981,12 @@ def apply_block_fp8_linear_hpu_dequant(
     input_2d = input.view(-1, input.shape[-1])
     weight = _dequant_fp8_weight(weight, weight_scale)
     if do_unpad and original_M is not None and original_N is not None:
-        om = original_M.data.item()
-        on = original_N.data.item()
+        # original_M/N are static pad sizes; prefer the Python ints captured at
+        # load time (fp8_block_linear_postprocess_weights) so this stays inside
+        # the compiled graph. Falling back to .item() would host-sync and graph-
+        # break on every block-fp8 linear.
+        om = original_M if isinstance(original_M, int) else original_M.item()
+        on = original_N if isinstance(original_N, int) else original_N.item()
         weight = weight[:om, :on]
     if bias is not None:
         output = torch.nn.functional.linear(input_2d, weight, bias=bias)
@@ -1183,6 +1190,10 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
         layer.get_dequant_weights_func = types.MethodType(get_dequant_weights_func, layer)
 
     layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+    # Keep the pad sizes as Python ints so the compiled forward can unpad with
+    # static slicing (no .item() host sync / graph break per block-fp8 linear).
+    layer.orig_M_val = int(orig_M)
+    layer.orig_N_val = int(orig_N)
     orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32, device=weight.device), requires_grad=False)
     orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32, device=weight.device), requires_grad=False)
     layer.register_parameter("orig_M", orig_M)
