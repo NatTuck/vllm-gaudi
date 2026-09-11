@@ -773,12 +773,19 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             ovl_gate[:rate] = lastg[:, :Dk]
 
     @torch.compiler.disable
-    def _compressor_compilable(self, hidden, qr, positions, is_prompt):
+    def _compressor_compilable(self, hidden, qr, positions, is_prompt, real=None):
         # FIXME(Step 5.5/6): this method uses data-dependent tensor slice bounds
         # (`buf[n:total]` with tensor n/total), which miscompile inside the
         # compiled layer region (RuntimeError: expanded size 0 vs 1024). Run it
         # eagerly (graph break) until the paged-KV rework makes the compressor
         # fully graph-safe with fixed shapes / slot_mapping.
+        T_full = hidden.shape[0]
+        if real is not None:
+            # Real-token selection (bool-mask indexing) must stay out of the
+            # compiled region; it is safe here (eager, graph-disabled).
+            hidden = hidden[real]
+            qr = qr[real]
+            positions = positions[real]
         if self.compressor is None or self.compress_ratio <= 1:
             return None, None, None, None
         rate = self.compress_ratio
@@ -919,18 +926,28 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         else:
             block_bias = None
             topk = torch.empty(T, 0, dtype=torch.long, device=dev)
+        if real is not None and block_bias is not None and T_full != T:
+            # The compressor ran on the real tokens only ([nreal, cap]); scatter
+            # the per-query block_bias back to the padded batch so the caller
+            # (compiled forward_prefill) gets a static [T, cap] mask without
+            # data-dependent slicing.
+            bb_full = block_bias.new_full((T_full, block_bias.shape[-1]), float("-inf"))
+            bb_full[real] = block_bias
+            block_bias = bb_full
         return compressed_kv_full, self._c_n, block_bias, topk
 
-    def _run_compressor(self, hidden_states, q_residual, positions, is_prompt):
+    def _run_compressor(self, hidden_states, q_residual, positions, is_prompt, real=None):
         """Run the graph-compilable CSA compressor/indexer over real tokens.
-        Returns (compressed_kv_full [CAP,D], compressed_n, block_bias [T,CAP] or None, _)."""
+        Returns (compressed_kv_full [CAP,D], compressed_n, block_bias [T,CAP] or None, _).
+        ``real`` is the optional real-token mask (prefill); it is applied inside
+        the compiler-disabled compressor so no bool indexing hits the graph."""
         if self.compressor is None or self.compress_ratio <= 1:
             D = self.head_dim
             dev = hidden_states.device
             return (torch.zeros(0, D, dtype=torch.bfloat16, device=dev),
                     torch.tensor(0, dtype=torch.int64, device=dev), None, None)
         ckv_full, c_n, bb, _ = self._compressor_compilable(
-            hidden_states, q_residual, positions, is_prompt)
+            hidden_states, q_residual, positions, is_prompt, real)
         if ckv_full is None:
             cap = max(self._cap, 1)
             dev = hidden_states.device
@@ -1100,60 +1117,64 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         """Prefill across a (possibly padded) prefill batch.
 
         vllm pads the prefill to a fixed length; only rows with position >= 0
-        are real tokens. Only real tokens may enter the window cache and the
-        compressor (padding would corrupt window/compressed state). The query
-        side (qr/kv/positions) stays the full batch so the returned hidden has
-        the padded shape vllm expects; padding query rows are masked to attend
-        the zero pad-key slots so their (discarded) output stays finite.
+        are real tokens and they are the leading ``[0:nreal)`` rows. The window
+        cache keeps the last ``min(nreal, window)`` real kv rows; the compressor
+        sees only real tokens. The query side (qr/kv/positions) stays the full
+        padded batch so the returned hidden has the shape vllm expects; padding
+        query rows are masked to attend every slot so their (discarded) output
+        stays finite.
+
+        Graph-safe: no ``int(tensor)`` host sync, no data-dependent Python
+        control flow, no bool-mask indexing in the compiled region. The real
+        token count is a tensor and the real-token selection happens inside the
+        compiler-disabled compressor.
         """
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
         T = kv_roped.shape[0]
         pos_flat = positions.reshape(-1)
         real = pos_flat >= 0
-        nreal = int(real.long().sum())
         dev = kv_roped.device
+        W = self.window_size
+        D = self.head_dim
 
-        self._win_n.zero_()
-        n_win = min(nreal, self.window_size)
-        self._win_cache[:n_win] = kv_roped[real][:n_win]
-        self._win_n.copy_(torch.tensor(n_win, dtype=torch.int64, device=dev))
+        # Window cache = the last min(nreal, W) real kv rows. Static-shape
+        # gather (fixed [W, D] output, dynamic index values): slot j holds the
+        # token at position ``start + j`` where start = max(0, nreal - W).
+        nreal = real.long().sum()
+        start = torch.clamp(nreal - W, min=0)
+        win_idx = (start + torch.arange(W, device=dev)).clamp(max=T - 1)
+        self._win_cache.copy_(kv_roped.gather(0, win_idx[:, None].expand(-1, D)))
+        self._win_n.copy_(torch.clamp(nreal, max=W))
         # decode appends at the next free ring slot = number of real tokens seen.
-        self._decode_pos.copy_(torch.tensor(nreal, dtype=torch.int64, device=dev))
+        self._decode_pos.copy_(nreal)
 
         is_prompt = torch.tensor(1, dtype=torch.int64, device=dev)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(
-            hidden_states[real], qr[real], pos_flat[real], is_prompt)
+            hidden_states, qr, pos_flat, is_prompt, real)
 
         cap = self._cap
         past_kv = torch.cat([self._win_cache, comp_full], dim=0)
         past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
 
-        # Window mask over the full padded T. Real query rows attend real window
-        # keys causally; padding query rows attend the zero pad-key slots (finite).
-        win_mask = torch.zeros(T, self.window_size, dtype=torch.bool, device=dev)
-        if nreal > 0:
-            real_pos = pos_flat[real]
-            if nreal <= self.window_size:
-                win_causal = real_pos[:, None] >= real_pos[None, :]
-                win_mask[:nreal, :nreal] = win_causal
-            else:
-                start = nreal - self.window_size
-                win_mask[:nreal, :] = real_pos[:, None] >= real_pos[None, start:]
-        if nreal < T:
-            win_mask[nreal:] = True
+        # Window mask: real query rows attend present, causal window slots;
+        # padding query rows attend every slot (finite, discarded).
+        win_ids = torch.arange(W, device=dev)
+        win_present = win_ids < self._win_n
+        win_pos = start + win_ids
+        win_mask = (win_pos[None, :] <= pos_flat[:, None]) & win_present[None, :]
+        win_mask = win_mask | (~real)[:, None]
 
-        comp_attend = torch.zeros(T, cap, dtype=torch.bool, device=dev)
-        if nreal > 0 and cap > 0:
-            comp_ids = torch.arange(cap, device=dev)
-            comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)  # [1, CAP]
-            if comp_bb is not None:
-                comp_attend[:nreal] = comp_present & torch.isfinite(comp_bb[:, :cap])
-            else:
-                comp_attend[:nreal] = comp_present.expand(nreal, -1)
-        if nreal < T:
-            comp_attend[nreal:] = True
-        mask = torch.cat([win_mask, comp_attend], dim=-1)
+        # Compressed mask: real rows attend present/finite compressed entries;
+        # padding rows attend every entry.
+        comp_ids = torch.arange(cap, device=dev)
+        comp_present = comp_ids[None, :] < comp_n.reshape(-1)[None, :]  # [1, CAP]
+        if comp_bb is not None:
+            comp_valid = comp_present & torch.isfinite(comp_bb[:, :cap])
+        else:
+            comp_valid = comp_present.expand(T, -1)
+        comp_mask = comp_valid | (~real)[:, None]
+        mask = torch.cat([win_mask, comp_mask], dim=-1)
 
         return self._forward_compilable(qr, kv, positions, past_kv, mask)
 
@@ -1164,7 +1185,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             hidden_states = hidden_states.unsqueeze(0)
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
-        self._win_cache[self._decode_pos % self.window_size] = kv_roped.squeeze(0)
+        # Ring-buffer write via index_copy_ with an explicit [1] slot index:
+        # graph-safe (fixed shapes), unlike `buf[tensor] = value`.
+        slot = (self._decode_pos % self.window_size).reshape(1)
+        self._win_cache.index_copy_(0, slot, kv_roped.reshape(1, -1))
         self._decode_pos.add_(1)
         self._win_n.add_(1).clamp_(max=self.window_size)
 
@@ -1916,6 +1940,16 @@ def _make_block_scales(
     return block_scales
 
 
+@torch.compiler.disable
+def _check_v4_routed_ready(moe) -> None:
+    """Load-time invariant check, kept out of the compiled MoE graph."""
+    if not bool(getattr(moe, "_v4_fp8_ready", torch.tensor(0)).item()):
+        raise RuntimeError(
+            "DeepSeek V4 routed fp4 buffers not ready (expected pre-registration "
+            "at load or snapshot restore); refusing to load from checkpoint at runtime."
+        )
+
+
 def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch.Tensor:
     """Batched fp8 routed expert computation (no per-expert Python loops).
 
@@ -1930,12 +1964,9 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
     # (_register_v4_routed_packed, called from load_weights) or restored from the
     # snapshot (_v4_fp8_ready=1). There is deliberately NO runtime-load fallback
     # here: a missing buffer means a load/restore bug and must fail loudly, never
-    # re-read the checkpoint in the forward.
-    if not bool(getattr(moe, "_v4_fp8_ready", torch.tensor(0)).item()):
-        raise RuntimeError(
-            "DeepSeek V4 routed fp4 buffers not ready (expected pre-registration "
-            "at load or snapshot restore); refusing to load from checkpoint at runtime."
-        )
+    # re-read the checkpoint in the forward. The check is compiler-disabled so
+    # its `.item()` host sync never graph-breaks the compiled MoE region.
+    _check_v4_routed_ready(moe)
     if moe.packed_w1_weight.device != flat.device:
         for _name in ("packed_w1_weight", "packed_w1_scale",
                       "packed_w2_weight", "packed_w2_scale",
