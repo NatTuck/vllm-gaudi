@@ -1215,6 +1215,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
 
 _HPU_CAP: dict = {"attn_in": {}, "attn_out": {}}
+_DUMP_ON = __import__("os").environ.get("HPU_DUMP") == "1"
 _MHC_PHASE = "attn"
 _MHC_LAYER = -1
 
@@ -1337,6 +1338,10 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
         self, x, positions, input_ids, post_mix=None, res_mix=None, residual=None,
     ):
         residual, post_mix, res_mix, x = self._mhc(x, residual, post_mix, res_mix)
+        if _DUMP_ON:
+            # attn_in (post input-norm / mHC) for the prefill step; compare with
+            # ref_cache.pt["attn_in"][0][layer]. Module-const guard => no graph break.
+            _HPU_CAP["attn_in"][self._layer_idx] = x.detach().float().clone()
         x = self.attn.forward_prefill(positions, x)
         residual, post_mix, res_mix, x = self._mhc_post_ffn(x, residual, post_mix, res_mix)
         x = self.ffn(x, input_ids)
