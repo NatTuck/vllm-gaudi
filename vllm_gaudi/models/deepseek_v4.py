@@ -1343,8 +1343,15 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             # ref_cache.pt["attn_in"][0][layer]. Module-const guard => no graph break.
             _HPU_CAP["attn_in"][self._layer_idx] = x.detach().float().clone()
         x = self.attn.forward_prefill(positions, x)
+        if _DUMP_ON:
+            _HPU_CAP.setdefault("attn_out", {})[self._layer_idx] = x.detach().float().clone()
         residual, post_mix, res_mix, x = self._mhc_post_ffn(x, residual, post_mix, res_mix)
+        if _DUMP_ON:
+            # MoE input (post ffn-norm / mHC collapse) for the prefill step.
+            _HPU_CAP.setdefault("moe_in", {})[self._layer_idx] = x.detach().float().clone()
         x = self.ffn(x, input_ids)
+        if _DUMP_ON:
+            _HPU_CAP.setdefault("moe_out", {})[self._layer_idx] = x.detach().float().clone()
         return x, residual, post_mix, res_mix
 
     def _forward_inner_decode(
@@ -2112,13 +2119,33 @@ def _hpu_deepseek_v4_moe_forward(
         topk_weights = scores.gather(1, topk_ids)
     topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
     topk_weights = topk_weights * self.routed_scaling_factor
+    if _DUMP_ON:
+        _lidx = getattr(self, "_v4_layer_idx", -1)
+        _HPU_CAP.setdefault("router_logits", {})[_lidx] = router_logits.detach().float().clone()
+        _HPU_CAP.setdefault("topk_ids", {})[_lidx] = topk_ids.detach().clone()
+        _HPU_CAP.setdefault("topk_weights", {})[_lidx] = topk_weights.detach().float().clone()
 
     routed = _compute_v4_routed(self, flat, topk_ids, topk_weights)
 
     if self.tp_size > 1:
         routed = tensor_model_parallel_all_reduce(routed)
+    if _DUMP_ON:
+        _HPU_CAP.setdefault("routed_out", {})[getattr(self, "_v4_layer_idx", -1)] = \
+            routed.detach().float().clone()
     if self.shared_experts is not None:
-        routed = routed.float() + self.shared_experts(flat).float()
+        _shared = self.shared_experts(flat)
+        # The shared expert's RowParallelLinear down_proj is built with
+        # reduce_results=False (upstream reduces routed+shared together inside the
+        # FusedMoE). This custom forward bypasses the FusedMoE, so the shared
+        # expert's TP partial must be all-reduced here -- otherwise every rank
+        # contributes only its own shard (~1/tp_size of the full output).
+        _dp = getattr(self.shared_experts, "down_proj", None)
+        if self.tp_size > 1 and _dp is not None and not getattr(_dp, "reduce_results", True):
+            _shared = tensor_model_parallel_all_reduce(_shared)
+        if _DUMP_ON:
+            _HPU_CAP.setdefault("shared_out", {})[getattr(self, "_v4_layer_idx", -1)] = \
+                _shared.detach().float().clone()
+        routed = routed.float() + _shared.float()
     final_hidden_states = routed.to(torch.bfloat16)
 
     return final_hidden_states.view(org_shape)
