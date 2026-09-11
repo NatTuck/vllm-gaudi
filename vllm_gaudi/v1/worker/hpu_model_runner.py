@@ -88,6 +88,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache, add_kv_sharing_layers_to_kv_cache_groups
 from vllm.v1.utils import CpuGpuBuffer
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState
+from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled, hpu_bind_kv_cache
 from vllm.distributed.parallel_state import get_pp_group, get_dp_group
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
@@ -1786,6 +1787,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     spec = attn_module.get_kv_cache_spec(self.vllm_config)
                     if spec is not None:
                         kv_cache_spec[layer_name] = spec
+                elif dsv4_paged_kv_enabled():
+                    # R1 paged path: also allocate the DSV4 sub-caches (SWA
+                    # window, compressor running state, indexer k_cache). Their
+                    # multiple caches per decoder layer need the HPU bind below.
+                    from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
+                    from vllm.models.deepseek_v4.compressor import CompressorStateCache
+                    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+                    if isinstance(attn_module, (DeepseekV4SWACache, CompressorStateCache, DeepseekV4IndexerCache)):
+                        spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                        if spec is not None:
+                            kv_cache_spec[layer_name] = spec
                 continue
 
         return kv_cache_spec
@@ -6898,6 +6911,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             value_cache = None
                             value_scales = None
                         kv_caches[layer_name] = (key_cache, value_cache, key_scales, value_scales)
+                    elif isinstance(kv_cache_spec, AttentionSpec):
+                        # DSV4 sub-caches (SWA window, compressor running state,
+                        # indexer k_cache) under VLLM_DSV4_PAGED_KV. Shape comes
+                        # from the owning layer's backend.
+                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
+                        backend = layer.get_attn_backend()
+                        kv_cache_shape = backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
+                                                                    kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                        kv_caches[layer_name] = torch.zeros(kv_cache_shape, dtype=kv_cache_spec.dtype, device=self.device)
                     elif isinstance(kv_cache_spec, MambaSpec):
                         state_tensors = []
                         for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
@@ -6920,7 +6942,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
                 kv_caches[layer_name] = kv_caches[target_layer_name]
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
-        bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
+        if dsv4_paged_kv_enabled():
+            hpu_bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
+        else:
+            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
         if self.enable_bucketing:
             self.bucketing_manager.num_hpu_blocks = num_blocks

@@ -552,6 +552,14 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         return num_heads
 
     def get_kv_cache_spec(self, vllm_config):
+        from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
+
+        if dsv4_paged_kv_enabled():
+            # R1: upstream-faithful spec — the compressed MLA cache for
+            # compress_ratio > 1, None for the SWA-only layers (their cache is
+            # the separately registered ``swa_cache`` module).
+            return super().get_kv_cache_spec(vllm_config)
+
         # The dense-MLA fallback computes attention over the full context in
         # torch and does not read the paged KV cache, but the HPU worker still
         # needs a normal, small, framework-compatible cache. Return a plain

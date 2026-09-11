@@ -27,9 +27,10 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
+from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
+from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled, hpu_bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
@@ -379,6 +380,18 @@ class HPUWorker(WorkerBase):
 
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
 
+            elif isinstance(layer_spec, AttentionSpec):
+                # DSV4 sub-caches (SWA window, compressor running state, indexer
+                # k_cache) under VLLM_DSV4_PAGED_KV. The dense forward does not
+                # read them; allocate a flat dummy sized by the spec for the
+                # profile run (the real allocation happens in the model runner).
+                dtype = layer_spec.dtype
+                elem = torch.tensor([], dtype=dtype).element_size()
+                numel = max(1, layer_spec.page_size_bytes // elem)
+                kv_caches[layer_name] = torch.zeros(numel, dtype=dtype, device='hpu')
+
+                single_kv_block_size_bytes += layer_spec.page_size_bytes
+
             elif isinstance(layer_spec, MambaSpec):
                 dtype0 = layer_spec.dtypes[0]
                 dtype1 = layer_spec.dtypes[1]
@@ -397,7 +410,10 @@ class HPUWorker(WorkerBase):
                 raise NotImplementedError
 
         runner_kv_caches: list[torch.Tensor] = []
-        bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
+        if dsv4_paged_kv_enabled():
+            hpu_bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
+        else:
+            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
 
         if is_fake_hpu():
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
