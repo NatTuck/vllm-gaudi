@@ -20,6 +20,8 @@ import torch
 import torch.nn as nn
 
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.v1.attention.backend import MultipleOf as _MultipleOf
+from vllm.v1.attention.backends.mla.indexer import DeepseekV4IndexerBackend as _NvIndexerBackend
 from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4DecoderLayer as _NvDeepseekV4DecoderLayer,
 )
@@ -471,6 +473,21 @@ def _hc_head(
 
 
 
+class HPUDeepseekV4IndexerBackend(_NvIndexerBackend):
+    """HPU indexer-cache backend.
+
+    The HPU indexer runs as compiled Python and is block-size agnostic, so
+    accept any kernel block size. The upstream CUDA backend pins 256, which
+    conflicts with the HPU MLA kernel's 128 when the indexer cache and the
+    compressed MLA cache are merged into one packed KV cache group
+    (``select_common_block_size`` then finds no common size).
+    """
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [_MultipleOf(1)]
+
+
 class DeepseekV4HPUAttention(DeepseekV4Attention):
     """HPU DeepSeek V4 attention.
 
@@ -546,6 +563,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._i_ovl_kv = torch.empty(0)
         self._i_ovl_gate = torch.empty(0)
         self._i_ovl_n = torch.tensor(0, dtype=torch.int64)
+
+        # Under the paged-KV flag the indexer k_cache must advertise an
+        # HPU-friendly supported kernel block size (see HPUDeepseekV4IndexerBackend).
+        from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
+
+        if dsv4_paged_kv_enabled() and getattr(self, "indexer", None) is not None:
+            self.indexer.k_cache.get_attn_backend = lambda: HPUDeepseekV4IndexerBackend
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

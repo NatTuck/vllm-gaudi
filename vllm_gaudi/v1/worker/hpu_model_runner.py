@@ -6629,6 +6629,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         elif self.is_encoder_only_attn:
             kernel_block_sizes = []
             self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        elif dsv4_paged_kv_enabled():
+            # DSv4 registers several KV cache groups (compressed MLA, SWA window,
+            # compressor running state, indexer). Rebuild the InputBatch so its
+            # MultiGroupBlockTable tracks a block table per group; the scheduler's
+            # per-group block_ids already flow through add_row/append_row.
+            kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, self.attn_groups)
+            self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+            # Group 0 is the main MLA attention (`_get_attention_group_id_for_hybrid`
+            # returns 0 for non-mamba); its kernel block size may be smaller than
+            # the manager block size when the cache is split.
+            if kernel_block_sizes:
+                self.attn_block_size = kernel_block_sizes[0]
+            logger.info(
+                "DSv4 paged-KV: %d KV cache groups, block_sizes=%s kernel_block_sizes=%s, "
+                "InputBatch groups=%d attn_block_size=%d", len(kv_cache_config.kv_cache_groups),
+                [g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups], kernel_block_sizes,
+                len(self.input_batch.block_table.block_tables), self.attn_block_size)
 
         kv_caches: dict[str, torch.Tensor] = {}
         num_blocks = 0
