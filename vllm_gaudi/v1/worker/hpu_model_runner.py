@@ -3279,6 +3279,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
         slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
 
+        dsv4_aux_meta = None
+        if dsv4_paged_kv_enabled() and num_decodes > 0:
+            _req_indices = [self.input_batch.req_id_to_index[self.input_batch.req_ids[i]] for i in range(num_decodes)]
+            _positions = [[int(padded_index[i, j]) for j in range(int(num_tokens_per_req[i]))] for i in range(num_decodes)]
+            dsv4_aux_meta = self._dsv4_aux_meta(_req_indices, _positions)
+
         #####################################
         # NOTE(Chendi): Since we can't actually do num_tokens = 2,
         # convert to [batch_size * num_tokens, 1]
@@ -3464,6 +3470,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             store_indices_tensor=store_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
+            dsv4_aux_meta=dsv4_aux_meta,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
