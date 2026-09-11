@@ -1167,7 +1167,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
         'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
-        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks'
+        'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'dsv4_aux_meta'
     ])
     return attention_metadata
 
@@ -2760,6 +2760,40 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return attn_mask.unflatten(0, (1, -1))
 
+    def _dsv4_aux_meta(self, req_indices, positions_per_req):
+        """Per-aux-group slot_mapping/block_list for the DSv4 paged caches.
+
+        Only used under VLLM_DSV4_PAGED_KV. Positions are absolute token
+        positions; each group addresses its own block table with its own block
+        size. Returns None when the paged path is disabled.
+        """
+        if not dsv4_paged_kv_enabled():
+            return None
+        aux: dict = {}
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if gid == 0:
+                continue
+            bs = group.kv_cache_spec.block_size
+            bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            slots: list[int] = []
+            blocks: list[int] = []
+            for i, req_idx in enumerate(req_indices):
+                plist = positions_per_req[i]
+                if not plist:
+                    continue
+                first, last = plist[0] // bs, plist[-1] // bs
+                for b in range(first, last + 1):
+                    blocks.append(int(bt[req_idx, b]))
+                for p in plist:
+                    physical = int(bt[req_idx, p // bs])
+                    slots.append(physical * bs + (p % bs))
+            aux[gid] = {
+                'slot_mapping': async_h2d_copy(slots, dtype=torch.int64),
+                'block_list': async_h2d_copy(blocks, dtype=torch.int64),
+                'block_size': bs,
+            }
+        return aux
+
     def _form_prefill_batch(self, contents):
         if len(contents.req_ids) == 0:
             return PrefillInputData()
@@ -2772,6 +2806,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.profiler_counter_helper.capture_prompt_seq_stats(query_lens, context_lens)
 
         token_positions = [list(range(cl, cl + ql)) for cl, ql in zip(context_lens, query_lens)]
+        dsv4_aux_meta = self._dsv4_aux_meta([self.input_batch.req_id_to_index.get(r, 0) for r in req_ids],
+                                            token_positions)
 
         # Use attn_block_size for KV cache slot addressing so that the
         # slot indices match the InputBatch block_table which is keyed
@@ -3079,7 +3115,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             blocks_caching_range=blocks_caching_range,
             mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
             seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
-            window_block_list=window_context_blocks_t)
+            window_block_list=window_context_blocks_t,
+            dsv4_aux_meta=dsv4_aux_meta)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -6501,6 +6538,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             kv_cache_group_id: int,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
+            forward_ctx = self.vllm_config.compilation_config.static_forward_context
             for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
                 attn_group = AttentionGroup(
                     attn_backend,
@@ -6508,6 +6546,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     kv_cache_spec,
                     kv_cache_group_id,
                 )
+                for _ln in layer_names:
+                    if _ln in forward_ctx:
+                        forward_ctx[_ln]._kv_cache_gid = kv_cache_group_id
 
                 attn_groups.append(attn_group)
             return attn_groups

@@ -65,6 +65,9 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     mamba_chunks_to_block_mapping: Optional[torch.Tensor] = None
     seqlens_offsets_for_blocks: Optional[torch.Tensor] = None
     window_block_list: Optional[torch.Tensor] = None
+    # DSv4 paged aux caches (VLLM_DSV4_PAGED_KV): gid -> {'slot_mapping': Tensor,
+    # 'block_list': Tensor, 'block_size': int} for the non-main KV cache groups.
+    dsv4_aux_meta: Optional[dict] = None
 
     def seq_len(self):
         return self.slot_mapping.size(-1)
@@ -92,7 +95,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               blocks_caching_range=None,
                               mamba_chunks_to_block_mapping=None,
                               seqlens_offsets_for_blocks=None,
-                              window_block_list=None):
+                              window_block_list=None,
+                              dsv4_aux_meta=None):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -116,7 +120,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    blocks_caching_range=blocks_caching_range,
                    mamba_chunks_to_block_mapping=mamba_chunks_to_block_mapping,
                    seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
-                   window_block_list=window_block_list)
+                   window_block_list=window_block_list,
+                   dsv4_aux_meta=dsv4_aux_meta)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -135,7 +140,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              load_indices_tensor=None,
                              store_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             dsv4_aux_meta=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -158,4 +164,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   dsv4_aux_meta=dsv4_aux_meta)
