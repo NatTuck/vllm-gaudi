@@ -6845,6 +6845,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     else:
                         pass
         else:  # non-hybrid scenario
+            # DSV4 (and other multi-group models) use the packed layout: one
+            # shared int8 slab of `block_stride * num_blocks` bytes, with each
+            # layer's cache a strided view at its byte `offset`. Allocate the
+            # backing once and build per-layer views instead of one tensor per
+            # layer (which over-allocates and OOMs).
+            packed_backing = None
+            layer_packing: dict[str, tuple[int, int]] = {}
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                if getattr(kv_cache_tensor, "block_stride", 0) and kv_cache_tensor.block_stride > 0:
+                    if packed_backing is None:
+                        packed_backing = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
+                    for ln in kv_cache_tensor.shared_by:
+                        layer_packing[ln] = (kv_cache_tensor.offset, kv_cache_tensor.block_stride)
+
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 for layer_name in kv_cache_tensor.shared_by:
                     # Get the correct spec for this layer
@@ -6877,6 +6891,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # the authoritative per-layer block count for every model
                     # (including heterogeneous ones like Gemma4).
                     num_blocks = kv_cache_config.num_blocks
+
+                    # Packed layout: this layer's cache is a strided view into
+                    # the shared slab at (offset, block_stride).
+                    if layer_name in layer_packing:
+                        offset, block_stride = layer_packing[layer_name]
+                        page_bytes = kv_cache_spec.page_size_bytes
+                        kv_caches[layer_name] = packed_backing.view(-1, block_stride)[:, offset:offset +
+                                                                                          page_bytes].view(
+                                                                                              kv_cache_spec.dtype)
+                        continue
+
                     if isinstance(kv_cache_spec, FullAttentionSpec):
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_blocks + 1, kv_cache_spec.block_size,
                                                                               kv_cache_spec.num_kv_heads,
