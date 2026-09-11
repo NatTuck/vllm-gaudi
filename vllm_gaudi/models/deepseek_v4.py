@@ -1145,6 +1145,44 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         kv = _rmsnorm(kv, self.eps, self.kv_norm.weight.data)
         return qr, kv
 
+    def _write_paged_swa_cache(self, kv_roped):
+        """Write roped KV into the paged SWA cache (VLLM_DSV4_PAGED_KV).
+
+        Uses a contiguous flat view of the packed slab (stashed by the model
+        runner) so the scatter avoids strided views, which HPU's graph compiler
+        rejects.
+
+        The SWA cache is a strided view into the packed slab, so scatter by
+        (block, offset) in place using the group's slot_mapping from the HPU
+        attention metadata.
+        """
+        from vllm.forward_context import get_forward_context
+
+        md = get_forward_context().attn_metadata
+        aux = getattr(md, "dsv4_aux_meta", None)
+        if not aux:
+            return
+        gid = getattr(self.swa_cache_layer, "_kv_cache_gid", None)
+        if gid is None or gid not in aux:
+            return
+        slab = getattr(self.swa_cache_layer, "_dsv4_flat_slab", None)
+        if slab is None:
+            return
+        info = aux[gid]
+        slots = info["slot_mapping"]
+        bs = info["block_size"]
+        head_dim = self.head_dim
+        kv = kv_roped.reshape(-1, head_dim)
+        T = kv.shape[0]
+        blocks = torch.div(slots, bs, rounding_mode="floor")
+        offs = slots % bs
+        # Flat scatter into the contiguous slab: element index =
+        # layer_offset + block*block_stride_elems + off*head_dim + d.
+        base = (self.swa_cache_layer._dsv4_flat_offset + blocks * self.swa_cache_layer._dsv4_flat_stride +
+                offs * head_dim)
+        idx = base.unsqueeze(1) + torch.arange(head_dim, device=kv.device, dtype=slots.dtype).unsqueeze(0)
+        slab[idx] = kv
+
     def forward_prefill(self, positions, hidden_states):
         """Prefill across a (possibly padded) prefill batch.
 
@@ -1163,6 +1201,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         """
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+        self._write_paged_swa_cache(kv_roped)
         T = kv_roped.shape[0]
         pos_flat = positions.reshape(-1)
         real = pos_flat >= 0
@@ -1217,6 +1256,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             hidden_states = hidden_states.unsqueeze(0)
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
+        self._write_paged_swa_cache(kv_roped)
         # Ring-buffer write via index_copy_ with an explicit [1] slot index:
         # graph-safe (fixed shapes), unlike `buf[tensor] = value`.
         slot = (self._decode_pos % self.window_size).reshape(1)

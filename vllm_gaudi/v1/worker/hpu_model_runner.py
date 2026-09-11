@@ -2760,12 +2760,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return attn_mask.unflatten(0, (1, -1))
 
-    def _dsv4_aux_meta(self, req_indices, positions_per_req):
+    def _dsv4_aux_meta(self, req_indices, positions_per_req, pad_shape=None, pad_block=None):
         """Per-aux-group slot_mapping/block_list for the DSv4 paged caches.
 
         Only used under VLLM_DSV4_PAGED_KV. Positions are absolute token
         positions; each group addresses its own block table with its own block
-        size. Returns None when the paged path is disabled.
+        size. ``pad_shape`` (prefill) pads each group's per-req slot lists to the
+        fixed batch shape with the PAD block's first slot, so the returned
+        ``slot_mapping`` has the same flattened length as the forward's padded
+        ``kv_roped`` rows. Returns None when the paged path is disabled.
         """
         if not dsv4_paged_kv_enabled():
             return None
@@ -2775,18 +2778,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 continue
             bs = group.kv_cache_spec.block_size
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
-            slots: list[int] = []
+            slot_lists: list[list[int]] = []
             blocks: list[int] = []
             for i, req_idx in enumerate(req_indices):
                 plist = positions_per_req[i]
-                if not plist:
-                    continue
-                first, last = plist[0] // bs, plist[-1] // bs
-                for b in range(first, last + 1):
-                    blocks.append(int(bt[req_idx, b]))
-                for p in plist:
-                    physical = int(bt[req_idx, p // bs])
-                    slots.append(physical * bs + (p % bs))
+                slots_i: list[int] = []
+                if plist:
+                    first, last = plist[0] // bs, plist[-1] // bs
+                    for b in range(first, last + 1):
+                        blocks.append(int(bt[req_idx, b]))
+                    for p in plist:
+                        physical = int(bt[req_idx, p // bs])
+                        slots_i.append(physical * bs + (p % bs))
+                slot_lists.append(slots_i)
+            if pad_shape is not None:
+                pad_slot = int(pad_block) * bs
+                padded = align_and_pad(slot_lists, pad_shape, itertools.repeat(pad_slot))
+                slots = [int(x) for row in padded for x in row]
+            else:
+                slots = [s for sl in slot_lists for s in sl]
             aux[gid] = {
                 'slot_mapping': async_h2d_copy(slots, dtype=torch.int64),
                 'block_list': async_h2d_copy(blocks, dtype=torch.int64),
@@ -2806,8 +2816,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.profiler_counter_helper.capture_prompt_seq_stats(query_lens, context_lens)
 
         token_positions = [list(range(cl, cl + ql)) for cl, ql in zip(context_lens, query_lens)]
-        dsv4_aux_meta = self._dsv4_aux_meta([self.input_batch.req_id_to_index.get(r, 0) for r in req_ids],
-                                            token_positions)
+        _aux_req_indices = [self.input_batch.req_id_to_index.get(r, 0) for r in req_ids]
+        _aux_positions = token_positions  # unpadded per-req positions; padded below
 
         # Use attn_block_size for KV cache slot addressing so that the
         # slot indices match the InputBatch block_table which is keyed
@@ -2870,6 +2880,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             token_positions = align_and_pad(token_positions, (target_bs, target_seq), itertools.repeat(-1))
         token_slots = align_and_pad(token_slots, (target_bs, target_seq), itertools.repeat(-1))
+        dsv4_aux_meta = self._dsv4_aux_meta(_aux_req_indices,
+                                            _aux_positions,
+                                            pad_shape=(target_bs, target_seq),
+                                            pad_block=self._PAD_BLOCK_ID)
         token_groups = align_and_pad(token_groups, (target_bs, target_seq), itertools.repeat(-1))
         context_blocks = align_and_pad(context_blocks, (target_bs, target_blocks), itertools.repeat(-1))
         context_groups = align_and_pad(context_groups, (target_bs, target_blocks), itertools.repeat(-1))
@@ -3283,7 +3297,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if dsv4_paged_kv_enabled() and num_decodes > 0:
             _req_indices = [self.input_batch.req_id_to_index[self.input_batch.req_ids[i]] for i in range(num_decodes)]
             _positions = [[int(padded_index[i, j]) for j in range(int(num_tokens_per_req[i]))] for i in range(num_decodes)]
-            dsv4_aux_meta = self._dsv4_aux_meta(_req_indices, _positions)
+            dsv4_aux_meta = self._dsv4_aux_meta(_req_indices,
+                                                _positions,
+                                                pad_shape=(padded_batch_size, num_tokens),
+                                                pad_block=self._PAD_BLOCK_ID)
 
         #####################################
         # NOTE(Chendi): Since we can't actually do num_tokens = 2,
@@ -6920,7 +6937,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 if getattr(kv_cache_tensor, "block_stride", 0) and kv_cache_tensor.block_stride > 0:
                     if packed_backing is None:
-                        packed_backing = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
+                        # Allocate one extra block as the PAD block (matches the
+                        # non-packed HPU convention: _PAD_BLOCK_ID == num_blocks).
+                        packed_backing = torch.zeros((kv_cache_config.num_blocks + 1) * kv_cache_tensor.block_stride,
+                                                     dtype=torch.int8,
+                                                     device=self.device)
                     for ln in kv_cache_tensor.shared_by:
                         layer_packing[ln] = (kv_cache_tensor.offset, kv_cache_tensor.block_stride)
 
@@ -6962,9 +6983,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     if layer_name in layer_packing:
                         offset, block_stride = layer_packing[layer_name]
                         page_bytes = kv_cache_spec.page_size_bytes
+                        dtype = kv_cache_spec.dtype
+                        elem = torch.tensor([], dtype=dtype).element_size()
                         kv_caches[layer_name] = packed_backing.view(-1, block_stride)[:, offset:offset +
-                                                                                          page_bytes].view(
-                                                                                              kv_cache_spec.dtype)
+                                                                                          page_bytes].view(dtype)
+                        # Stash a contiguous flat view + element offset/stride so
+                        # the forward can scatter without a strided view (HPU's
+                        # graph compiler rejects strided_view/as_strided_scatter).
+                        _layer = self.vllm_config.compilation_config.static_forward_context.get(layer_name)
+                        if _layer is not None and page_bytes % elem == 0:
+                            _layer._dsv4_flat_slab = packed_backing.view(dtype)
+                            _layer._dsv4_flat_offset = offset // elem
+                            _layer._dsv4_flat_stride = block_stride // elem
                         continue
 
                     if isinstance(kv_cache_spec, FullAttentionSpec):
