@@ -2797,9 +2797,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 slots = [int(x) for row in padded for x in row]
             else:
                 slots = [s for sl in slot_lists for s in sl]
+            # Full block table of the (single) request, indexed by logical block:
+            # the R3 window read needs slots for positions before the current
+            # batch, which are not in ``slot_mapping``. Only meaningful for a
+            # single request (the window read falls back to the manual buffer
+            # otherwise).
+            block_list_full = None
+            if len(req_indices) == 1:
+                block_list_full = async_h2d_copy(bt[req_indices[0], :].tolist(), dtype=torch.int64)
             aux[gid] = {
                 'slot_mapping': async_h2d_copy(slots, dtype=torch.int64),
                 'block_list': async_h2d_copy(blocks, dtype=torch.int64),
+                'block_list_full': block_list_full,
                 'block_size': bs,
             }
         return aux

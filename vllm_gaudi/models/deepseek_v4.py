@@ -1184,6 +1184,59 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         offs = slots % bs
         page[blocks, offs] = kv
 
+    def _read_paged_swa_window(self, last_pos, window):
+        """Read the sliding window (last ``window`` positions) from the paged
+        SWA cache (R3).
+
+        ``last_pos`` is the last real position in the batch (scalar tensor).
+        Returns ``(win_kv [W, head_dim], win_n, win_start)`` or ``None`` when the
+        paged path is unavailable (no single-request full block table), in which
+        case the caller keeps the manual buffer.
+
+        Graph-safe: positions -> logical block -> physical block via the
+        request's full block table, then ``page[phys, off]`` advanced indexing.
+        """
+        from vllm.forward_context import get_forward_context
+
+        md = get_forward_context().attn_metadata
+        aux = getattr(md, "dsv4_aux_meta", None)
+        if not aux:
+            return None
+        gid = getattr(self.swa_cache_layer, "_kv_cache_gid", None)
+        if gid is None or gid not in aux:
+            return None
+        layer = self.swa_cache_layer
+        slab2d = getattr(layer, "_dsv4_slab2d", None)
+        if slab2d is None:
+            return None
+        info = aux[gid]
+        bl = info.get("block_list_full")
+        if bl is None or bl.dim() != 1:
+            return None
+        bs = info["block_size"]
+        head_dim = self.head_dim
+        page = slab2d[:, layer._dsv4_page_off:layer._dsv4_page_off +
+                      layer._dsv4_page_elems].view(-1, bs, head_dim)
+        end = last_pos + 1
+        start = torch.clamp(end - window, min=0)
+        win_ids = torch.arange(window, device=end.device, dtype=torch.int64)
+        wpos = start + win_ids
+        valid = wpos < end
+        wpos_c = torch.clamp(wpos, max=end - 1)
+        logical = torch.div(wpos_c, bs, rounding_mode="floor")
+        woffs = wpos_c % bs
+        phys = bl[logical]
+        # Read via dim-0 index_select + dim-1 gather (both HPU-supported) rather
+        # than advanced indexing on the strided page view, which makes the
+        # compiler materialize a full slab copy inside the model's large graph.
+        # The page is fp8 (kv_cache_dtype=fp8_inc); HPU's gather has no fp8
+        # kernel, so cast the selected rows (small) to bf16 first.
+        pages = page.index_select(0, phys).to(torch.bfloat16)  # [W, bs, head_dim]
+        gidx = woffs.view(-1, 1, 1).expand(-1, 1, head_dim)
+        win_kv = torch.gather(pages, 1, gidx).squeeze(1)  # [W, head_dim]
+        win_n = torch.clamp(end - start, max=window)
+        return win_kv, win_n, start, valid
+
     def forward_prefill(self, positions, hidden_states):
         """Prefill across a (possibly padded) prefill batch.
 
@@ -1214,10 +1267,18 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # gather (fixed [W, D] output, dynamic index values): slot j holds the
         # token at position ``start + j`` where start = max(0, nreal - W).
         nreal = real.long().sum()
-        start = torch.clamp(nreal - W, min=0)
-        win_idx = (start + torch.arange(W, device=dev)).clamp(max=T - 1)
-        self._win_cache.copy_(kv_roped.gather(0, win_idx[:, None].expand(-1, D)))
-        self._win_n.copy_(torch.clamp(nreal, max=W))
+        r3 = self._read_paged_swa_window(pos_flat[nreal - 1], W)
+        if r3 is not None:
+            # R3: read the window from the paged SWA cache (supports chunked
+            # prefill; window positions come from the request's block table).
+            win_kv, win_n, start, _valid = r3
+            self._win_cache.copy_(win_kv)
+            self._win_n.copy_(win_n)
+        else:
+            start = torch.clamp(nreal - W, min=0)
+            win_idx = (start + torch.arange(W, device=dev)).clamp(max=T - 1)
+            self._win_cache.copy_(kv_roped.gather(0, win_idx[:, None].expand(-1, D)))
+            self._win_n.copy_(torch.clamp(nreal, max=W))
         # decode appends at the next free ring slot = number of real tokens seen.
         self._decode_pos.copy_(nreal)
 
@@ -1258,14 +1319,20 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
         self._write_paged_swa_cache(kv_roped)
-        # Ring-buffer write via index_copy_ with an explicit [1] slot index:
-        # graph-safe (fixed shapes), unlike `buf[tensor] = value`.
-        slot = (self._decode_pos % self.window_size).reshape(1)
-        self._win_cache.index_copy_(0, slot, kv_roped.reshape(1, -1))
-        self._decode_pos.add_(1)
-        self._win_n.add_(1).clamp_(max=self.window_size)
-
         pos_flat = positions.reshape(-1)
+        r3 = self._read_paged_swa_window(pos_flat[-1], self.window_size)
+        if r3 is not None:
+            # R3: window straight from the paged SWA cache (no ring buffer).
+            win_kv, win_n, _start, _valid = r3
+            self._win_cache.copy_(win_kv)
+            self._win_n.copy_(win_n)
+        else:
+            # Ring-buffer write via index_copy_ with an explicit [1] slot index:
+            # graph-safe (fixed shapes), unlike `buf[tensor] = value`.
+            slot = (self._decode_pos % self.window_size).reshape(1)
+            self._win_cache.index_copy_(0, slot, kv_roped.reshape(1, -1))
+            self._decode_pos.add_(1)
+            self._win_n.add_(1).clamp_(max=self.window_size)
         is_prompt = torch.tensor(0, dtype=torch.int64, device=pos_flat.device)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
 
