@@ -1533,7 +1533,13 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         )
         if _dbg:
             print(f"[v4model] after hc_head shape={tuple(hidden_states.shape)}", flush=True)
-        hidden_states = self.norm(hidden_states)
+        # Use the manual fp32 RMSNorm instead of the vLLM RMSNorm module.
+        # HPURMSNorm.forward_oot calls habana FusedRMSNorm -> torch.ops.hpu.rms_norm,
+        # which FAILS to compile with force_static_compile on this stack
+        # (synStatus 26 "Can not compile graph", reproducible standalone; the
+        # rms_norm_fast path compiles but is inaccurate). The manual
+        # decomposition is what every layer norm already uses and compiles.
+        hidden_states = _rmsnorm(hidden_states, self.rms_norm_eps, self.norm.weight)
         if _dbg:
             print(f"[v4model] after norm shape={tuple(hidden_states.shape)}", flush=True)
         if hidden_shape is not None and len(hidden_shape) == 3:
