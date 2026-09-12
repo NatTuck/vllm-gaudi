@@ -7006,6 +7006,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         page_bytes = kv_cache_spec.page_size_bytes
                         dtype = kv_cache_spec.dtype
                         elem = torch.tensor([], dtype=dtype).element_size()
+                        _layer = self.vllm_config.compilation_config.static_forward_context.get(layer_name)
                         kv_caches[layer_name] = packed_backing.view(-1, block_stride)[:, offset:offset +
                                                                                           page_bytes].view(dtype)
                         # Stash a 2-D view of the packed backing + this group's
@@ -7015,7 +7016,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # index ops fail when the *indexed dim* >= 2**31 and the
                         # slab is ~1.9e10 elements; the 2-D view indexes dim 0
                         # (num_blocks+1) which is small. See stepP1_probe4.py.
-                        _layer = self.vllm_config.compilation_config.static_forward_context.get(layer_name)
                         if _layer is not None and page_bytes % elem == 0 and block_stride % elem == 0:
                             _layer._dsv4_slab2d = packed_backing.view(dtype).view(-1, block_stride // elem)
                             _layer._dsv4_page_off = offset // elem
