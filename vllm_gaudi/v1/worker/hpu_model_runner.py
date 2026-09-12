@@ -2775,6 +2775,50 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         aux: dict = {}
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if gid == 0:
+                # Compressed MLA cache (R5): per-token compressed-entry slot
+                # mapping. A token at position p owns compressed entry
+                # ci = (p+1)//ratio - 1 when (p+1) % ratio == 0; the entry lives
+                # at bt0[ci // storage_block_size]*sbs + ci % storage_block_size.
+                spec = group.kv_cache_spec
+                ratio = getattr(spec, "compress_ratio", 1)
+                if ratio <= 1:
+                    continue
+                sbs = spec.storage_block_size
+                bt0 = self.input_batch.block_table[0].get_cpu_tensor()
+                comp_lists: list[list[int]] = []
+                for i, req_idx in enumerate(req_indices):
+                    sl_i: list[int] = []
+                    for p in positions_per_req[i]:
+                        if (p + 1) % ratio == 0:
+                            ci = (p + 1) // ratio - 1
+                            physical = int(bt0[req_idx, ci // sbs])
+                            sl_i.append(physical * sbs + (ci % sbs))
+                        else:
+                            sl_i.append(-1)
+                    comp_lists.append(sl_i)
+                if pad_shape is not None:
+                    padded = align_and_pad(comp_lists, pad_shape, itertools.repeat(-1))
+                    cslots = [int(x) for row in padded for x in row]
+                else:
+                    cslots = [s for sl in comp_lists for s in sl]
+                if pad_shape is not None:
+                    t2r0 = [i for i in range(pad_shape[0]) for _ in range(pad_shape[1])]
+                else:
+                    t2r0 = [i for i, sl in enumerate(comp_lists) for _ in sl]
+                blf0 = None
+                if len(req_indices) == 1:
+                    blf0 = async_h2d_copy(bt0[req_indices[0], :].tolist(), dtype=torch.int64)
+                entry0 = {
+                    'slot_mapping': async_h2d_copy(cslots, dtype=torch.int64),
+                    'block_list_full': blf0,
+                    'block_size': sbs,
+                    'storage_block_size': sbs,
+                    'compress_ratio': ratio,
+                    'token_to_req_indices': async_h2d_copy(t2r0, dtype=torch.int32),
+                }
+                aux[gid] = entry0
+                for _ln in group.layer_names:
+                    aux[_ln] = entry0
                 continue
             bs = group.kv_cache_spec.block_size
             bt = self.input_batch.block_table[gid].get_cpu_tensor()

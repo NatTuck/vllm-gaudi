@@ -915,9 +915,40 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # s, s+rate, ... where s = (-(pos[0]+1)) % rate.
         s = (-(int(pos[0].item()) + 1)) % rate
         if s >= T:
-            return kv.new_zeros((0, D)), 0
+            return kv.new_zeros((0, D)), 0, None
         sel = torch.arange(s, T, rate, device=dev, dtype=torch.int64)
-        return comp_all.index_select(0, sel), int(sel.numel())
+        return comp_all.index_select(0, sel), int(sel.numel()), sel
+
+    def _write_paged_compressed(self, comp, sel, positions):
+        """R5: write the compressor's compressed entries into the paged
+        compressed-MLA cache (the attention layer's own cache, fp8).
+
+        ``sel`` indexes the real-token rows that completed a window; the aux
+        gid-0 entry carries the per-token compressed slot mapping.
+        """
+        from vllm.forward_context import get_forward_context
+
+        md = get_forward_context().attn_metadata
+        aux = getattr(md, "dsv4_aux_meta", None)
+        if not aux:
+            return
+        entry = aux.get(self.prefix)
+        if entry is None:
+            return
+        slab2d = getattr(self, "_dsv4_slab2d", None)
+        if slab2d is None:
+            return
+        T = positions.numel()
+        slots = entry["slot_mapping"][:T]
+        if sel is not None:
+            slots = slots[sel]
+        sbs = entry["storage_block_size"]
+        hd = self.head_dim
+        page = slab2d[:, self._dsv4_page_off:self._dsv4_page_off +
+                      self._dsv4_page_elems].view(-1, sbs, hd)
+        blocks = torch.div(slots, sbs, rounding_mode="floor")
+        offs = slots % sbs
+        page[blocks, offs] = comp.to(page.dtype)
 
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
@@ -992,9 +1023,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             # R4c: the paged compressor state is the source of truth (absolute
             # positions; no leftover/overlap buffers, and it fixes the manual
             # overlap-reset bug).
-            comp, nw_p = self._comp_state_paged(kv, gate, positions)
+            comp, nw_p, sel_p = self._comp_state_paged(kv, gate, positions)
             if comp is None:
                 _paged = False
+            else:
+                self._write_paged_compressed(comp, sel_p, positions)
         if not _paged:
             _nw_c, left_c, ck, cg = self._comp_store_shift(
                 self._c_win_kv, self._c_win_gate, self._c_win_n, kv, gate, rate)
@@ -1030,8 +1063,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             igate = hidden @ igate_w.t()
             _paged_i = _paged
             if _paged_i:
-                icomp, _nw_i = self._comp_state_paged(ikv, igate, positions,
-                                                      comp_module=idx.compressor, head_dim=idx_h)
+                icomp, _nw_i, _sel_i = self._comp_state_paged(ikv, igate, positions,
+                                                              comp_module=idx.compressor,
+                                                              head_dim=idx_h)
                 if icomp is None:
                     _paged_i = False
             if not _paged_i:
