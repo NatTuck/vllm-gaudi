@@ -785,6 +785,26 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         comp = _apply_rope(comp, pos, cache, rope_dim)
         return comp
 
+    def _dsv4_aux_entry(self, layer):
+        """Fetch the paged-KV metadata entry for an aux cache layer.
+
+        Prefers the layer prefix (the standard machinery key: metadata keyed by
+        layer name), falling back to the KV-cache group id.
+        """
+        from vllm.forward_context import get_forward_context
+
+        md = get_forward_context().attn_metadata
+        aux = getattr(md, "dsv4_aux_meta", None)
+        if not aux:
+            return None
+        prefix = getattr(layer, "prefix", None)
+        if prefix is not None and prefix in aux:
+            return aux[prefix]
+        gid = getattr(layer, "_kv_cache_gid", None)
+        if gid is not None and gid in aux:
+            return aux[gid]
+        return None
+
     def _comp_state_paged(self, kv, gate, positions):
         """R4b (WIP, NOT WIRED): recompute compressed entries from the paged
         compressor state.
@@ -802,21 +822,16 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         advanced-index/bool-index views; gate this from an isolated harness with
         controlled contiguous tensors first (see PLAN.md R4 feasibility).
         """
-        from vllm.forward_context import get_forward_context
-
         rate = self.compress_ratio
         D = self.head_dim
         coff = self._comp_coff
         layer = self.compressor.state_cache
-        gid = getattr(layer, "_kv_cache_gid", None)
-        md = get_forward_context().attn_metadata
-        aux = getattr(md, "dsv4_aux_meta", None)
-        if not aux or gid is None or gid not in aux:
+        info = self._dsv4_aux_entry(layer)
+        if info is None:
             return None, 0
         slab2d = getattr(layer, "_dsv4_slab2d", None)
         if slab2d is None:
             return None, 0
-        info = aux[gid]
         bl = info.get("block_list_full")
         if bl is None or bl.dim() != 1:
             return None, 0
@@ -1244,19 +1259,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         Scatter by (block, off) in place using the group's slot_mapping from the
         HPU attention metadata.
         """
-        from vllm.forward_context import get_forward_context
-
-        md = get_forward_context().attn_metadata
-        aux = getattr(md, "dsv4_aux_meta", None)
-        if not aux:
-            return
-        gid = getattr(self.swa_cache_layer, "_kv_cache_gid", None)
-        if gid is None or gid not in aux:
+        info = self._dsv4_aux_entry(self.swa_cache_layer)
+        if info is None:
             return
         slab2d = getattr(self.swa_cache_layer, "_dsv4_slab2d", None)
         if slab2d is None:
             return
-        info = aux[gid]
         slots = info["slot_mapping"]
         bs = info["block_size"]
         head_dim = self.head_dim
@@ -1281,20 +1289,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         Graph-safe: positions -> logical block -> physical block via the
         request's full block table, then ``page[phys, off]`` advanced indexing.
         """
-        from vllm.forward_context import get_forward_context
-
-        md = get_forward_context().attn_metadata
-        aux = getattr(md, "dsv4_aux_meta", None)
-        if not aux:
-            return None
-        gid = getattr(self.swa_cache_layer, "_kv_cache_gid", None)
-        if gid is None or gid not in aux:
-            return None
         layer = self.swa_cache_layer
+        info = self._dsv4_aux_entry(layer)
+        if info is None:
+            return None
         slab2d = getattr(layer, "_dsv4_slab2d", None)
         if slab2d is None:
             return None
-        info = aux[gid]
         bl = info.get("block_list_full")
         if bl is None or bl.dim() != 1:
             return None

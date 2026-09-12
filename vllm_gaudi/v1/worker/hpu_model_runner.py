@@ -2805,12 +2805,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             block_list_full = None
             if len(req_indices) == 1:
                 block_list_full = async_h2d_copy(bt[req_indices[0], :].tolist(), dtype=torch.int64)
-            aux[gid] = {
+            # token -> request mapping (standard machinery field). The padded
+            # flattened order is row-major over (batch, seq), one request per row.
+            if pad_shape is not None:
+                t2r = [i for i in range(pad_shape[0]) for _ in range(pad_shape[1])]
+            else:
+                t2r = [i for i, sl in enumerate(slot_lists) for _ in sl]
+            entry = {
                 'slot_mapping': async_h2d_copy(slots, dtype=torch.int64),
                 'block_list': async_h2d_copy(blocks, dtype=torch.int64),
                 'block_list_full': block_list_full,
                 'block_size': bs,
+                'token_to_req_indices': async_h2d_copy(t2r, dtype=torch.int32),
             }
+            # Key by gid (legacy) AND by each layer prefix (standard machinery
+            # shape: attn_metadata keyed by layer name).
+            aux[gid] = entry
+            for _ln in group.layer_names:
+                aux[_ln] = entry
         return aux
 
     def _form_prefill_batch(self, contents):
