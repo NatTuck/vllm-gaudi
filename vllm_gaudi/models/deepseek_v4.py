@@ -785,6 +785,91 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         comp = _apply_rope(comp, pos, cache, rope_dim)
         return comp
 
+    def _comp_state_paged(self, kv, gate, positions):
+        """R4b (WIP, NOT WIRED): recompute compressed entries from the paged
+        compressor state.
+
+        Writes this batch's per-token ``(kv, gate)`` state (fp32) to the
+        compressor state cache at its slots, then reads the completed windows
+        back and computes the compressed entries with the same math as
+        ``_comp_windows``/``_comp_windows_hca`` but addressed by **absolute
+        positions** -- no leftover/overlap buffers. Returns ``(comp [nw, D],
+        nw)`` or ``(None, 0)`` when the paged state cache is unavailable.
+
+        FIXME(R4b): not called yet. In-engine gating hits HPU tensor-view
+        quirks ("when accessing base meta, tensor size should match the storage
+        size") from the bool-masked/non-contiguous ``positions`` and from
+        advanced-index/bool-index views; gate this from an isolated harness with
+        controlled contiguous tensors first (see PLAN.md R4 feasibility).
+        """
+        from vllm.forward_context import get_forward_context
+
+        rate = self.compress_ratio
+        D = self.head_dim
+        coff = self._comp_coff
+        layer = self.compressor.state_cache
+        gid = getattr(layer, "_kv_cache_gid", None)
+        md = get_forward_context().attn_metadata
+        aux = getattr(md, "dsv4_aux_meta", None)
+        if not aux or gid is None or gid not in aux:
+            return None, 0
+        slab2d = getattr(layer, "_dsv4_slab2d", None)
+        if slab2d is None:
+            return None, 0
+        info = aux[gid]
+        bl = info.get("block_list_full")
+        if bl is None or bl.dim() != 1:
+            return None, 0
+        slots = info["slot_mapping"]
+        bs = info["block_size"]
+        state_dim = 2 * coff * D
+        page = slab2d[:, layer._dsv4_page_off:layer._dsv4_page_off +
+                      layer._dsv4_page_elems].view(-1, bs, state_dim)
+        dev = kv.device
+        # Store this batch's per-token state (fp32): [kv | gate].
+        state = torch.cat([kv, gate], dim=-1).float()
+        blocks = torch.div(slots, bs, rounding_mode="floor")
+        offs = slots % bs
+        page[blocks, offs] = state
+
+        # Fully tensor-space window recompute (no host sync): treat every token
+        # as a candidate window end, then select the aligned ends. Window layout
+        # matches _comp_windows: CSA = [prev rate | cur rate] (prev = stream0,
+        # cur = stream1); HCA = [cur rate].
+        pos = positions.reshape(-1).to(torch.int64)
+        T = pos.numel()
+        win = 2 * rate if coff == 2 else rate
+        rel = torch.arange(-win + 1, 1, device=dev, dtype=torch.int64)
+        win_pos = pos.unsqueeze(1) + rel.unsqueeze(0)  # [T, win]
+        valid = win_pos >= 0
+        safe = win_pos.clamp(min=0)
+        phys = bl[torch.div(safe, bs, rounding_mode="floor")]
+        states = page[phys, safe % bs]  # [T, win, state_dim]
+        ape = self.compressor.ape  # [rate, coff*D]
+        ape_win = ape[safe % rate]  # [T, win, coff*D]
+        if coff == 2:
+            kv_prev = states[:, :rate, :D]
+            gate_prev = states[:, :rate, 2 * D:3 * D] + ape_win[:, :rate, :D]
+            kv_cur = states[:, rate:, D:2 * D]
+            gate_cur = states[:, rate:, 3 * D:4 * D] + ape_win[:, rate:, D:2 * D]
+            nk = torch.cat([kv_prev, kv_cur], dim=1)
+            ng = torch.cat([gate_prev, gate_cur], dim=1)
+        else:
+            nk = states[:, :, :D]
+            ng = states[:, :, D:2 * D] + ape_win[:, :, :D]
+        ng = ng.masked_fill(~valid.unsqueeze(-1), float("-inf"))
+        soft = torch.softmax(ng.float(), dim=1).to(nk.dtype)
+        comp_all = (nk * soft).sum(dim=1)  # [T, D]
+        comp_all = self._comp_rmsnorm(comp_all, self.compressor.norm.weight)
+        idx = torch.div(pos + 1, rate, rounding_mode="floor") - 1
+        comp_all = _apply_rope(comp_all, (idx * rate).clamp(min=0),
+                               self._compress_cache, self.rope_head_dim)
+        # Gate selection: the batch is a single request starting at position 0
+        # (the only case exercised), so the aligned window ends are the
+        # positions rate-1, 2*rate-1, ... (avoids HPU bool-index views).
+        sel = torch.arange(rate - 1, T, rate, device=dev, dtype=torch.int64)
+        return comp_all.index_select(0, sel), int(sel.numel())
+
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
         # nw is a Python int; wrap it as a device tensor so torch.where is valid
