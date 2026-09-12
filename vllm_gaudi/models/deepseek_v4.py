@@ -841,14 +841,21 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         slots = info["slot_mapping"][:kv.shape[0]].clone()
         bs = info["block_size"]
         state_dim = 2 * coff * D
-        page = slab2d[:, layer._dsv4_page_off:layer._dsv4_page_off +
-                      layer._dsv4_page_elems].view(-1, bs, state_dim)
+        off_elems = layer._dsv4_page_off
+        pe = layer._dsv4_page_elems
         dev = kv.device
-        # Store this batch's per-token state (fp32): [kv | gate].
-        state = torch.cat([kv, gate], dim=-1).float()
+        state = torch.cat([kv, gate], dim=-1)
         blocks = torch.div(slots, bs, rounding_mode="floor")
         offs = slots % bs
-        page[blocks, offs] = state
+        # b2: per-token slice copy_ (eager, no advanced indexing / no strided
+        # 3-D view). The advanced-index scatter into the strided page fails
+        # in-engine; a contiguous 1-D slice copy on the 2-D slab avoids it.
+        state = state.float()
+        for t in range(kv.shape[0]):
+            b = int(blocks[t].item())
+            o = int(offs[t].item())
+            col0 = off_elems + o * state_dim
+            slab2d[b, col0:col0 + state_dim].copy_(state[t])
 
         # Fully tensor-space window recompute (no host sync): treat every token
         # as a candidate window end, then select the aligned ends. Window layout
@@ -856,25 +863,39 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # cur = stream1); HCA = [cur rate].
         pos = positions.reshape(-1).to(torch.int64)
         T = pos.numel()
+        if T < rate:
+            return kv.new_zeros((0, D)), 0
         win = 2 * rate if coff == 2 else rate
         rel = torch.arange(-win + 1, 1, device=dev, dtype=torch.int64)
         win_pos = pos.unsqueeze(1) + rel.unsqueeze(0)  # [T, win]
         valid = win_pos >= 0
         safe = win_pos.clamp(min=0)
         phys = bl[torch.div(safe, bs, rounding_mode="floor")]
-        states = page[phys, safe % bs]  # [T, win, state_dim]
-        ape = self.compressor.ape  # [rate, coff*D]
-        ape_win = ape[safe % rate]  # [T, win, coff*D]
+        # Read per window slot with contiguous 1-D slice copies: strided 3-D
+        # index_select/gather on the fp32 page fails in-engine (fp8 SWA works).
+        K = T * win
+        phys_flat = phys.reshape(-1)
+        off_flat = (safe % bs).reshape(-1)
+        rows = torch.zeros(K, state_dim, device=dev, dtype=torch.float32)
+        for i in range(K):
+            b = int(phys_flat[i].item())
+            o = int(off_flat[i].item())
+            col0 = off_elems + o * state_dim
+            rows[i].copy_(slab2d[b, col0:col0 + state_dim])
+        # kv stays bf16 (as the manual buffers); gates are fp32 after ape.
+        states = rows.view(T, win, state_dim).to(torch.bfloat16)
+        ape = self.compressor.ape  # [rate, coff*D] fp32
+        ape_win = ape[safe % rate]  # [T, win, coff*D] fp32
         if coff == 2:
             kv_prev = states[:, :rate, :D]
-            gate_prev = states[:, :rate, 2 * D:3 * D] + ape_win[:, :rate, :D]
+            gate_prev = states[:, :rate, 2 * D:3 * D].float() + ape_win[:, :rate, :D]
             kv_cur = states[:, rate:, D:2 * D]
-            gate_cur = states[:, rate:, 3 * D:4 * D] + ape_win[:, rate:, D:2 * D]
+            gate_cur = states[:, rate:, 3 * D:4 * D].float() + ape_win[:, rate:, D:2 * D]
             nk = torch.cat([kv_prev, kv_cur], dim=1)
             ng = torch.cat([gate_prev, gate_cur], dim=1)
         else:
             nk = states[:, :, :D]
-            ng = states[:, :, D:2 * D] + ape_win[:, :, :D]
+            ng = states[:, :, D:2 * D].float() + ape_win[:, :, :D]
         ng = ng.masked_fill(~valid.unsqueeze(-1), float("-inf"))
         soft = torch.softmax(ng.float(), dim=1).to(nk.dtype)
         comp_all = (nk * soft).sum(dim=1)  # [T, D]
@@ -964,6 +985,18 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         else:
             comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
                                           norm_w, cache, self.rope_head_dim)
+        if __import__("os").environ.get("DSV4_COMP_STATE") == "1" and real is not None:
+            from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
+            if dsv4_paged_kv_enabled():
+                comp_p, nw_p = self._comp_state_paged(kv, gate, positions)
+                if comp_p is not None and comp_p.shape == comp.shape:
+                    d = (comp_p.float() - comp.float()).abs()
+                    print(f"[R4b] manual={tuple(comp.shape)} paged={tuple(comp_p.shape)} "
+                          f"max|diff|={d.max().item():.3e} mean={d.mean().item():.3e}",
+                          flush=True)
+                else:
+                    pm = None if comp_p is None else tuple(comp_p.shape)
+                    print(f"[R4b] manual={tuple(comp.shape)} paged={pm}", flush=True)
         self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
         self._c_n += comp.shape[0]
         if rate == 4:
@@ -1262,6 +1295,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         Scatter by (block, off) in place using the group's slot_mapping from the
         HPU attention metadata.
         """
+        if __import__("os").environ.get("DSV4_R4B_NOSWA") == "1":
+            return
         info = self._dsv4_aux_entry(self.swa_cache_layer)
         if info is None:
             return
