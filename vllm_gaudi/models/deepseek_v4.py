@@ -863,7 +863,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # cur = stream1); HCA = [cur rate].
         pos = positions.reshape(-1).to(torch.int64)
         T = pos.numel()
-        if T < rate:
+        if T == 0:
             return kv.new_zeros((0, D)), 0
         win = 2 * rate if coff == 2 else rate
         rel = torch.arange(-win + 1, 1, device=dev, dtype=torch.int64)
@@ -903,10 +903,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         idx = torch.div(pos + 1, rate, rounding_mode="floor") - 1
         comp_all = _apply_rope(comp_all, (idx * rate).clamp(min=0),
                                self._compress_cache, self.rope_head_dim)
-        # Gate selection: the batch is a single request starting at position 0
-        # (the only case exercised), so the aligned window ends are the
-        # positions rate-1, 2*rate-1, ... (avoids HPU bool-index views).
-        sel = torch.arange(rate - 1, T, rate, device=dev, dtype=torch.int64)
+        # Gate selection by ABSOLUTE position: window ends are positions e with
+        # (e+1) % rate == 0. For a contiguous batch the ends are
+        # s, s+rate, ... where s = (-(pos[0]+1)) % rate.
+        s = (-(int(pos[0].item()) + 1)) % rate
+        if s >= T:
+            return kv.new_zeros((0, D)), 0
+        sel = torch.arange(s, T, rate, device=dev, dtype=torch.int64)
         return comp_all.index_select(0, sel), int(sel.numel())
 
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
@@ -975,33 +978,35 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                   f"c_win_n={self._c_win_n} rate={rate}", flush=True)
         kv = hidden @ kv_w.t()
         gate = hidden @ gate_w.t()
-        _nw_c, left_c, ck, cg = self._comp_store_shift(
-            self._c_win_kv, self._c_win_gate, self._c_win_n, kv, gate, rate)
-        self._c_win_n = torch.tensor(left_c, dtype=torch.int64, device=dev)
-        if rate == 4:
-            comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
-                                      norm_w, cache, self._c_ovl_n,
-                                      self._c_ovl_kv, self._c_ovl_gate, self.rope_head_dim)
+        from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
+        _env = __import__("os").environ
+        _paged = dsv4_paged_kv_enabled() and _env.get("DSV4_COMP_STATE_USE") == "1"
+        if _paged:
+            # R4c: the paged compressor state is the source of truth (absolute
+            # positions; no leftover/overlap buffers, and it fixes the manual
+            # overlap-reset bug).
+            comp, nw_p = self._comp_state_paged(kv, gate, positions)
+            if comp is None:
+                _paged = False
+        if not _paged:
+            _nw_c, left_c, ck, cg = self._comp_store_shift(
+                self._c_win_kv, self._c_win_gate, self._c_win_n, kv, gate, rate)
+            self._c_win_n = torch.tensor(left_c, dtype=torch.int64, device=dev)
+            if rate == 4:
+                comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
+                                          norm_w, cache, self._c_ovl_n,
+                                          self._c_ovl_kv, self._c_ovl_gate, self.rope_head_dim)
+            else:
+                comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
+                                              norm_w, cache, self.rope_head_dim)
+            self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
+            self._c_n += comp.shape[0]
+            if rate == 4:
+                self._comp_fill_overlap(ck, cg, D, rate, ape,
+                                        self._c_ovl_kv, self._c_ovl_gate, self._c_ovl_n)
         else:
-            comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
-                                          norm_w, cache, self.rope_head_dim)
-        if __import__("os").environ.get("DSV4_COMP_STATE") == "1" and real is not None:
-            from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
-            if dsv4_paged_kv_enabled():
-                comp_p, nw_p = self._comp_state_paged(kv, gate, positions)
-                if comp_p is not None and comp_p.shape == comp.shape:
-                    d = (comp_p.float() - comp.float()).abs()
-                    print(f"[R4b] manual={tuple(comp.shape)} paged={tuple(comp_p.shape)} "
-                          f"max|diff|={d.max().item():.3e} mean={d.mean().item():.3e}",
-                          flush=True)
-                else:
-                    pm = None if comp_p is None else tuple(comp_p.shape)
-                    print(f"[R4b] manual={tuple(comp.shape)} paged={pm}", flush=True)
-        self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
-        self._c_n += comp.shape[0]
-        if rate == 4:
-            self._comp_fill_overlap(ck, cg, D, rate, ape,
-                                    self._c_ovl_kv, self._c_ovl_gate, self._c_ovl_n)
+            self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
+            self._c_n += comp.shape[0]
         compressed_kv_full = self._c_comp
 
         # ---- indexer (only CSA, ratio 4) ----
