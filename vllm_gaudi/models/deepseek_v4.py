@@ -805,28 +805,35 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             return aux[gid]
         return None
 
-    def _comp_state_paged(self, kv, gate, positions):
-        """R4b (WIP, NOT WIRED): recompute compressed entries from the paged
-        compressor state.
+    def _comp_state_paged(self, kv, gate, positions, comp_module=None, head_dim=None):
+        """R4: recompute compressed entries from the paged compressor state.
 
-        Writes this batch's per-token ``(kv, gate)`` state (fp32) to the
-        compressor state cache at its slots, then reads the completed windows
-        back and computes the compressed entries with the same math as
+        Writes this batch's per-token ``(kv, gate)`` state to the compressor
+        state cache at its slots, then reads the completed windows back and
+        computes the compressed entries with the same math as
         ``_comp_windows``/``_comp_windows_hca`` but addressed by **absolute
-        positions** -- no leftover/overlap buffers. Returns ``(comp [nw, D],
-        nw)`` or ``(None, 0)`` when the paged state cache is unavailable.
+        positions** -- no leftover/overlap buffers (and it fixes the manual
+        overlap-reset bug). Returns ``(comp [nw, head_dim], nw)`` or
+        ``(None, 0)`` when the paged state cache is unavailable.
 
-        FIXME(R4b): not called yet. In-engine, the fp32 strided state write
-        ``page[blocks, offs] = state`` raises "when accessing base meta, tensor
-        size should match the storage size" (the same op is bit-exact in an
-        isolated probe, full-size fp32, so it is an HPU interaction with the
-        model's large graph / shared backing). Workarounds to try: write via a
-        dedicated contiguous state cache, or a custom op. See JOURNAL 2026-09-12.
+        ``comp_module`` selects the main (``self.compressor``) or indexer
+        (``self.indexer.compressor``) compressor; ``head_dim`` overrides the
+        projected head width (indexer: 128).
+
+        NOTE: the state write/read use per-token contiguous 1-D slice copies
+        because strided 3-D advanced-index/index_select/gather on fp32/bf16
+        views of the packed backing fail in-engine (fp8 works). This is a
+        functional workaround; the graph-safe fast path is a custom HPU slot
+        scatter/gather (PLAN Phase C, item C0). See JOURNAL 2026-09-12.
         """
         rate = self.compress_ratio
-        D = self.head_dim
+        if comp_module is None:
+            comp_module = self.compressor
+        if head_dim is None:
+            head_dim = self.head_dim
+        D = head_dim
         coff = self._comp_coff
-        layer = self.compressor.state_cache
+        layer = comp_module.state_cache
         info = self._dsv4_aux_entry(layer)
         if info is None:
             return None, 0
@@ -884,7 +891,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             rows[i].copy_(slab2d[b, col0:col0 + state_dim])
         # kv stays bf16 (as the manual buffers); gates are fp32 after ape.
         states = rows.view(T, win, state_dim).to(torch.bfloat16)
-        ape = self.compressor.ape  # [rate, coff*D] fp32
+        ape = comp_module.ape  # [rate, coff*D] fp32
         ape_win = ape[safe % rate]  # [T, win, coff*D] fp32
         if coff == 2:
             kv_prev = states[:, :rate, :D]
@@ -899,7 +906,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         ng = ng.masked_fill(~valid.unsqueeze(-1), float("-inf"))
         soft = torch.softmax(ng.float(), dim=1).to(nk.dtype)
         comp_all = (nk * soft).sum(dim=1)  # [T, D]
-        comp_all = self._comp_rmsnorm(comp_all, self.compressor.norm.weight)
+        comp_all = self._comp_rmsnorm(comp_all, comp_module.norm.weight)
         idx = torch.div(pos + 1, rate, rounding_mode="floor") - 1
         comp_all = _apply_rope(comp_all, (idx * rate).clamp(min=0),
                                self._compress_cache, self.rope_head_dim)
@@ -1021,16 +1028,23 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             inorm_w = idx.compressor.norm.weight
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
-            _nw_i, left_i, ik, ig = self._comp_store_shift(
-                self._i_win_kv, self._i_win_gate, self._i_win_n, ikv, igate, rate)
-            self._i_win_n = torch.tensor(left_i, dtype=torch.int64, device=dev)
-            icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
-                                       inorm_w, cache, self._i_ovl_n,
-                                       self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
+            _paged_i = _paged
+            if _paged_i:
+                icomp, _nw_i = self._comp_state_paged(ikv, igate, positions,
+                                                      comp_module=idx.compressor, head_dim=idx_h)
+                if icomp is None:
+                    _paged_i = False
+            if not _paged_i:
+                _nw_i, left_i, ik, ig = self._comp_store_shift(
+                    self._i_win_kv, self._i_win_gate, self._i_win_n, ikv, igate, rate)
+                self._i_win_n = torch.tensor(left_i, dtype=torch.int64, device=dev)
+                icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
+                                           inorm_w, cache, self._i_ovl_n,
+                                           self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
+                self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
+                                        self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
             self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
             self._i_n += icomp.shape[0]
-            self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
-                                    self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
             idx_compressed = self._i_comp
         else:
             idx_h = D
