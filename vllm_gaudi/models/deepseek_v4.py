@@ -948,7 +948,90 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                       self._dsv4_page_elems].view(-1, sbs, hd)
         blocks = torch.div(slots, sbs, rounding_mode="floor")
         offs = slots % sbs
-        page[blocks, offs] = comp.to(page.dtype)
+        # NOTE: this method runs in the graph-disabled (eager) compressor, and
+        # eager advanced-index scatter on the strided fp8 page view is a silent
+        # no-op on HPU (it works only inside a compiled graph, e.g. the SWA
+        # write). Write each new entry with a contiguous 1-D slice copy instead;
+        # the graph-safe fast path is the custom HPU slot op (PLAN C0).
+        comp_fp8 = comp.to(page.dtype)
+        off_elems = self._dsv4_page_off
+        for i in range(comp.shape[0]):
+            b = int(blocks[i].item())
+            o = int(offs[i].item())
+            col0 = off_elems + o * hd
+            slab2d[b, col0:col0 + hd].copy_(comp_fp8[i])
+        if __import__("os").environ.get("DSV4_R6_DEBUG") == "1" and comp.shape[0] > 0:
+            _b0 = int(blocks[0].item())
+            _o0 = int(offs[0].item())
+            _probe = slab2d[_b0, off_elems + _o0 * hd:off_elems + _o0 * hd + 3].to(
+                torch.bfloat16).float().tolist()
+            print(f"[R5-write] layer={getattr(self, '_layer_idx', '?')} n={comp.shape[0]} "
+                  f"block={_b0} off={_o0} "
+                  f"val0={comp[0, :3].float().tolist()} probe={_probe} "
+                  f"page_off={self._dsv4_page_off} "
+                  f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
+
+    def _read_paged_compressed(self, cap):
+        """R6: gather the compressed entries ``[cap, head_dim]`` from the paged
+        compressed-MLA cache (written by R5) by global block/slot id.
+
+        Entry ``ci`` lives at physical slot
+        ``bt0[ci // storage_block_size] * sbs + ci % storage_block_size``, so
+        block ``b`` holds entries ``[b*sbs, (b+1)*sbs)`` in order: selecting the
+        request's physical blocks in logical order and reshaping gives the
+        entries in ``ci`` order. Entries beyond the live count are masked out by
+        the caller. The cache is fp8, so selected blocks are cast to bf16 before
+        the read (HPU has no fp8 gather kernel). Returns None when the paged path
+        is unavailable.
+        """
+        from vllm.forward_context import get_forward_context
+
+        md = get_forward_context().attn_metadata
+        aux = getattr(md, "dsv4_aux_meta", None)
+        _dbg = __import__("os").environ.get("DSV4_R6_DEBUG") == "1"
+        if _dbg:
+            print(f"[R6-enter] prefix={self.prefix!r} has_aux={bool(aux)} "
+                  f"slab={getattr(self, '_dsv4_slab2d', None) is not None}", flush=True)
+        if not aux:
+            return None
+        entry = aux.get(self.prefix)
+        if entry is None:
+            if _dbg:
+                print(f"[R6] no aux entry for prefix={self.prefix!r}; "
+                      f"keys={list(aux.keys())[:6]}", flush=True)
+            return None
+        slab2d = getattr(self, "_dsv4_slab2d", None)
+        if slab2d is None:
+            return None
+        bl = entry.get("block_list_full")
+        if bl is None or bl.dim() != 1:
+            if _dbg:
+                print(f"[R6] block_list_full missing for prefix={self.prefix!r}",
+                      flush=True)
+            return None
+        sbs = entry["storage_block_size"]
+        hd = self.head_dim
+        page = slab2d[:, self._dsv4_page_off:self._dsv4_page_off +
+                      self._dsv4_page_elems].view(-1, sbs, hd)
+        nblocks = (cap + sbs - 1) // sbs
+        logical = torch.arange(nblocks, device=bl.device, dtype=torch.int64)
+        logical = logical.clamp(max=bl.numel() - 1)
+        phys = bl[logical].clamp(min=0)
+        pages = page.index_select(0, phys).to(torch.bfloat16)  # [nblocks, sbs, hd]
+        comp = pages.reshape(-1, hd)[:cap]
+        if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
+            live = int(self._c_n)
+            if live > 0:
+                ref = self._c_comp[:live]
+                got = comp[:live].float()
+                d = (got - ref.float()).abs().max().item()
+                r = d / ref.float().abs().max().clamp(min=1e-6).item()
+                print(f"[R6] layer={getattr(self, '_layer_idx', '?')} live={live} "
+                      f"max_abs_diff={d:.4g} rel={r:.3%} cache_dtype={page.dtype} "
+                      f"bl0={int(bl[0])} phys0={int(phys[0])} got0={comp[0, :3].float().tolist()} "
+                      f"ref0={ref[0, :3].float().tolist()} page_off={self._dsv4_page_off} "
+                      f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
+        return comp
 
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
@@ -1047,7 +1130,17 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         else:
             self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
             self._c_n += comp.shape[0]
+        # R6: read the compressed entries back from the paged cache (the source
+        # of truth under DSV4_COMP_STATE_USE) rather than the manual buffer. The
+        # manual `_c_comp` remains the fallback when the read is unavailable.
         compressed_kv_full = self._c_comp
+        if _env.get("DSV4_R6_DEBUG") == "1":
+            print(f"[R6-decide] layer={getattr(self, '_layer_idx', '?')} "
+                  f"_paged={_paged} c_n={int(self._c_n)}", flush=True)
+        if _paged and _env.get("DSV4_COMP_READ_PAGED", "1") == "1":
+            _paged_comp = self._read_paged_compressed(self._cap)
+            if _paged_comp is not None:
+                compressed_kv_full = _paged_comp
 
         # ---- indexer (only CSA, ratio 4) ----
         has_idx = rate == 4 and self.indexer is not None

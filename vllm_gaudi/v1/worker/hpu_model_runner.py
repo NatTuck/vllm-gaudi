@@ -2774,51 +2774,64 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return None
         aux: dict = {}
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            if gid == 0:
-                # Compressed MLA cache (R5): per-token compressed-entry slot
+            spec = group.kv_cache_spec
+            per_layer = (spec.kv_cache_specs
+                         if isinstance(spec, UniformTypeKVCacheSpecs) else {ln: spec
+                                                                           for ln in group.layer_names})
+            first_spec = next(iter(per_layer.values()))
+            if __import__("os").environ.get("DSV4_AUX_DEBUG") == "1":
+                print(f"[AUX] gid={gid} spec={type(spec).__name__} "
+                      f"nlayers={len(group.layer_names)} "
+                      f"ratios={sorted({getattr(v, 'compress_ratio', 1) for v in per_layer.values()})} "
+                      f"blocks={sorted({getattr(v, 'block_size', -1) for v in per_layer.values()})}",
+                      flush=True)
+            if isinstance(first_spec, MLAAttentionSpec) and first_spec.compress_ratio > 1:
+                # Compressed MLA cache (R5/R6): per-token compressed-entry slot
                 # mapping. A token at position p owns compressed entry
                 # ci = (p+1)//ratio - 1 when (p+1) % ratio == 0; the entry lives
-                # at bt0[ci // storage_block_size]*sbs + ci % storage_block_size.
-                spec = group.kv_cache_spec
-                ratio = getattr(spec, "compress_ratio", 1)
-                if ratio <= 1:
-                    continue
-                sbs = spec.storage_block_size
-                bt0 = self.input_batch.block_table[0].get_cpu_tensor()
-                comp_lists: list[list[int]] = []
-                for i, req_idx in enumerate(req_indices):
-                    sl_i: list[int] = []
-                    for p in positions_per_req[i]:
-                        if (p + 1) % ratio == 0:
-                            ci = (p + 1) // ratio - 1
-                            physical = int(bt0[req_idx, ci // sbs])
-                            sl_i.append(physical * sbs + (ci % sbs))
-                        else:
-                            sl_i.append(-1)
-                    comp_lists.append(sl_i)
-                if pad_shape is not None:
-                    padded = align_and_pad(comp_lists, pad_shape, itertools.repeat(-1))
-                    cslots = [int(x) for row in padded for x in row]
-                else:
-                    cslots = [s for sl in comp_lists for s in sl]
-                if pad_shape is not None:
-                    t2r0 = [i for i in range(pad_shape[0]) for _ in range(pad_shape[1])]
-                else:
-                    t2r0 = [i for i, sl in enumerate(comp_lists) for _ in sl]
-                blf0 = None
-                if len(req_indices) == 1:
-                    blf0 = async_h2d_copy(bt0[req_indices[0], :].tolist(), dtype=torch.int64)
-                entry0 = {
-                    'slot_mapping': async_h2d_copy(cslots, dtype=torch.int64),
-                    'block_list_full': blf0,
-                    'block_size': sbs,
-                    'storage_block_size': sbs,
-                    'compress_ratio': ratio,
-                    'token_to_req_indices': async_h2d_copy(t2r0, dtype=torch.int32),
-                }
-                aux[gid] = entry0
+                # at bt[ci // storage_block_size]*sbs + ci % storage_block_size.
+                # Layers in one group share the compress ratio, but build one
+                # entry per distinct (ratio, sbs) to stay safe if they don't.
+                bt = self.input_batch.block_table[gid].get_cpu_tensor()
+                by_key: dict = {}
                 for _ln in group.layer_names:
-                    aux[_ln] = entry0
+                    _s = per_layer.get(_ln, first_spec)
+                    _r = getattr(_s, "compress_ratio", 1)
+                    if _r > 1:
+                        by_key.setdefault((_r, _s.storage_block_size), []).append(_ln)
+                for (ratio, sbs), lns in by_key.items():
+                    comp_lists: list[list[int]] = []
+                    for i, req_idx in enumerate(req_indices):
+                        sl_i: list[int] = []
+                        for p in positions_per_req[i]:
+                            if (p + 1) % ratio == 0:
+                                ci = (p + 1) // ratio - 1
+                                physical = int(bt[req_idx, ci // sbs])
+                                sl_i.append(physical * sbs + (ci % sbs))
+                            else:
+                                sl_i.append(-1)
+                        comp_lists.append(sl_i)
+                    if pad_shape is not None:
+                        padded = align_and_pad(comp_lists, pad_shape, itertools.repeat(-1))
+                        cslots = [int(x) for row in padded for x in row]
+                        t2r0 = [i for i in range(pad_shape[0]) for _ in range(pad_shape[1])]
+                    else:
+                        cslots = [s for sl in comp_lists for s in sl]
+                        t2r0 = [i for i, sl in enumerate(comp_lists) for _ in sl]
+                    blf0 = None
+                    if len(req_indices) == 1:
+                        blf0 = async_h2d_copy(bt[req_indices[0], :].tolist(), dtype=torch.int64)
+                    entry0 = {
+                        'slot_mapping': async_h2d_copy(cslots, dtype=torch.int64),
+                        'block_list_full': blf0,
+                        'block_size': sbs,
+                        'storage_block_size': sbs,
+                        'compress_ratio': ratio,
+                        'token_to_req_indices': async_h2d_copy(t2r0, dtype=torch.int32),
+                    }
+                    aux[gid] = entry0
+                    for _ln in lns:
+                        aux[_ln] = entry0
                 continue
             bs = group.kv_cache_spec.block_size
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
