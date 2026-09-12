@@ -816,11 +816,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         positions** -- no leftover/overlap buffers. Returns ``(comp [nw, D],
         nw)`` or ``(None, 0)`` when the paged state cache is unavailable.
 
-        FIXME(R4b): not called yet. In-engine gating hits HPU tensor-view
-        quirks ("when accessing base meta, tensor size should match the storage
-        size") from the bool-masked/non-contiguous ``positions`` and from
-        advanced-index/bool-index views; gate this from an isolated harness with
-        controlled contiguous tensors first (see PLAN.md R4 feasibility).
+        FIXME(R4b): not called yet. In-engine, the fp32 strided state write
+        ``page[blocks, offs] = state`` raises "when accessing base meta, tensor
+        size should match the storage size" (the same op is bit-exact in an
+        isolated probe, full-size fp32, so it is an HPU interaction with the
+        model's large graph / shared backing). Workarounds to try: write via a
+        dedicated contiguous state cache, or a custom op. See JOURNAL 2026-09-12.
         """
         rate = self.compress_ratio
         D = self.head_dim
@@ -835,7 +836,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         bl = info.get("block_list_full")
         if bl is None or bl.dim() != 1:
             return None, 0
-        slots = info["slot_mapping"]
+        # The aux slot_mapping is padded to the fixed batch shape; the compressor
+        # runs on real tokens only (the leading rows), so take the first T.
+        slots = info["slot_mapping"][:kv.shape[0]].clone()
         bs = info["block_size"]
         state_dim = 2 * coff * D
         page = slab2d[:, layer._dsv4_page_off:layer._dsv4_page_off +
