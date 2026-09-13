@@ -1037,10 +1037,16 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # Built once at load time (see _make_compress_cache); never build here.
         cache = self._compress_cache
 
-        # Reset the entry counters on prefill.
-        zero = torch.tensor(0, dtype=torch.int64, device=dev)
-        self._c_n = torch.where(is_prompt > 0, zero, self._c_n)
-        self._i_n = torch.where(is_prompt > 0, zero, self._i_n)
+        # Live compressed-entry count from ABSOLUTE positions: an entry ci exists
+        # for every window end e with (e+1) % rate == 0 and e <= last_pos, so the
+        # count through the last real position is (last_pos + 1) // rate. This is
+        # stateless, hence correct for chunked prefill / prefix caching. (A
+        # per-step counter reset on every prefill step forgets the previous
+        # chunk's entries -- the R10.1 chunked-prefill bug.)
+        _pos = positions.reshape(-1)
+        _last = _pos[-1] if _pos.numel() > 0 else torch.tensor(-1, dtype=torch.int64, device=dev)
+        self._c_n = ((_last + 1) // rate).to(torch.int64)
+        self._i_n = ((_last + 1) // 4).to(torch.int64)
 
         c = self.compressor
         fused = self._comp_weight(c.fused_wkv_wgate, hidden.shape[-1])
@@ -1059,7 +1065,6 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             sel_p = None
         if comp.shape[0] > 0:
             self._write_paged_compressed(comp, sel_p, positions)
-        self._c_n += comp.shape[0]
         # R6: read the compressed entries back from the paged cache (the source
         # of truth).
         compressed_kv_full = self._read_paged_compressed(self._cap)
@@ -1085,7 +1090,6 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             if icomp.shape[0] > 0:
                 # R7: write the indexer keys into the paged k_cache (fp8+scale).
                 self._write_paged_indexer(icomp, _sel_i, positions)
-            self._i_n += icomp.shape[0]
             idx_compressed = self._read_paged_indexer(self._cap)
             if idx_compressed is None:
                 idx_compressed = kv.new_zeros((self._cap, idx_h))
