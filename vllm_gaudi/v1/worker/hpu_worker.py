@@ -519,6 +519,26 @@ class HPUWorker(WorkerBase):
                     mamba_state_per_block, ratio)
                 available = adjusted
 
+        # R7: the DSv4 indexer k_cache is allocated in a dedicated (non-packed)
+        # backing to avoid cross-group corruption in the packed slab, so reserve
+        # its per-block memory. The packed block_stride is the largest group sum,
+        # which for DSv4 is the MLA group (main compressed + indexer k_caches).
+        if os.environ.get("DSV4_INDEXER_PAGED", "1") != "0":
+            from vllm.v1.kv_cache_interface import MLAAttentionSpec
+            idx_page = sum(s.page_size_bytes for n, s in kv_cache_spec.items()
+                           if n.endswith(".indexer.k_cache"))
+            mla_page = sum(s.page_size_bytes for s in kv_cache_spec.values()
+                           if isinstance(s, MLAAttentionSpec))
+            if idx_page > 0 and mla_page > idx_page:
+                factor = mla_page / (mla_page + idx_page)
+                adjusted = int(available * factor)
+                logger.info(
+                    "DSv4 indexer k_cache dedicated allocation: reducing "
+                    "available KV cache from %s to %s (mla_page=%d, idx_page=%d, "
+                    "factor=%.3f)", format_bytes(available), format_bytes(adjusted),
+                    mla_page, idx_page, factor)
+                available = adjusted
+
         # Core vLLM's determine_available_memory contract returns an int
         # (bytes). Most models route through get_num_blocks() which casts to
         # int, but gemma4's heterogeneous KV layout (interleaved sliding/full

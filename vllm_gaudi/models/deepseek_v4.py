@@ -1043,17 +1043,35 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             return None, None
         return layer, info
 
-    def _write_paged_indexer(self, icomp, sel, positions):
-        """R7: write the indexer compressed keys into the paged indexer k_cache.
+    def _quant_indexer_key(self, k):
+        """Quantize indexer keys to the paged k_cache format: fp8 + a per-token
+        fp32 scale, using the standard HPU fp8 path.
 
-        HPU stores the indexer keys in **bf16**: the official reference (and our
-        scorer) use bf16 indexer keys ("current implementation uses bf16" in
-        the checkpoint's inference/model.py), so the upstream fp8+scale layout
-        would quantize the top-k keys and diverge. Per-entry contiguous 1-D
-        slice copies (eager fp8/advanced-index scatter is a no-op).
+        ``k`` is ``[n, 128]`` bf16. Returns ``(x_fp8 [n,128], scale [n] fp32)``
+        where ``dequant = cast_from_fp8(x_fp8, scale)``. ``FP8_MAX`` is the HPU
+        native max (240 = e4m3fnuz on Gaudi2, 448 on Gaudi3), so the quantized
+        values stay in the hardware's representable range.
+        """
+        from vllm_gaudi.extension.ops import FP8_MAX
+        kf = k.to(torch.bfloat16)
+        amax = kf.float().abs().amax(dim=-1).clamp(min=1e-4)
+        scale = (amax / FP8_MAX).to(torch.float32)  # dequant multiplier
+        inv = (1.0 / scale).reshape(-1, 1)
+        x = torch.ops.hpu.cast_to_fp8_v2(kf, inv, False, False,
+                                         torch.float8_e4m3fn)[0]
+        return x, scale
+
+    def _write_paged_indexer(self, icomp, sel, positions):
+        """R7: write the indexer compressed keys into the paged indexer k_cache
+        as fp8 + a per-token fp32 scale.
+
+        The upstream k_cache layout is per block of ``sbs`` tokens:
+        ``[0, sbs*128)`` fp8 bytes, ``[sbs*128, sbs*128+sbs*4)`` fp32 scales.
+        Per-entry contiguous 1-D slice copies (eager fp8 advanced-index scatter
+        is a no-op on HPU).
         """
         layer, info = self._indexer_kcache_aux()
-        if layer is None:
+        if layer is None or icomp.shape[0] == 0:
             return
         slab2d = layer._dsv4_slab2d
         T = positions.numel()
@@ -1061,26 +1079,28 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if sel is not None:
             slots = slots[sel]
         sbs = info["storage_block_size"]
-        tok = self.indexer.head_dim  # semantic index head (128)
-        row = layer.head_dim  # storage row width (may include padding)
+        tok = self.indexer.head_dim  # 128 fp8 bytes/token
         off = layer._dsv4_page_off
+        fp8_elems = sbs * tok
         blocks = torch.div(slots, sbs, rounding_mode="floor")
         offs = slots % sbs
-        keys = icomp.to(torch.bfloat16)
+        x, scale = self._quant_indexer_key(icomp)
+        x_u8 = x.view(torch.uint8)
         for i in range(icomp.shape[0]):
             b = int(blocks[i].item())
             o = int(offs[i].item())
-            col0 = off + o * row
-            slab2d[b, col0:col0 + tok].copy_(keys[i])
+            col0 = off + o * tok
+            slab2d[b, col0:col0 + tok].copy_(x_u8[i])
+            scol0 = off + fp8_elems + o * 4
+            slab2d[b, scol0:scol0 + 4].copy_(scale[i:i + 1].view(torch.uint8))
 
     def _read_paged_indexer(self, cap):
         """R7: gather indexer compressed keys ``[cap, 128]`` from the paged
-        indexer k_cache (bf16).
+        indexer k_cache and dequantize (fp8 * per-token scale) to bf16.
 
-        Reads the live entries with per-entry contiguous 1-D slice copies:
-        strided ``index_select`` on a bf16 view of the packed backing fails on
-        HPU (fp8 works, which is why the R3/R6 reads use index_select). Entries
-        beyond the live count stay zero and are masked by the caller.
+        Entries beyond the live count stay zero and are masked by the caller.
+        The fp8 region is read with ``index_select`` on the strided page view
+        (fp8 strided reads work on HPU).
         """
         layer, info = self._indexer_kcache_aux()
         if layer is None:
@@ -1091,27 +1111,30 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         slab2d = layer._dsv4_slab2d
         sbs = info["storage_block_size"]
         tok = self.indexer.head_dim
-        row = layer.head_dim
         off = layer._dsv4_page_off
-        live = min(int(self._c_n), cap)
-        out = torch.zeros(cap, tok, dtype=torch.bfloat16, device=slab2d.device)
-        for ci in range(live):
-            logical = ci // sbs
-            if logical >= bl.numel():
-                break
-            b = int(bl[logical].item())
-            o = ci % sbs
-            col0 = off + o * row
-            out[ci].copy_(slab2d[b, col0:col0 + tok])
+        fp8_elems = sbs * tok
+        nblocks = (cap + sbs - 1) // sbs
+        logical = torch.arange(nblocks, device=bl.device, dtype=torch.int64)
+        logical = logical.clamp(max=bl.numel() - 1)
+        phys = bl[logical].clamp(min=0)
+        fp8_page = slab2d[:, off:off + fp8_elems].view(-1, sbs, tok)
+        sc_page = slab2d[:, off + fp8_elems:off + fp8_elems + sbs * 4].view(-1, sbs, 4)
+        x = fp8_page.index_select(0, phys).view(torch.float8_e4m3fn)
+        x = x.reshape(-1, tok)[:cap]
+        sc = sc_page.index_select(0, phys).view(torch.float32).reshape(-1)[:cap]
+        out = torch.ops.hpu.cast_from_fp8(x, sc.reshape(-1, 1), torch.bfloat16)
         if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
-            _ref = self._i_comp[:live].float()
-            _got = out[:live].float()
-            _d = (_got - _ref).abs().max().item() if live > 0 else -1.0
-            print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={live} "
-                  f"tok={tok} row={row} off={off} pe={layer._dsv4_page_elems} "
-                  f"bl0={int(bl[0])} diff={_d:.4g} "
-                  f"ref0={_ref[0, :3].tolist() if live else []} "
-                  f"got0={_got[0, :3].tolist() if live else []}", flush=True)
+            _live = min(int(self._c_n), cap)
+            if _live > 0:
+                _ref = self._i_comp[:_live].float()
+                _got = out[:_live].float()
+                _d = (_got - _ref).abs().max().item()
+                print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={_live} "
+                      f"tok={tok} off={off} pe={layer._dsv4_page_elems} "
+                      f"bl0={int(bl[0])} phys0={int(phys[0])} diff={_d:.4g} "
+                      f"ref_absmax={_ref.abs().max().item():.4g} "
+                      f"ref0={_ref[0, :3].tolist()} got0={_got[0, :3].tolist()} "
+                      f"c_n={int(self._c_n)} i_n={int(self._i_n)}", flush=True)
         return out
 
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
@@ -1251,15 +1274,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                                            self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
                 self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
                                         self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
-            elif _env.get("DSV4_INDEXER_PAGED", "0") == "1" and icomp is not None and icomp.shape[0] > 0:
-                # WIP (R7, gated off by default): write the indexer keys into the
-                # paged k_cache. The scorer keeps the reference-matching manual
-                # `_i_comp` until the paged indexer cache is fixed.
+            elif _env.get("DSV4_INDEXER_PAGED", "1") != "0" and icomp is not None and icomp.shape[0] > 0:
+                # R7: write the indexer keys into the paged k_cache (fp8+scale).
                 self._write_paged_indexer(icomp, _sel_i, positions)
             self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
             self._i_n += icomp.shape[0]
             idx_compressed = self._i_comp
-            if _paged_i and _env.get("DSV4_INDEXER_PAGED", "0") == "1":
+            if _paged_i and _env.get("DSV4_INDEXER_PAGED", "1") != "0":
                 _paged_ic = self._read_paged_indexer(self._cap)
                 if _paged_ic is not None:
                     idx_compressed = _paged_ic

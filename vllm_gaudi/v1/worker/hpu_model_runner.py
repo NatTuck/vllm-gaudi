@@ -1795,23 +1795,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     from vllm.models.deepseek_v4.compressor import CompressorStateCache
                     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-                    if isinstance(attn_module, DeepseekV4IndexerCache) and os.environ.get("DSV4_INDEXER_PAGED") == "1":
-                        # WIP (R7, gated off by default): HPU would store the
-                        # indexer compressed keys in bf16 (the reference uses
-                        # bf16 indexer keys; the upstream 132-byte fp8+scale
-                        # layout quantizes the top-k keys and diverges). This
-                        # spec override currently corrupts the packed layout
-                        # (overlapping offsets -> garbage reads), so it is off
-                        # until the layout is fixed.
-                        kv_cache_spec[layer_name] = MLAAttentionSpec(
-                            block_size=self.vllm_config.cache_config.block_size,
-                            num_kv_heads=1,
-                            head_size=attn_module.head_dim,
-                            dtype=torch.bfloat16,
-                            compress_ratio=attn_module.compress_ratio,
-                            cache_dtype_str="bfloat16",
-                        )
-                    elif isinstance(attn_module, (DeepseekV4SWACache, CompressorStateCache, DeepseekV4IndexerCache)):
+                    if isinstance(attn_module, (DeepseekV4SWACache, CompressorStateCache, DeepseekV4IndexerCache)):
+                        # The indexer k_cache keeps its upstream uint8/132-byte
+                        # layout (128 fp8 + 4 fp32 scale per token); R7 stores
+                        # the keys with the standard HPU fp8 path (FP8_MAX=240
+                        # e4m3fnuz on Gaudi2) into that layout.
                         spec = attn_module.get_kv_cache_spec(self.vllm_config)
                         if spec is not None:
                             kv_cache_spec[layer_name] = spec
@@ -2896,6 +2884,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             aux[gid] = entry
             for _ln in group.layer_names:
                 aux[_ln] = entry
+        if __import__("os").environ.get("DSV4_LAYOUT_DEBUG") == "1":
+            for _gid, _grp in enumerate(self.kv_cache_config.kv_cache_groups):
+                _bt = self.input_batch.block_table[_gid].get_cpu_tensor()
+                print(f"[BLK] gid={_gid} nlayers={len(_grp.layer_names)} "
+                      f"bt0={_bt[req_indices[0], :4].tolist()}", flush=True)
         return aux
 
     def _form_prefill_batch(self, contents):
@@ -7039,6 +7032,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     for ln in kv_cache_tensor.shared_by:
                         layer_packing[ln] = (kv_cache_tensor.offset, kv_cache_tensor.block_stride)
 
+            if os.environ.get("DSV4_LAYOUT_DEBUG") == "1" and layer_packing:
+                _spec_by_layer = {}
+                for _g in kv_cache_config.kv_cache_groups:
+                    _gs = _g.kv_cache_spec
+                    for _ln in _g.layer_names:
+                        _spec_by_layer[_ln] = (_gs.kv_cache_specs.get(_ln)
+                                               if isinstance(_gs, UniformTypeKVCacheSpecs) else _gs)
+                _ranges = []
+                for _ln, (_off, _bs) in layer_packing.items():
+                    _sp = _spec_by_layer.get(_ln)
+                    _pb = _sp.page_size_bytes if _sp is not None else -1
+                    _ranges.append((_off, _off + _pb, _ln, _pb, getattr(_sp, "dtype", None)))
+                _ranges.sort()
+                print(f"[LAYOUT] block_stride={next(iter(layer_packing.values()))[1]} "
+                      f"nlayers={len(_ranges)}", flush=True)
+                for _i, (_a, _b, _ln, _pb, _dt) in enumerate(_ranges):
+                    _ov = ""
+                    if _i + 1 < len(_ranges) and _ranges[_i + 1][0] < _b:
+                        _ov = f" OVERLAP->{_ranges[_i + 1][2]}"
+                    if "indexer" in _ln or _ov:
+                        print(f"[LAYOUT] {_ln} off={_a} end={_b} page={_pb} "
+                              f"dtype={_dt}{_ov}", flush=True)
+
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 for layer_name in kv_cache_tensor.shared_by:
                     # Get the correct spec for this layer
@@ -7080,6 +7096,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         dtype = kv_cache_spec.dtype
                         elem = torch.tensor([], dtype=dtype).element_size()
                         _layer = self.vllm_config.compilation_config.static_forward_context.get(layer_name)
+                        # R7: the indexer k_cache gets a dedicated backing. The
+                        # packed slab overlays groups, and on HPU different
+                        # groups share physical blocks (e.g. the SWA cache), so a
+                        # concurrently-written cache lands on the indexer's page
+                        # and corrupts it. A private allocation removes all
+                        # sharing (costs one extra page per indexer layer; the
+                        # packed slab still reserves its space).
+                        if os.environ.get("DSV4_INDEXER_PAGED", "1") != "0" and _layer is not None and \
+                                type(_layer).__name__ == "DeepseekV4IndexerCache":
+                            page_elems = page_bytes // elem
+                            backing = torch.zeros((num_blocks + 1) * page_bytes,
+                                                  dtype=torch.uint8, device=self.device)
+                            slab2d = backing.view(dtype).view(-1, page_elems)
+                            _layer._dsv4_slab2d = slab2d
+                            _layer._dsv4_page_off = 0
+                            _layer._dsv4_page_elems = page_elems
+                            kv_caches[layer_name] = slab2d
+                            continue
                         kv_caches[layer_name] = packed_backing.view(-1, block_stride)[:, offset:offset +
                                                                                           page_bytes].view(dtype)
                         # Stash a 2-D view of the packed backing + this group's
