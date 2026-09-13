@@ -1650,16 +1650,15 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         nreal = real.long().sum()
         r3 = self._read_paged_swa_window(pos_flat[nreal - 1], W)
         if r3 is not None:
-            # R3: read the window from the paged SWA cache (supports chunked
-            # prefill; window positions come from the request's block table).
+            # R3/R8: the window comes straight from the paged SWA cache and is
+            # used directly (no manual `_win_cache` staging); window positions
+            # come from the request's block table (supports chunked prefill).
             win_kv, win_n, start, _valid = r3
-            self._win_cache.copy_(win_kv)
-            self._win_n.copy_(win_n)
         else:
             start = torch.clamp(nreal - W, min=0)
             win_idx = (start + torch.arange(W, device=dev)).clamp(max=T - 1)
-            self._win_cache.copy_(kv_roped.gather(0, win_idx[:, None].expand(-1, D)))
-            self._win_n.copy_(torch.clamp(nreal, max=W))
+            win_kv = kv_roped.gather(0, win_idx[:, None].expand(-1, D))
+            win_n = torch.clamp(nreal, max=W)
         # decode appends at the next free ring slot = number of real tokens seen.
         self._decode_pos.copy_(nreal)
 
@@ -1668,13 +1667,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             hidden_states, qr, pos_flat, is_prompt, real)
 
         cap = self._cap
-        past_kv = torch.cat([self._win_cache, comp_full], dim=0)
+        past_kv = torch.cat([win_kv, comp_full], dim=0)
         past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
 
         # Window mask: real query rows attend present, causal window slots;
         # padding query rows attend every slot (finite, discarded).
         win_ids = torch.arange(W, device=dev)
-        win_present = win_ids < self._win_n
+        win_present = win_ids < win_n
         win_pos = start + win_ids
         win_mask = (win_pos[None, :] <= pos_flat[:, None]) & win_present[None, :]
         win_mask = win_mask | (~real)[:, None]
@@ -1703,10 +1702,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         pos_flat = positions.reshape(-1)
         r3 = self._read_paged_swa_window(pos_flat[-1], self.window_size)
         if r3 is not None:
-            # R3: window straight from the paged SWA cache (no ring buffer).
+            # R3/R8: window straight from the paged SWA cache (no ring buffer,
+            # no manual `_win_cache` staging).
             win_kv, win_n, _start, _valid = r3
-            self._win_cache.copy_(win_kv)
-            self._win_n.copy_(win_n)
         else:
             # Ring-buffer write via index_copy_ with an explicit [1] slot index:
             # graph-safe (fixed shapes), unlike `buf[tensor] = value`.
@@ -1714,17 +1712,19 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             self._win_cache.index_copy_(0, slot, kv_roped.reshape(1, -1))
             self._decode_pos.add_(1)
             self._win_n.add_(1).clamp_(max=self.window_size)
+            win_kv = self._win_cache
+            win_n = self._win_n
         is_prompt = torch.tensor(0, dtype=torch.int64, device=pos_flat.device)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
 
         cap = self._cap
-        past_kv = torch.cat([self._win_cache, comp_full], dim=0)
+        past_kv = torch.cat([win_kv, comp_full], dim=0)
         past_kv = past_kv.unsqueeze(1).expand(-1, self.n_local_heads, self.head_dim)
 
-        # Decode attends its real past context in the window: the first _win_n
+        # Decode attends its real past context in the window: the first win_n
         # slots (ring not yet full) or all slots once the ring is full.
         win_ids = torch.arange(self.window_size, device=pos_flat.device)
-        win_present = (win_ids < self._win_n).unsqueeze(0)  # [1, WIN]
+        win_present = (win_ids < win_n).unsqueeze(0)  # [1, WIN]
         comp_ids = torch.arange(cap, device=pos_flat.device)
         comp_present = comp_ids.unsqueeze(0) < comp_n.unsqueeze(-1)
         mask = torch.cat([win_present, comp_present], dim=-1)
