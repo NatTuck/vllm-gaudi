@@ -2772,10 +2772,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         size. ``pad_shape`` (prefill) pads each group's per-req slot lists to the
         fixed batch shape with the PAD block's first slot, so the returned
         ``slot_mapping`` has the same flattened length as the forward's padded
-        ``kv_roped`` rows. Returns None when the paged path is disabled.
+        ``kv_roped`` rows.
         """
-        if not dsv4_paged_kv_enabled():
-            return None
         aux: dict = {}
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
             spec = group.kv_cache_spec

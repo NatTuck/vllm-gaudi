@@ -526,17 +526,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             torch.full((self.n_heads,), -float("inf"), dtype=torch.float32),
             requires_grad=False,
         )
-        # Window KV cache as ring buffer with tensor counter
-        self._win_cache_device = self.fused_wqa_wkv.weight.device
         _ws = getattr(self, "window_size", 128)
         print(f"[HPU_ATTN] window_size from base={_ws}, forcing to 128", flush=True)
         self.window_size = 128
-        self._win_cache = torch.zeros(
-            self.window_size, self.head_dim,
-            dtype=torch.bfloat16, device=self._win_cache_device,
-        )
-        self._win_n = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
-        self._decode_pos = torch.tensor(0, dtype=torch.int64, device=self._win_cache.device)
 
         # Compressor kernel state — flat tensor attributes, no dict
         vllm_config = kwargs.get("vllm_config", None) or (args[0] if args else None)
@@ -544,31 +536,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._compress_cache = None
         self._comp_coff = 2 if self.compress_ratio == 4 else 1
         self._cap = 0
-        # Window buffers (allocated at first compressor use)
-        self._c_win_kv = torch.empty(0)
-        self._c_win_gate = torch.empty(0)
-        self._c_win_n = torch.tensor(0, dtype=torch.int64)
-        self._i_win_kv = torch.empty(0)
-        self._i_win_gate = torch.empty(0)
-        self._i_win_n = torch.tensor(0, dtype=torch.int64)
-        # Compressed KV capacity buffers
-        self._c_comp = torch.empty(0)
+        # Completed-window entry counters (R9: the paged caches hold the data).
         self._c_n = torch.tensor(0, dtype=torch.int64)
-        self._i_comp = torch.empty(0)
         self._i_n = torch.tensor(0, dtype=torch.int64)
-        # Overlap buffers
-        self._c_ovl_kv = torch.empty(0)
-        self._c_ovl_gate = torch.empty(0)
-        self._c_ovl_n = torch.tensor(0, dtype=torch.int64)
-        self._i_ovl_kv = torch.empty(0)
-        self._i_ovl_gate = torch.empty(0)
-        self._i_ovl_n = torch.tensor(0, dtype=torch.int64)
 
-        # Under the paged-KV flag the indexer k_cache must advertise an
-        # HPU-friendly supported kernel block size (see HPUDeepseekV4IndexerBackend).
-        from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
-
-        if dsv4_paged_kv_enabled() and getattr(self, "indexer", None) is not None:
+        # The indexer k_cache must advertise an HPU-friendly supported kernel
+        # block size (see HPUDeepseekV4IndexerBackend).
+        if getattr(self, "indexer", None) is not None:
             self.indexer.k_cache.get_attn_backend = lambda: HPUDeepseekV4IndexerBackend
 
     @classmethod
@@ -576,13 +550,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         return num_heads
 
     def get_kv_cache_spec(self, vllm_config):
-        from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
-
-        if dsv4_paged_kv_enabled():
-            # R1: upstream-faithful spec — the compressed MLA cache for
-            # compress_ratio > 1, None for the SWA-only layers (their cache is
-            # the separately registered ``swa_cache`` module).
-            return super().get_kv_cache_spec(vllm_config)
+        # R1: upstream-faithful spec — the compressed MLA cache for
+        # compress_ratio > 1, None for the SWA-only layers (their cache is the
+        # separately registered ``swa_cache`` module).
+        return super().get_kv_cache_spec(vllm_config)
 
         # The dense-MLA fallback computes attention over the full context in
         # torch and does not read the paged KV cache, but the HPU worker still
@@ -681,23 +652,6 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         cos = freqs.cos() * scale
         sin = freqs.sin() * scale
         self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
-        idx_h = self.indexer.head_dim if (rate == 4 and self.indexer is not None) else D
-        max_tokens = rate * 2 + 128  # prefill up to 128 tokens + leftover
-        # The stored per-token kv/gate width is coff*D (CSA rate4 keeps two
-        # streams -> 2*D; HCA keeps one -> D). Sizing by coff*D keeps the
-        # window buffer width == the projected kv width for both layer types.
-        cwid = self._comp_coff * D
-        self._c_win_kv = torch.zeros(max_tokens, cwid, dtype=torch.bfloat16, device=dev)
-        self._c_win_gate = torch.zeros(max_tokens, cwid, dtype=torch.bfloat16, device=dev)
-        self._c_comp = torch.zeros(cap, D, dtype=torch.bfloat16, device=dev)
-        self._c_ovl_kv = torch.zeros(rate, D, dtype=torch.bfloat16, device=dev)
-        # gates are fp32 to match the reference position_bias precision
-        self._c_ovl_gate = torch.zeros(rate, D, dtype=torch.float32, device=dev)
-        self._i_win_kv = torch.zeros(max_tokens, 2 * idx_h, dtype=torch.bfloat16, device=dev)
-        self._i_win_gate = torch.zeros(max_tokens, 2 * idx_h, dtype=torch.bfloat16, device=dev)
-        self._i_comp = torch.zeros(cap, idx_h, dtype=torch.bfloat16, device=dev)
-        self._i_ovl_kv = torch.zeros(rate, idx_h, dtype=torch.bfloat16, device=dev)
-        self._i_ovl_gate = torch.zeros(rate, idx_h, dtype=torch.float32, device=dev)
 
     def _comp_rmsnorm(self, x, w):
         xf = x.float()
@@ -716,74 +670,6 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if w.dim() == 2 and w.shape[-1] != in_features:
             w = w.t()
         return w
-
-    def _comp_store_shift(self, kv_buf, gate_buf, n, kv_new, gate_new, rate):
-        """Append new (kv, gate) tokens, return the window-aligned prefix to
-        compress plus the leftover count, and compact the leftover to the front.
-
-        The window MUST be captured BEFORE the leftover is moved to the front
-        (otherwise it clobbers the first ``left`` window rows), and the gate
-        buffer must be written alongside the kv buffer.
-        """
-        # FIXME(Step 5.5/6): host-sync the counter to a Python int; HPU eager
-        # mis-handles tensor slice bounds (`buf[tensor:tensor]`). The paged-KV
-        # rework removes this counter entirely.
-        n = int(n) if torch.is_tensor(n) else n
-        T = kv_new.shape[0]
-        total = n + T
-        if __import__("os").environ.get("V4_COMP_DEBUG") == "1":
-            print(f"[store] n={n} T={T} kv_new={tuple(kv_new.shape)} "
-                  f"buf={tuple(kv_buf.shape)} total={total}", flush=True)
-        kv_buf[n:total] = kv_new
-        gate_buf[n:total] = gate_new
-        usable = (total // rate) * rate
-        left = total - usable
-        ck = kv_buf[:usable].clone()
-        cg = gate_buf[:usable].clone()
-        kv_buf[:left] = kv_buf[usable:total].clone()
-        gate_buf[:left] = gate_buf[usable:total].clone()
-        return usable // rate, left, ck, cg
-
-    def _comp_windows(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
-                      cache, ovl_n, ovl_kv, ovl_gate, rope_dim):
-        nw = ck.shape[0] // rate
-        if nw == 0:
-            return ck.new_zeros((0, Dk))
-        ckv = ck.view(nw, rate, 2 * Dk)
-        cgv = cg.view(nw, rate, 2 * Dk) + ape
-        nk = ck.new_zeros(nw, 2 * rate, Dk)
-        # Gates stay fp32 (position_bias is fp32 in the reference), so the
-        # softmax sees the same values as the reference.
-        ng = cgv.new_full((nw, 2 * rate, Dk), float("-inf"))
-        nk[:, rate:] = ckv[:, :, Dk:].to(ck.dtype)
-        ng[:, rate:] = cgv[:, :, Dk:]
-        nk[1:, :rate] = ckv[:-1, :, :Dk].to(ck.dtype)
-        ng[1:, :rate] = cgv[:-1, :, :Dk]
-        nk[0, :rate] = torch.where(ovl_n > 0, ovl_kv[:rate].to(ck.dtype), nk[0, :rate])
-        ng[0, :rate] = torch.where(ovl_n > 0, ovl_gate[:rate].to(ng.dtype), ng[0, :rate])
-        # Match the reference: softmax in fp32, cast to the value dtype, then
-        # product/sum in the value dtype.
-        soft = torch.softmax(ng.float(), dim=1).to(nk.dtype)
-        comp = (nk * soft).sum(dim=1)
-        comp = self._comp_rmsnorm(comp, norm_w)
-        pos = torch.arange(nw, device=ck.device) * rate + first_pos
-        comp = _apply_rope(comp, pos, cache, rope_dim)
-        return comp
-
-    def _comp_windows_hca(self, ck, cg, first_pos, Dk, rate, ape, norm_w,
-                          cache, rope_dim):
-        nw = ck.shape[0] // rate
-        if nw == 0:
-            return ck.new_zeros((0, Dk))
-        ckv = ck.view(nw, rate, Dk)
-        cgv = cg.view(nw, rate, Dk) + ape
-        # Match the reference: softmax fp32 -> value dtype, product/sum in value dtype.
-        soft = torch.softmax(cgv.float(), dim=1).to(ckv.dtype)
-        comp = (ckv * soft).sum(dim=1)
-        comp = self._comp_rmsnorm(comp, norm_w)
-        pos = torch.arange(nw, device=ck.device) * rate + first_pos
-        comp = _apply_rope(comp, pos, cache, rope_dim)
-        return comp
 
     def _dsv4_aux_entry(self, layer):
         """Fetch the paged-KV metadata entry for an aux cache layer.
@@ -836,13 +722,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         layer = comp_module.state_cache
         info = self._dsv4_aux_entry(layer)
         if info is None:
-            return None, 0
+            return None, 0, None
         slab2d = getattr(layer, "_dsv4_slab2d", None)
         if slab2d is None:
-            return None, 0
+            return None, 0, None
         bl = info.get("block_list_full")
         if bl is None or bl.dim() != 1:
-            return None, 0
+            return None, 0, None
         # The aux slot_mapping is padded to the fixed batch shape; the compressor
         # runs on real tokens only (the leading rows), so take the first T.
         slots = info["slot_mapping"][:kv.shape[0]].clone()
@@ -871,7 +757,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         pos = positions.reshape(-1).to(torch.int64)
         T = pos.numel()
         if T == 0:
-            return kv.new_zeros((0, D)), 0
+            return kv.new_zeros((0, D)), 0, None
         win = 2 * rate if coff == 2 else rate
         rel = torch.arange(-win + 1, 1, device=dev, dtype=torch.int64)
         win_pos = pos.unsqueeze(1) + rel.unsqueeze(0)  # [T, win]
@@ -1022,14 +908,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
             live = int(self._c_n)
             if live > 0:
-                ref = self._c_comp[:live]
-                got = comp[:live].float()
-                d = (got - ref.float()).abs().max().item()
-                r = d / ref.float().abs().max().clamp(min=1e-6).item()
                 print(f"[R6] layer={getattr(self, '_layer_idx', '?')} live={live} "
-                      f"max_abs_diff={d:.4g} rel={r:.3%} cache_dtype={page.dtype} "
-                      f"bl0={int(bl[0])} phys0={int(phys[0])} got0={comp[0, :3].float().tolist()} "
-                      f"ref0={ref[0, :3].float().tolist()} page_off={self._dsv4_page_off} "
+                      f"cache_dtype={page.dtype} bl0={int(bl[0])} phys0={int(phys[0])} "
+                      f"got0={comp[0, :3].float().tolist()} "
+                      f"page_off={self._dsv4_page_off} "
                       f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
         return comp
 
@@ -1126,35 +1008,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
             _live = min(int(self._c_n), cap)
             if _live > 0:
-                _ref = self._i_comp[:_live].float()
-                _got = out[:_live].float()
-                _d = (_got - _ref).abs().max().item()
                 print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={_live} "
                       f"tok={tok} off={off} pe={layer._dsv4_page_elems} "
-                      f"bl0={int(bl[0])} phys0={int(phys[0])} diff={_d:.4g} "
-                      f"ref_absmax={_ref.abs().max().item():.4g} "
-                      f"ref0={_ref[0, :3].tolist()} got0={_got[0, :3].tolist()} "
+                      f"bl0={int(bl[0])} phys0={int(phys[0])} "
+                      f"got0={out[0, :3].float().tolist()} "
                       f"c_n={int(self._c_n)} i_n={int(self._i_n)}", flush=True)
         return out
-
-    def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
-        nw = chunk_kv.shape[0] // rate
-        # nw is a Python int; wrap it as a device tensor so torch.where is valid
-        # in eager too (dynamo otherwise constant-folds the python bool).
-        ovl_n.copy_(torch.where(
-            chunk_kv.new_tensor(nw) > 0,
-            torch.tensor(rate, dtype=torch.int64, device=ovl_n.device),
-            torch.tensor(0, dtype=torch.int64, device=ovl_n.device)))
-        # Pad chunk with rate dummy rows to make [-1] safe when usable<rate.
-        # Only meaningful when at least one full window closed; when nw==0 the
-        # chunk is empty and there is no overlap to carry (ovl_n already 0).
-        if nw > 0:
-            safe_kv = torch.cat([chunk_kv, chunk_kv.new_zeros(rate, 2 * Dk)], dim=0)
-            safe_ga = torch.cat([chunk_gate + ape, chunk_gate.new_zeros(rate, 2 * Dk)], dim=0)
-            last = safe_kv.view(-1, rate, 2 * Dk)[-1]
-            lastg = safe_ga.view(-1, rate, 2 * Dk)[-1]
-            ovl_kv[:rate] = last[:, :Dk]
-            ovl_gate[:rate] = lastg[:, :Dk]
 
     @torch.compiler.disable
     def _compressor_compilable(self, hidden, qr, positions, is_prompt, real=None):
@@ -1178,14 +1037,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # Built once at load time (see _make_compress_cache); never build here.
         cache = self._compress_cache
 
-        # Reset all state on prefill
+        # Reset the entry counters on prefill.
         zero = torch.tensor(0, dtype=torch.int64, device=dev)
-        self._c_win_n = torch.where(is_prompt > 0, zero, self._c_win_n)
         self._c_n = torch.where(is_prompt > 0, zero, self._c_n)
-        self._c_ovl_n = torch.where(is_prompt > 0, zero, self._c_ovl_n)
-        self._i_win_n = torch.where(is_prompt > 0, zero, self._i_win_n)
         self._i_n = torch.where(is_prompt > 0, zero, self._i_n)
-        self._i_ovl_n = torch.where(is_prompt > 0, zero, self._i_ovl_n)
 
         c = self.compressor
         fused = self._comp_weight(c.fused_wkv_wgate, hidden.shape[-1])
@@ -1193,97 +1048,47 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         kv_out = coff * D
         kv_w = fused[:kv_out]
         gate_w = fused[kv_out:]
-        # position_bias stays fp32 (matches the reference; bf16 would round the
-        # softmax logits differently).
-        ape = c.ape
-        norm_w = c.norm.weight
-
-        if __import__("os").environ.get("V4_COMP_DEBUG") == "1":
-            print(f"[comp] hidden={tuple(hidden.shape)} qr={tuple(qr.shape)} "
-                  f"c_win_n={self._c_win_n} rate={rate}", flush=True)
         kv = hidden @ kv_w.t()
         gate = hidden @ gate_w.t()
-        from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled
-        _env = __import__("os").environ
-        _paged = dsv4_paged_kv_enabled() and _env.get("DSV4_COMP_STATE_USE") == "1"
-        if _paged:
-            # R4c: the paged compressor state is the source of truth (absolute
-            # positions; no leftover/overlap buffers, and it fixes the manual
-            # overlap-reset bug).
-            comp, nw_p, sel_p = self._comp_state_paged(kv, gate, positions)
-            if comp is None:
-                _paged = False
-            else:
-                self._write_paged_compressed(comp, sel_p, positions)
-        if not _paged:
-            _nw_c, left_c, ck, cg = self._comp_store_shift(
-                self._c_win_kv, self._c_win_gate, self._c_win_n, kv, gate, rate)
-            self._c_win_n = torch.tensor(left_c, dtype=torch.int64, device=dev)
-            if rate == 4:
-                comp = self._comp_windows(ck, cg, self._c_n * rate, D, rate, ape,
-                                          norm_w, cache, self._c_ovl_n,
-                                          self._c_ovl_kv, self._c_ovl_gate, self.rope_head_dim)
-            else:
-                comp = self._comp_windows_hca(ck, cg, self._c_n * rate, D, rate, ape,
-                                              norm_w, cache, self.rope_head_dim)
-            self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
-            self._c_n += comp.shape[0]
-            if rate == 4:
-                self._comp_fill_overlap(ck, cg, D, rate, ape,
-                                        self._c_ovl_kv, self._c_ovl_gate, self._c_ovl_n)
-        else:
-            self._c_comp[self._c_n:self._c_n + comp.shape[0]] = comp
-            self._c_n += comp.shape[0]
+        # R4/R9: the paged compressor state is the only path (absolute positions;
+        # no leftover/overlap buffers, which also fixes the manual overlap-reset
+        # bug).
+        comp, _nw_p, sel_p = self._comp_state_paged(kv, gate, positions)
+        if comp is None:
+            comp = kv.new_zeros((0, D))
+            sel_p = None
+        if comp.shape[0] > 0:
+            self._write_paged_compressed(comp, sel_p, positions)
+        self._c_n += comp.shape[0]
         # R6: read the compressed entries back from the paged cache (the source
-        # of truth under DSV4_COMP_STATE_USE) rather than the manual buffer. The
-        # manual `_c_comp` remains the fallback when the read is unavailable.
-        compressed_kv_full = self._c_comp
-        if _env.get("DSV4_R6_DEBUG") == "1":
-            print(f"[R6-decide] layer={getattr(self, '_layer_idx', '?')} "
-                  f"_paged={_paged} c_n={int(self._c_n)}", flush=True)
-        if _paged and _env.get("DSV4_COMP_READ_PAGED", "1") == "1":
-            _paged_comp = self._read_paged_compressed(self._cap)
-            if _paged_comp is not None:
-                compressed_kv_full = _paged_comp
+        # of truth).
+        compressed_kv_full = self._read_paged_compressed(self._cap)
+        if compressed_kv_full is None:
+            compressed_kv_full = kv.new_zeros((self._cap, D))
 
         # ---- indexer (only CSA, ratio 4) ----
         has_idx = rate == 4 and self.indexer is not None
         if has_idx:
-            idx_h = self._i_comp.shape[-1]
             idx = self.indexer
+            idx_h = idx.head_dim
             ifused = self._comp_weight(idx.compressor.fused_wkv_wgate, hidden.shape[-1])
             ikv_w = ifused[: 2 * idx_h]
             igate_w = ifused[2 * idx_h:]
-            iape = idx.compressor.ape
-            inorm_w = idx.compressor.norm.weight
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
-            _paged_i = _paged
-            if _paged_i:
-                icomp, _nw_i, _sel_i = self._comp_state_paged(ikv, igate, positions,
-                                                              comp_module=idx.compressor,
-                                                              head_dim=idx_h)
-                if icomp is None:
-                    _paged_i = False
-            if not _paged_i:
-                _nw_i, left_i, ik, ig = self._comp_store_shift(
-                    self._i_win_kv, self._i_win_gate, self._i_win_n, ikv, igate, rate)
-                self._i_win_n = torch.tensor(left_i, dtype=torch.int64, device=dev)
-                icomp = self._comp_windows(ik, ig, self._i_n * rate, idx_h, rate, iape,
-                                           inorm_w, cache, self._i_ovl_n,
-                                           self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
-                self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
-                                        self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
-            elif _env.get("DSV4_INDEXER_PAGED", "1") != "0" and icomp is not None and icomp.shape[0] > 0:
+            icomp, _nw_i, _sel_i = self._comp_state_paged(ikv, igate, positions,
+                                                          comp_module=idx.compressor,
+                                                          head_dim=idx_h)
+            if icomp is None:
+                icomp = kv.new_zeros((0, idx_h))
+                _sel_i = None
+            if icomp.shape[0] > 0:
                 # R7: write the indexer keys into the paged k_cache (fp8+scale).
                 self._write_paged_indexer(icomp, _sel_i, positions)
-            self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
             self._i_n += icomp.shape[0]
-            idx_compressed = self._i_comp
-            if _paged_i and _env.get("DSV4_INDEXER_PAGED", "1") != "0":
-                _paged_ic = self._read_paged_indexer(self._cap)
-                if _paged_ic is not None:
-                    idx_compressed = _paged_ic
+            idx_compressed = self._read_paged_indexer(self._cap)
+            if idx_compressed is None:
+                idx_compressed = kv.new_zeros((self._cap, idx_h))
         else:
             idx_h = D
             idx_compressed = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
@@ -1644,23 +1449,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         W = self.window_size
         D = self.head_dim
 
-        # Window cache = the last min(nreal, W) real kv rows. Static-shape
-        # gather (fixed [W, D] output, dynamic index values): slot j holds the
-        # token at position ``start + j`` where start = max(0, nreal - W).
+        # Window = the last min(nreal, W) real kv rows, straight from the paged
+        # SWA cache (R3/R8/R9; no manual `_win_cache` staging). Window positions
+        # come from the request's block table (supports chunked prefill).
         nreal = real.long().sum()
         r3 = self._read_paged_swa_window(pos_flat[nreal - 1], W)
-        if r3 is not None:
-            # R3/R8: the window comes straight from the paged SWA cache and is
-            # used directly (no manual `_win_cache` staging); window positions
-            # come from the request's block table (supports chunked prefill).
-            win_kv, win_n, start, _valid = r3
-        else:
-            start = torch.clamp(nreal - W, min=0)
-            win_idx = (start + torch.arange(W, device=dev)).clamp(max=T - 1)
-            win_kv = kv_roped.gather(0, win_idx[:, None].expand(-1, D))
-            win_n = torch.clamp(nreal, max=W)
-        # decode appends at the next free ring slot = number of real tokens seen.
-        self._decode_pos.copy_(nreal)
+        assert r3 is not None, "DSv4 paged window read unavailable"
+        win_kv, win_n, start, _valid = r3
 
         is_prompt = torch.tensor(1, dtype=torch.int64, device=dev)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(
@@ -1701,19 +1496,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         self._write_paged_swa_cache(kv_roped)
         pos_flat = positions.reshape(-1)
         r3 = self._read_paged_swa_window(pos_flat[-1], self.window_size)
-        if r3 is not None:
-            # R3/R8: window straight from the paged SWA cache (no ring buffer,
-            # no manual `_win_cache` staging).
-            win_kv, win_n, _start, _valid = r3
-        else:
-            # Ring-buffer write via index_copy_ with an explicit [1] slot index:
-            # graph-safe (fixed shapes), unlike `buf[tensor] = value`.
-            slot = (self._decode_pos % self.window_size).reshape(1)
-            self._win_cache.index_copy_(0, slot, kv_roped.reshape(1, -1))
-            self._decode_pos.add_(1)
-            self._win_n.add_(1).clamp_(max=self.window_size)
-            win_kv = self._win_cache
-            win_n = self._win_n
+        # R3/R8/R9: window straight from the paged SWA cache (no ring buffer).
+        assert r3 is not None, "DSv4 paged window read unavailable"
+        win_kv, win_n, _start, _valid = r3
         is_prompt = torch.tensor(0, dtype=torch.int64, device=pos_flat.device)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
 

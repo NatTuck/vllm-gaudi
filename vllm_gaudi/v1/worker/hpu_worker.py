@@ -29,8 +29,7 @@ from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
-from vllm.v1.worker.utils import bind_kv_cache
-from vllm_gaudi.v1.worker.dsv4_paged_kv import dsv4_paged_kv_enabled, hpu_bind_kv_cache
+from vllm_gaudi.v1.worker.dsv4_paged_kv import hpu_bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
@@ -410,10 +409,7 @@ class HPUWorker(WorkerBase):
                 raise NotImplementedError
 
         runner_kv_caches: list[torch.Tensor] = []
-        if dsv4_paged_kv_enabled():
-            hpu_bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
-        else:
-            bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
+        hpu_bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, runner_kv_caches)
 
         if is_fake_hpu():
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu

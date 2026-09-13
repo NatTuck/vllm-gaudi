@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek V4 paged-KV helpers (R1 of the paged-KV reintegration).
+"""DeepSeek V4 paged-KV helpers.
 
 DeepSeek V4 registers several KV caches per decoder layer (the compressed MLA
 attention cache, the sliding-window cache, the compressor running state, and the
@@ -7,19 +7,14 @@ indexer cache). vLLM's ``bind_kv_cache`` groups caches by decoder-layer index an
 refuses (``NotImplementedError``) when a single layer index owns more than one
 cache on a non-CUDA/XPU/CPU platform. HPU hits that case, so it needs its own
 binding that keeps every ``layer_name`` distinct.
-
-Gated by ``VLLM_DSV4_PAGED_KV`` so the manual-buffer fallback stays the default
-until the paged path passes its gates (R2-R8); the flag and the manual path are
-removed together in R9.
 """
-
-import os
 
 from vllm.v1.worker.utils import extract_layer_index
 
 
 def dsv4_paged_kv_enabled() -> bool:
-    return os.environ.get("VLLM_DSV4_PAGED_KV", "0") == "1"
+    """The paged path is the only DSv4 KV path (R9 removed the manual buffers)."""
+    return True
 
 
 def hpu_bind_kv_cache(
