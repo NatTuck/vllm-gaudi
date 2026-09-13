@@ -1033,6 +1033,87 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                       f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
         return comp
 
+    def _indexer_kcache_aux(self):
+        """Return ``(layer, info)`` for the indexer k_cache, or ``(None, None)``."""
+        layer = getattr(self.indexer, "k_cache", None) if self.indexer is not None else None
+        if layer is None:
+            return None, None
+        info = self._dsv4_aux_entry(layer)
+        if info is None or getattr(layer, "_dsv4_slab2d", None) is None:
+            return None, None
+        return layer, info
+
+    def _write_paged_indexer(self, icomp, sel, positions):
+        """R7: write the indexer compressed keys into the paged indexer k_cache.
+
+        HPU stores the indexer keys in **bf16**: the official reference (and our
+        scorer) use bf16 indexer keys ("current implementation uses bf16" in
+        the checkpoint's inference/model.py), so the upstream fp8+scale layout
+        would quantize the top-k keys and diverge. Per-entry contiguous 1-D
+        slice copies (eager fp8/advanced-index scatter is a no-op).
+        """
+        layer, info = self._indexer_kcache_aux()
+        if layer is None:
+            return
+        slab2d = layer._dsv4_slab2d
+        T = positions.numel()
+        slots = info["slot_mapping"][:T]
+        if sel is not None:
+            slots = slots[sel]
+        sbs = info["storage_block_size"]
+        tok = self.indexer.head_dim  # semantic index head (128)
+        row = layer.head_dim  # storage row width (may include padding)
+        off = layer._dsv4_page_off
+        blocks = torch.div(slots, sbs, rounding_mode="floor")
+        offs = slots % sbs
+        keys = icomp.to(torch.bfloat16)
+        for i in range(icomp.shape[0]):
+            b = int(blocks[i].item())
+            o = int(offs[i].item())
+            col0 = off + o * row
+            slab2d[b, col0:col0 + tok].copy_(keys[i])
+
+    def _read_paged_indexer(self, cap):
+        """R7: gather indexer compressed keys ``[cap, 128]`` from the paged
+        indexer k_cache (bf16).
+
+        Reads the live entries with per-entry contiguous 1-D slice copies:
+        strided ``index_select`` on a bf16 view of the packed backing fails on
+        HPU (fp8 works, which is why the R3/R6 reads use index_select). Entries
+        beyond the live count stay zero and are masked by the caller.
+        """
+        layer, info = self._indexer_kcache_aux()
+        if layer is None:
+            return None
+        bl = info.get("block_list_full")
+        if bl is None or bl.dim() != 1:
+            return None
+        slab2d = layer._dsv4_slab2d
+        sbs = info["storage_block_size"]
+        tok = self.indexer.head_dim
+        row = layer.head_dim
+        off = layer._dsv4_page_off
+        live = min(int(self._c_n), cap)
+        out = torch.zeros(cap, tok, dtype=torch.bfloat16, device=slab2d.device)
+        for ci in range(live):
+            logical = ci // sbs
+            if logical >= bl.numel():
+                break
+            b = int(bl[logical].item())
+            o = ci % sbs
+            col0 = off + o * row
+            out[ci].copy_(slab2d[b, col0:col0 + tok])
+        if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
+            _ref = self._i_comp[:live].float()
+            _got = out[:live].float()
+            _d = (_got - _ref).abs().max().item() if live > 0 else -1.0
+            print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={live} "
+                  f"tok={tok} row={row} off={off} pe={layer._dsv4_page_elems} "
+                  f"bl0={int(bl[0])} diff={_d:.4g} "
+                  f"ref0={_ref[0, :3].tolist() if live else []} "
+                  f"got0={_got[0, :3].tolist() if live else []}", flush=True)
+        return out
+
     def _comp_fill_overlap(self, chunk_kv, chunk_gate, Dk, rate, ape, ovl_kv, ovl_gate, ovl_n):
         nw = chunk_kv.shape[0] // rate
         # nw is a Python int; wrap it as a device tensor so torch.where is valid
@@ -1170,9 +1251,18 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                                            self._i_ovl_kv, self._i_ovl_gate, self.rope_head_dim)
                 self._comp_fill_overlap(ik, ig, idx_h, rate, iape,
                                         self._i_ovl_kv, self._i_ovl_gate, self._i_ovl_n)
+            elif _env.get("DSV4_INDEXER_PAGED", "0") == "1" and icomp is not None and icomp.shape[0] > 0:
+                # WIP (R7, gated off by default): write the indexer keys into the
+                # paged k_cache. The scorer keeps the reference-matching manual
+                # `_i_comp` until the paged indexer cache is fixed.
+                self._write_paged_indexer(icomp, _sel_i, positions)
             self._i_comp[self._i_n:self._i_n + icomp.shape[0]] = icomp
             self._i_n += icomp.shape[0]
             idx_compressed = self._i_comp
+            if _paged_i and _env.get("DSV4_INDEXER_PAGED", "0") == "1":
+                _paged_ic = self._read_paged_indexer(self._cap)
+                if _paged_ic is not None:
+                    idx_compressed = _paged_ic
         else:
             idx_h = D
             idx_compressed = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)

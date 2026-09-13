@@ -1795,7 +1795,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     from vllm.models.deepseek_v4.compressor import CompressorStateCache
                     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-                    if isinstance(attn_module, (DeepseekV4SWACache, CompressorStateCache, DeepseekV4IndexerCache)):
+                    if isinstance(attn_module, DeepseekV4IndexerCache) and os.environ.get("DSV4_INDEXER_PAGED") == "1":
+                        # WIP (R7, gated off by default): HPU would store the
+                        # indexer compressed keys in bf16 (the reference uses
+                        # bf16 indexer keys; the upstream 132-byte fp8+scale
+                        # layout quantizes the top-k keys and diverges). This
+                        # spec override currently corrupts the packed layout
+                        # (overlapping offsets -> garbage reads), so it is off
+                        # until the layout is fixed.
+                        kv_cache_spec[layer_name] = MLAAttentionSpec(
+                            block_size=self.vllm_config.cache_config.block_size,
+                            num_kv_heads=1,
+                            head_size=attn_module.head_dim,
+                            dtype=torch.bfloat16,
+                            compress_ratio=attn_module.compress_ratio,
+                            cache_dtype_str="bfloat16",
+                        )
+                    elif isinstance(attn_module, (DeepseekV4SWACache, CompressorStateCache, DeepseekV4IndexerCache)):
                         spec = attn_module.get_kv_cache_spec(self.vllm_config)
                         if spec is not None:
                             kv_cache_spec[layer_name] = spec
