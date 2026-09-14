@@ -120,11 +120,13 @@ from vllm_gaudi.attention.backends.hpu_attn import HPUAttentionImpl
 if TYPE_CHECKING:
     import xgrammar as xgr
     import xgrammar.kernels.apply_token_bitmask_inplace_torch_compile as xgr_torch_compile  # noqa: E501
+    import xgrammar.kernels.apply_token_bitmask_inplace_torch as xgr_torch
     import xgrammar.kernels.apply_token_bitmask_inplace_cpu as xgr_cpu
     from vllm.v1.core.scheduler import SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
     xgr_cpu = LazyLoader("xgr_cpu", globals(), "xgrammar.kernels.apply_token_bitmask_inplace_cpu")
+    xgr_torch = LazyLoader("xgr_torch", globals(), "xgrammar.kernels.apply_token_bitmask_inplace_torch")
     xgr_torch_compile = LazyLoader("xgr_torch_compile", globals(),
                                    "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
 
@@ -1101,6 +1103,22 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
 @torch.compiler.disable
 def _mark_unbacked_dim0(tensor: torch.Tensor):
     torch._dynamo.decorators.mark_unbacked(tensor, 0)
+
+
+def _gather_logits_rows(hidden_states: torch.Tensor, logits_indices: torch.Tensor) -> torch.Tensor:
+    """Select the hidden states that produce logits (one row per sampled token).
+
+    Kept as a separate function so it can be torch.compiled into a single HPU
+    graph; run eager it would be a stray HPU kernel outside a graph (R2).
+    """
+    return hidden_states.view(-1, hidden_states.shape[-1])[logits_indices]
+
+
+def _scatter_target_tokens(target_token_ids: torch.Tensor, logits_indices: torch.Tensor,
+                           next_token_ids: torch.Tensor) -> torch.Tensor:
+    """In-place scatter of sampled tokens into the target token buffer (R3)."""
+    target_token_ids[logits_indices] = next_token_ids
+    return target_token_ids
 
 
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
@@ -3879,8 +3897,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             non_flattened_hidden_states = hidden_states
             aux_hidden_states = None
 
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = hidden_states[logits_indices]
+        _gather = getattr(self, '_gather_logits_rows', None)
+        hidden_states = _gather_logits_rows(hidden_states, logits_indices) if _gather is None \
+            else _gather(hidden_states, logits_indices)
         LoraMask.setLoraMask(lora_logits_mask)
         with self.profiler.record_event('internal', ('compute_logits'
                                                      f'{batch_size}_'
@@ -4094,8 +4113,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if req_id in grammar_output.structured_output_request_ids:
                 struct_out_req_batch_indices[req_id] = logit_index
 
-        out_indices = []
-
         # Reorder the bitmask to match the order of the requests in the batch.
         sorted_bitmask = np.full(shape=(logits.shape[0], grammar_bitmask.shape[1]),
                                  fill_value=-1,
@@ -4108,49 +4125,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for i in range(1 + num_spec_tokens):
                 sorted_bitmask[logit_index + i] = \
                     grammar_bitmask[cumulative_index + i]
-                out_indices.append(logit_index + i)
             cumulative_index += 1 + num_spec_tokens
 
         # Copy async to device as tensor.
         grammar_bitmask = torch.from_numpy(sorted_bitmask).to(logits.device, non_blocking=True)
 
-        # If the grammar bitmask and the logits have the same shape
-        # we don't need to pass indices to the kernel,
-        # since the bitmask is already aligned with the logits.
-        skip_out_indices = len(out_indices) == logits.shape[0]
-
-        index_tensor = None
-        if not skip_out_indices:
-            # xgrammar expects a python list of indices but it will actually work with
-            # a tensor. If we copy the tensor ourselves here we can do it in a non_blocking
-            # manner and there should be no cpu sync within xgrammar.
-            index_tensor = torch.tensor(out_indices, dtype=torch.int32, device="cpu", pin_memory=True)
-            index_tensor = index_tensor.to(logits.device, non_blocking=True)
-
-        # Serialization of np.ndarray is much more efficient than a tensor,
-        # so we receive it in that format.
-        #grammar_bitmask = torch.from_numpy(grammar_bitmask).contiguous()
-
-        # Force use of the torch.compile implementation from xgrammar to work
-        # around issues with the Triton kernel in concurrent structured output
-        # scenarios. See PR #19565 and issues #19493, #18376 for details.
-
-        # xgr_torch_compile.apply_token_bitmask_inplace_torch_compile(
-        #     logits,
-        #     grammar_bitmask.to(self.device, non_blocking=True),
-        #     indices=out_indices if not skip_out_indices else None,
-        # )
-
-        # NOTE(tianmu-li): xgr_torch_compile uses torch.inductor by default.
-        # Have to use the CPU backend, which has its overhead.
-        logits_cpu = logits.cpu().to(torch.float32)
-        '''xgr_cpu.apply_token_bitmask_inplace_cpu(
-            logits_cpu,
-            grammar_bitmask.to("cpu"),
-            indices=out_indices if not skip_out_indices else None,
-        )'''
-        xgr_cpu.apply_token_bitmask_inplace_cpu(logits_cpu, grammar_bitmask.to("cpu"), indices=index_tensor)
-        logits.copy_(logits_cpu.to(self.device, non_blocking=True).to(logits.dtype))
+        # Apply the bitmask fully on the HPU using xgrammar's pure-torch kernel
+        # (repeat_interleave / arange / shift / and / masked_fill_ -- all
+        # graph-safe on hpu_backend). The bitmask has already been scattered to
+        # the logits row order, so we never need the ``indices`` variant (its
+        # advanced indexing is not HPU-graph-safe), and rows that are not
+        # structured-output requests hold -1 (all bits set) -> no masking. This
+        # removes the previous ``logits.cpu() -> xgr_cpu -> logits.copy_``
+        # round-trip, which left the HPU (violating HPU residency) and added a
+        # host sync per step.
+        xgr_torch.apply_token_bitmask_inplace_torch(logits, grammar_bitmask)
 
     def _configure_lora(self, input, requests, req_ids, is_prompt):
         lora_mask = None
@@ -5137,6 +5126,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # shapes on tensors added to module via register_buffer()
             torch._dynamo.config.force_parameter_static_shapes = False
             self.compile_config = HPUCompileConfig()
+
+            # Runner-side per-step ops that are not part of the model graph
+            # (R2 gather, R3 scatter) must also be single compiled graphs.
+            self._gather_logits_rows = self._compile(_gather_logits_rows)
+            self._scatter_target_tokens = self._compile(_scatter_target_tokens)
 
             if self.compile_config.regional_compilation:
                 self._compile_methods()
@@ -7545,7 +7539,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         token_ids = token_ids.squeeze()
         target_token_ids = token_ids.clone()
         target_token_ids[:-1].copy_(token_ids[1:])
-        target_token_ids[logits_indices] = next_token_ids
+        _scatter = getattr(self, '_scatter_target_tokens', None)
+        target_token_ids = _scatter_target_tokens(target_token_ids, logits_indices,
+                                                  next_token_ids) if _scatter is None \
+            else _scatter(target_token_ids, logits_indices, next_token_ids)
         target_token_ids = target_token_ids.unsqueeze(0)
         if target_hidden_states.dim() == 2:
             target_hidden_states = target_hidden_states.unsqueeze(0)

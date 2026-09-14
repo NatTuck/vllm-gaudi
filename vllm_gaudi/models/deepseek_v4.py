@@ -1343,8 +1343,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         qr_kv = self.fused_wqa_wkv(hidden_states)
         qr_kv = qr_kv[0] if isinstance(qr_kv, tuple) else qr_kv
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr = _rmsnorm(qr, self.eps, self.q_norm.weight.data)
-        kv = _rmsnorm(kv, self.eps, self.kv_norm.weight.data)
+        qr = _rmsnorm(qr, self.eps, self.q_norm.weight)
+        kv = _rmsnorm(kv, self.eps, self.kv_norm.weight)
         return qr, kv
 
     def _write_paged_swa_cache(self, kv_roped):
@@ -1619,7 +1619,7 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
                     x, self.hc_attn_fn_broadcast, self.hc_attn_scale,
                     self.hc_attn_base, self.rms_norm_eps, self.hc_eps,
                     self.hc_eps, self.hc_post_alpha, self.hc_sinkhorn_iters,
-                    self.hc_mult, self.attn_norm.weight.data, self.rms_norm_eps,
+                    self.hc_mult, self.attn_norm.weight, self.rms_norm_eps,
                 )
             from vllm.model_executor.kernels.mhc import mhc_pre_torch
             return (x, *mhc_pre_torch(
@@ -1632,7 +1632,7 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
             self.rms_norm_eps, self.hc_eps, self.hc_eps,
             self.hc_post_alpha, self.hc_sinkhorn_iters, self.hc_mult,
-            self.attn_norm.weight.data, self.rms_norm_eps,
+            self.attn_norm.weight, self.rms_norm_eps,
         )
 
     def _mhc_post_ffn(self, x, residual, post_mix, res_mix):
@@ -1641,7 +1641,7 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
             self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
             self.rms_norm_eps, self.hc_eps, self.hc_eps,
             self.hc_post_alpha, self.hc_sinkhorn_iters, self.hc_mult,
-            self.ffn_norm.weight.data, self.rms_norm_eps,
+            self.ffn_norm.weight, self.rms_norm_eps,
         )
 
     def _forward_inner_prefill(
