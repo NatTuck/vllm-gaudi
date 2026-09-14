@@ -41,6 +41,18 @@ from vllm.sequence import IntermediateTensors
 
 _DIAG_DONE = {"v": True}  # diag disabled: the per-layer device-sync prints throttle the first eager forward
 
+# Debug flags hoisted to module scope: reading them inside a compiled region with
+# ``__import__("os").environ`` is a dynamo graph break (the debug bodies also host-sync),
+# so they must be constants at trace time.
+_DSV4_R6_DEBUG = os.environ.get("DSV4_R6_DEBUG") == "1"
+_DSV4_R4B_NOSWA = os.environ.get("DSV4_R4B_NOSWA") == "1"
+_HPU_DUMP_ON = os.environ.get("HPU_DUMP") == "1"
+
+# The routed fp4 readiness invariant is a load-time property; check it once in the
+# eager model forward (see `_check_v4_routed_ready`) rather than per-MoE inside the
+# compiled region, where the `.item()` host sync would graph-break.
+_V4_ROUTED_CHECKED = [False]
+
 
 def _diag(name: str, t: torch.Tensor, *, layer: int | None = None) -> None:
     """Print once (first forward) a NaN/abs-mean/variance diagnostic for t."""
@@ -846,7 +858,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             o = int(offs[i].item())
             col0 = off_elems + o * hd
             slab2d[b, col0:col0 + hd].copy_(comp_fp8[i])
-        if __import__("os").environ.get("DSV4_R6_DEBUG") == "1" and comp.shape[0] > 0:
+        if _DSV4_R6_DEBUG and comp.shape[0] > 0:
             _b0 = int(blocks[0].item())
             _o0 = int(offs[0].item())
             _probe = slab2d[_b0, off_elems + _o0 * hd:off_elems + _o0 * hd + 3].to(
@@ -874,7 +886,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         md = get_forward_context().attn_metadata
         aux = getattr(md, "dsv4_aux_meta", None)
-        _dbg = __import__("os").environ.get("DSV4_R6_DEBUG") == "1"
+        _dbg = _DSV4_R6_DEBUG
         if _dbg:
             print(f"[R6-enter] prefix={self.prefix!r} has_aux={bool(aux)} "
                   f"slab={getattr(self, '_dsv4_slab2d', None) is not None}", flush=True)
@@ -905,7 +917,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         phys = bl[logical].clamp(min=0)
         pages = page.index_select(0, phys).to(torch.bfloat16)  # [nblocks, sbs, hd]
         comp = pages.reshape(-1, hd)[:cap]
-        if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
+        if _DSV4_R6_DEBUG:
             live = int(self._c_n)
             if live > 0:
                 print(f"[R6] layer={getattr(self, '_layer_idx', '?')} live={live} "
@@ -1005,7 +1017,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         x = x.reshape(-1, tok)[:cap]
         sc = sc_page.index_select(0, phys).view(torch.float32).reshape(-1)[:cap]
         out = torch.ops.hpu.cast_from_fp8(x, sc.reshape(-1, 1), torch.bfloat16)
-        if __import__("os").environ.get("DSV4_R6_DEBUG") == "1":
+        if _DSV4_R6_DEBUG:
             _live = min(int(self._c_n), cap)
             if _live > 0:
                 print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={_live} "
@@ -1197,7 +1209,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             o, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim
         )
         _diag("op_after_invrope", o)
-        if __import__("os").environ.get("HPU_DUMP") == "1":
+        if _HPU_DUMP_ON:
             _HPU_CAP.setdefault("op_after_invrope", {})[getattr(self, "_layer_idx", -1)] = o.detach().float().clone()
         num_tokens = o.shape[0]
         heads_per_group = self.n_local_heads // self.n_local_groups
@@ -1216,9 +1228,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         _diag("wo_a_weight", self.wo_a.weight)
         z = torch.einsum("tgk,gdk->tgd", o_flat.float(), w).to(o.dtype)  # [T, n_groups, o_lora_rank]
         _diag("op_after_einsum", z)
-        if __import__("os").environ.get("HPU_DUMP") == "1":
+        if _HPU_DUMP_ON:
             _HPU_CAP.setdefault("z_einsum", {})[getattr(self, "_layer_idx", -1)] = z.detach().float().clone()
-        if __import__("os").environ.get("HPU_DUMP") == "1":
+        if _HPU_DUMP_ON:
             _HPU_CAP.setdefault("wo_a_dq", {})[getattr(self, "_layer_idx", -1)] = \
                 wo_a_bf16.detach().float().clone()
             _HPU_CAP.setdefault("wo_a_raw", {})[getattr(self, "_layer_idx", -1)] = \
@@ -1361,7 +1373,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         Scatter by (block, off) in place using the group's slot_mapping from the
         HPU attention metadata.
         """
-        if __import__("os").environ.get("DSV4_R4B_NOSWA") == "1":
+        if _DSV4_R4B_NOSWA:
             return
         info = self._dsv4_aux_entry(self.swa_cache_layer)
         if info is None:
@@ -1456,10 +1468,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # Window = the last min(nreal, W) real kv rows, straight from the paged
         # SWA cache (R3/R8/R9; no manual `_win_cache` staging). Window positions
         # come from the request's block table (supports chunked prefill).
-        nreal = real.long().sum()
-        r3 = self._read_paged_swa_window(pos_flat[nreal - 1], W)
-        assert r3 is not None, "DSv4 paged window read unavailable"
-        win_kv, win_n, start, _valid = r3
+        # Last real position = max position (padding rows are -1). Using
+        # ``pos_flat[nreal - 1]`` with a data-dependent 0-dim index would emit a
+        # scalar extraction (aten._local_scalar_dense) -> graph break.
+        # R9: the paged path is the only path, so the read always returns a tuple
+        # (no assert, which would also break the compiled region).
+        win_kv, win_n, start, _valid = self._read_paged_swa_window(pos_flat.max(), W)
 
         is_prompt = torch.tensor(1, dtype=torch.int64, device=dev)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(
@@ -1499,10 +1513,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
         self._write_paged_swa_cache(kv_roped)
         pos_flat = positions.reshape(-1)
-        r3 = self._read_paged_swa_window(pos_flat[-1], self.window_size)
         # R3/R8/R9: window straight from the paged SWA cache (no ring buffer).
-        assert r3 is not None, "DSv4 paged window read unavailable"
-        win_kv, win_n, _start, _valid = r3
+        # No assert: it would be a dynamo graph break inside the compiled region.
+        win_kv, win_n, _start, _valid = self._read_paged_swa_window(pos_flat[-1], self.window_size)
         is_prompt = torch.tensor(0, dtype=torch.int64, device=pos_flat.device)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
 
@@ -1525,7 +1538,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
 
 _HPU_CAP: dict = {"attn_in": {}, "attn_out": {}}
-_DUMP_ON = __import__("os").environ.get("HPU_DUMP") == "1"
+_DUMP_ON = _HPU_DUMP_ON
 _MHC_PHASE = "attn"
 _MHC_LAYER = -1
 
@@ -1803,6 +1816,15 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.view(-1, self.config.hidden_size)
             positions = positions.reshape(-1)
+
+        # One-time load invariant (eager, so it never graph-breaks the compiled MoE):
+        # every routed expert's packed fp4 buffers must be present.
+        if not _V4_ROUTED_CHECKED[0]:
+            _V4_ROUTED_CHECKED[0] = True
+            for _lyr in self.layers[self.start_layer:self.end_layer]:
+                _ffn = getattr(_lyr, "ffn", None)
+                if _ffn is not None and hasattr(_ffn, "_v4_fp8_ready"):
+                    _check_v4_routed_ready(_ffn)
 
         residual, post_mix, res_mix = None, None, None
         import os as _os
@@ -2303,9 +2325,9 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
     # (_register_v4_routed_packed, called from load_weights) or restored from the
     # snapshot (_v4_fp8_ready=1). There is deliberately NO runtime-load fallback
     # here: a missing buffer means a load/restore bug and must fail loudly, never
-    # re-read the checkpoint in the forward. The check is compiler-disabled so
-    # its `.item()` host sync never graph-breaks the compiled MoE region.
-    _check_v4_routed_ready(moe)
+    # re-read the checkpoint in the forward. The readiness check runs once in the
+    # eager model forward (DeepseekV4HPUModel.forward) so its `.item()` host sync
+    # never graph-breaks this compiled region.
     if moe.packed_w1_weight.device != flat.device:
         for _name in ("packed_w1_weight", "packed_w1_scale",
                       "packed_w2_weight", "packed_w2_scale",
