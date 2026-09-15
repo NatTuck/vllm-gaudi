@@ -661,12 +661,14 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         sin = freqs.sin() * scale
         self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
 
-        # Allocate the bf16 state ring buffer for the vectorized compressor.
-        # Only 8 entries needed for CSA (win = 2*rate), but allocate cap for
-        # safety (tiny overhead: 4096 * 2048 * 2 = 16 MiB).
+        # Allocate the bf16 state buffer for the vectorized compressor. The
+        # window read addresses by ABSOLUTE position modulo `cap` (not modulo
+        # `win`), so any prefill chunk with T <= cap is correct: each position
+        # maps to a distinct slot and a window (size `win`) never wraps. One
+        # extra row (index `cap`) is a scratch slot for padding rows.
         coff = self._comp_coff
         state_dim = 2 * coff * D
-        self._dsv4_comp_state = torch.zeros(cap, state_dim, dtype=torch.bfloat16,
+        self._dsv4_comp_state = torch.zeros(cap + 1, state_dim, dtype=torch.bfloat16,
                                             device=dev)
         # Dedicated fp32 scale buffer for the indexer k_cache. HPU cannot mutate
         # two dtype-views (fp8 keys + fp32 scales) of the same cache in one
@@ -677,9 +679,10 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             self._dsv4_indexer_scales = torch.zeros(cap + 1, dtype=torch.float32,
                                                     device=dev)
             # The indexer has its own (narrower) state width; give it a separate
-            # ring buffer so it never shares the main compressor's buffer.
+            # state buffer (absolute-position addressed, +1 scratch row) so it
+            # never shares the main compressor's buffer.
             idx_state_dim = 2 * coff * self.indexer.head_dim
-            self._dsv4_indexer_state = torch.zeros(cap, idx_state_dim,
+            self._dsv4_indexer_state = torch.zeros(cap + 1, idx_state_dim,
                                                    dtype=torch.bfloat16, device=dev)
 
     def _comp_rmsnorm(self, x, w):
@@ -745,17 +748,22 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         state_dim = 2 * coff * D
         win = 2 * rate if coff == 2 else rate
 
-        # Use the ring buffer allocated in _make_compress_cache.
+        # State buffer allocated in _make_compress_cache (cap + 1 rows).
         buf = state_buf if state_buf is not None else self._dsv4_comp_state
+        # Address by ABSOLUTE position modulo `ring` (= cap), not modulo `win`:
+        # each position maps to a distinct slot for any T <= cap, so the window
+        # read is correct (the old `% win` form overwrote states within a
+        # prefill chunk longer than `win`). `ring` is also the scratch slot.
+        ring = buf.shape[0] - 1
 
-        # Write to ring buffer indexed by absolute position. Padding rows
-        # (position < 0) are redirected to a scratch slot (== win, free because
-        # the buffer has `cap` rows) so they never clobber a real token's state.
+        # Write to the state buffer indexed by absolute position. Padding rows
+        # (position < 0) go to the scratch slot so they never clobber a real
+        # token's state.
         state = torch.cat([kv, gate], dim=-1).to(torch.bfloat16)  # [T, state_dim] bf16
         pos = positions.reshape(-1).to(torch.int64)
         valid_pos = pos >= 0
-        ridx = torch.where(valid_pos, pos % win,
-                           torch.full_like(pos, win))  # scratch slot for padding
+        ridx = torch.where(valid_pos, pos % ring,
+                           torch.full_like(pos, ring))  # scratch slot for padding
         buf[ridx] = state
 
         # Read window: for each token, gather the last 'win' positions
@@ -766,7 +774,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         win_pos = pos.unsqueeze(1) + rel.unsqueeze(0)  # [T, win]
         valid = win_pos >= 0
         safe_pos = win_pos.clamp(min=0)
-        ridx_win = safe_pos % win
+        ridx_win = safe_pos % ring
         states = buf[ridx_win]  # [T, win, state_dim] bf16
 
         # APE by position-within-rate
