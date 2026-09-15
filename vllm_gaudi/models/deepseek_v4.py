@@ -632,6 +632,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         Must be called OUTSIDE any compiled region (it constructs a transformers
         ``AutoConfig``/``DeepseekV4CSACompressor``). It is invoked once per layer
         from ``DeepseekV4HPUModel.load_weights`` after the weights are loaded.
+        Also allocates the per-layer bf16 state ring buffer for the vectorized
+        compressor state path.
         """
         if self.compressor is None or self.compress_ratio <= 1:
             return
@@ -646,12 +648,6 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             DeepseekV4CSACompressor,
         )
         from transformers import AutoConfig
-        # vllm's hf_config (vllm.transformers_utils.configs.deepseek_v4) exposes
-        # only the legacy compress_ratios and drops the transformers fields the
-        # public CSA compressor reads (compress_rates, rope_parameters). Rebuild
-        # a real transformers config from the checkpoint dir so its __post_init__
-        # derives compress_rates/layer_types/rope_parameters as the CPU reference
-        # does.
         ckpt = _v4_resolve_ckpt_dir(
             getattr(self._hf_config, "_name_or_path", "") or ""
         )
@@ -664,6 +660,27 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         cos = freqs.cos() * scale
         sin = freqs.sin() * scale
         self._compress_cache = torch.cat([cos, sin], dim=-1).to(torch.bfloat16)
+
+        # Allocate the bf16 state ring buffer for the vectorized compressor.
+        # Only 8 entries needed for CSA (win = 2*rate), but allocate cap for
+        # safety (tiny overhead: 4096 * 2048 * 2 = 16 MiB).
+        coff = self._comp_coff
+        state_dim = 2 * coff * D
+        self._dsv4_comp_state = torch.zeros(cap, state_dim, dtype=torch.bfloat16,
+                                            device=dev)
+        # Dedicated fp32 scale buffer for the indexer k_cache. HPU cannot mutate
+        # two dtype-views (fp8 keys + fp32 scales) of the same cache in one
+        # graph, so the scales live here, indexed by compressed-entry index.
+        # One extra row (index `cap`) is a scratch slot for invalid/padding
+        # entries so they never overwrite a live entry's scale.
+        if self.indexer is not None:
+            self._dsv4_indexer_scales = torch.zeros(cap + 1, dtype=torch.float32,
+                                                    device=dev)
+            # The indexer has its own (narrower) state width; give it a separate
+            # ring buffer so it never shares the main compressor's buffer.
+            idx_state_dim = 2 * coff * self.indexer.head_dim
+            self._dsv4_indexer_state = torch.zeros(cap, idx_state_dim,
+                                                   dtype=torch.bfloat16, device=dev)
 
     def _comp_rmsnorm(self, x, w):
         xf = x.float()
@@ -703,130 +720,117 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             return aux[gid]
         return None
 
-    def _comp_state_paged(self, kv, gate, positions, comp_module=None, head_dim=None):
-        """R4: recompute compressed entries from the paged compressor state.
+    def _comp_state_paged_vectorized(self, kv, gate, positions, comp_module=None,
+                                      head_dim=None, state_buf=None):
+        """R4 vectorized: write per-token state to a bf16 ring buffer and
+        recompute compressed entries (no per-token .item() loops, no strided
+        fp32 page views — HPU-graph-safe).
 
-        Writes this batch's per-token ``(kv, gate)`` state to the compressor
-        state cache at its slots, then reads the completed windows back and
-        computes the compressed entries with the same math as
-        ``_comp_windows``/``_comp_windows_hca`` but addressed by **absolute
-        positions** -- no leftover/overlap buffers (and it fixes the manual
-        overlap-reset bug). Returns ``(comp [nw, head_dim], nw)`` or
-        ``(None, 0)`` when the paged state cache is unavailable.
+        Each token writes its ``(kv, gate)`` state to
+        ``state_buf[position % win]`` (ring buffer, size ``win``). Then for
+        each token a window of the last ``win`` state rows is read back and
+        passed through the compression math.
 
-        ``comp_module`` selects the main (``self.compressor``) or indexer
-        (``self.indexer.compressor``) compressor; ``head_dim`` overrides the
-        projected head width (indexer: 128).
+        ``comp_module`` selects main/indexer compressor; ``head_dim`` overrides
+        the projected head width (indexer: 128). ``state_buf`` defaults to
+        a per-layer buffer allocated in ``_make_compress_cache``.
 
-        NOTE: the state write/read use per-token contiguous 1-D slice copies
-        because strided 3-D advanced-index/index_select/gather on fp32/bf16
-        views of the packed backing fail in-engine (fp8 works). This is a
-        functional workaround; the graph-safe fast path is a custom HPU slot
-        scatter/gather (PLAN Phase C, item C0). See JOURNAL 2026-09-12.
+        Returns ``(comp [nw, D], nw, sel_indices)``.
         """
         rate = self.compress_ratio
-        if comp_module is None:
-            comp_module = self.compressor
-        if head_dim is None:
-            head_dim = self.head_dim
-        D = head_dim
+        comp_module = comp_module if comp_module is not None else self.compressor
+        D = head_dim if head_dim is not None else self.head_dim
         coff = self._comp_coff
-        layer = comp_module.state_cache
-        info = self._dsv4_aux_entry(layer)
-        if info is None:
-            return None, 0, None
-        slab2d = getattr(layer, "_dsv4_slab2d", None)
-        if slab2d is None:
-            return None, 0, None
-        bl = info.get("block_list_full")
-        if bl is None or bl.dim() != 1:
-            return None, 0, None
-        # The aux slot_mapping is padded to the fixed batch shape; the compressor
-        # runs on real tokens only (the leading rows), so take the first T.
-        slots = info["slot_mapping"][:kv.shape[0]].clone()
-        bs = info["block_size"]
-        state_dim = 2 * coff * D
-        off_elems = layer._dsv4_page_off
-        pe = layer._dsv4_page_elems
         dev = kv.device
-        state = torch.cat([kv, gate], dim=-1)
-        blocks = torch.div(slots, bs, rounding_mode="floor")
-        offs = slots % bs
-        # b2: per-token slice copy_ (eager, no advanced indexing / no strided
-        # 3-D view). The advanced-index scatter into the strided page fails
-        # in-engine; a contiguous 1-D slice copy on the 2-D slab avoids it.
-        state = state.float()
-        for t in range(kv.shape[0]):
-            b = int(blocks[t].item())
-            o = int(offs[t].item())
-            col0 = off_elems + o * state_dim
-            slab2d[b, col0:col0 + state_dim].copy_(state[t])
+        state_dim = 2 * coff * D
+        win = 2 * rate if coff == 2 else rate
 
-        # Fully tensor-space window recompute (no host sync): treat every token
-        # as a candidate window end, then select the aligned ends. Window layout
-        # matches _comp_windows: CSA = [prev rate | cur rate] (prev = stream0,
-        # cur = stream1); HCA = [cur rate].
+        # Use the ring buffer allocated in _make_compress_cache.
+        buf = state_buf if state_buf is not None else self._dsv4_comp_state
+
+        # Write to ring buffer indexed by absolute position. Padding rows
+        # (position < 0) are redirected to a scratch slot (== win, free because
+        # the buffer has `cap` rows) so they never clobber a real token's state.
+        state = torch.cat([kv, gate], dim=-1).to(torch.bfloat16)  # [T, state_dim] bf16
         pos = positions.reshape(-1).to(torch.int64)
+        valid_pos = pos >= 0
+        ridx = torch.where(valid_pos, pos % win,
+                           torch.full_like(pos, win))  # scratch slot for padding
+        buf[ridx] = state
+
+        # Read window: for each token, gather the last 'win' positions
         T = pos.numel()
         if T == 0:
-            return kv.new_zeros((0, D)), 0, None
-        win = 2 * rate if coff == 2 else rate
+            return kv.new_zeros((0, D)), torch.tensor(0, dtype=torch.int64, device=dev), None
         rel = torch.arange(-win + 1, 1, device=dev, dtype=torch.int64)
         win_pos = pos.unsqueeze(1) + rel.unsqueeze(0)  # [T, win]
         valid = win_pos >= 0
-        safe = win_pos.clamp(min=0)
-        phys = bl[torch.div(safe, bs, rounding_mode="floor")]
-        # Read per window slot with contiguous 1-D slice copies: strided 3-D
-        # index_select/gather on the fp32 page fails in-engine (fp8 SWA works).
-        K = T * win
-        phys_flat = phys.reshape(-1)
-        off_flat = (safe % bs).reshape(-1)
-        rows = torch.zeros(K, state_dim, device=dev, dtype=torch.float32)
-        for i in range(K):
-            b = int(phys_flat[i].item())
-            o = int(off_flat[i].item())
-            col0 = off_elems + o * state_dim
-            rows[i].copy_(slab2d[b, col0:col0 + state_dim])
-        # kv stays bf16 (as the manual buffers); gates are fp32 after ape.
-        states = rows.view(T, win, state_dim).to(torch.bfloat16)
+        safe_pos = win_pos.clamp(min=0)
+        ridx_win = safe_pos % win
+        states = buf[ridx_win]  # [T, win, state_dim] bf16
+
+        # APE by position-within-rate
         ape = comp_module.ape  # [rate, coff*D] fp32
-        ape_win = ape[safe % rate]  # [T, win, coff*D] fp32
+        ape_idx = pos % rate
+        ape_win = ape[ape_idx].view(T, 1, coff * D).expand(T, win, coff * D)  # [T, win, coff*D]
+
         if coff == 2:
-            kv_prev = states[:, :rate, :D]
-            gate_prev = states[:, :rate, 2 * D:3 * D].float() + ape_win[:, :rate, :D]
-            kv_cur = states[:, rate:, D:2 * D]
-            gate_cur = states[:, rate:, 3 * D:4 * D].float() + ape_win[:, rate:, D:2 * D]
-            nk = torch.cat([kv_prev, kv_cur], dim=1)
-            ng = torch.cat([gate_prev, gate_cur], dim=1)
+            # CSA: stream 0 in [0:rate], stream 1 in [rate:2*rate]
+            kv_s0 = states[:, :rate, :D].float()
+            gate_s0 = states[:, :rate, 2*D:3*D].float() + ape_win[:, :rate, :D]
+            kv_s1 = states[:, rate:, D:2*D].float()
+            gate_s1 = states[:, rate:, 3*D:4*D].float() + ape_win[:, rate:, D:2*D]
+            nk = torch.cat([kv_s0, kv_s1], dim=1)
+            ng = torch.cat([gate_s0, gate_s1], dim=1)
         else:
-            nk = states[:, :, :D]
-            ng = states[:, :, D:2 * D].float() + ape_win[:, :, :D]
+            # HCA: single stream
+            nk = states[:, :, :D].float()
+            ng = states[:, :, D:2*D].float() + ape_win[:, :, :D]
         ng = ng.masked_fill(~valid.unsqueeze(-1), float("-inf"))
-        soft = torch.softmax(ng.float(), dim=1).to(nk.dtype)
-        comp_all = (nk * soft).sum(dim=1)  # [T, D]
+        # Padding rows have no valid window -> all -inf -> softmax NaN. Zero them
+        # (their outputs are discarded) so the graph stays NaN-free.
+        all_invalid = ~valid.any(dim=1)  # [T]
+        ng = torch.where(all_invalid.view(T, 1, 1), torch.zeros_like(ng), ng)
+        soft = torch.softmax(ng.float(), dim=1)
+        comp_all = (nk * soft.to(torch.bfloat16)).sum(dim=1)  # [T, D]
         comp_all = self._comp_rmsnorm(comp_all, comp_module.norm.weight)
         idx = torch.div(pos + 1, rate, rounding_mode="floor") - 1
         comp_all = _apply_rope(comp_all, (idx * rate).clamp(min=0),
                                self._compress_cache, self.rope_head_dim)
-        # Gate selection by ABSOLUTE position: window ends are positions e with
-        # (e+1) % rate == 0. For a contiguous batch the ends are
-        # s, s+rate, ... where s = (-(pos[0]+1)) % rate.
-        s = (-(int(pos[0].item()) + 1)) % rate
-        if s >= T:
-            return kv.new_zeros((0, D)), 0, None
-        sel = torch.arange(s, T, rate, device=dev, dtype=torch.int64)
-        return comp_all.index_select(0, sel), int(sel.numel()), sel
+
+        # Select window-end-aligned entries by absolute position. Real positions
+        # are contiguous and leading, padding rows (pos < 0) are trailing, so
+        # nreal = #(pos >= 0) and the first real position is p0 = max - nreal + 1.
+        # The aligned rows are s, s+rate, ... where s = (-(p0+1)) % rate is a ROW
+        # index. A FIXED-size selection (max_sel rows) keeps every shape static
+        # (no bool-mask indexing / data-dependent shapes); invalid rows (>= nreal)
+        # are clamped to a real row only for the gather, while the returned `sel`
+        # stays unclamped so the writers redirect them to pad-block slots.
+        nreal = valid_pos.sum()
+        p0 = pos.max() - nreal + 1
+        s = (-(p0 + 1)) % rate
+        max_sel = (T + rate - 1) // rate
+        sel = s + torch.arange(max_sel, device=dev, dtype=torch.int64) * rate
+        nw = (sel < nreal).sum().to(torch.int64)
+        sel_clamped = sel.clamp(max=(nreal - 1).clamp(min=0))
+        comp = comp_all.index_select(0, sel_clamped)  # [max_sel, D], static
+        return comp, nw, sel
 
     def _write_paged_compressed(self, comp, sel, positions):
         """R5: write the compressor's compressed entries into the paged
         compressed-MLA cache (the attention layer's own cache, fp8).
 
-        ``sel`` indexes the real-token rows that completed a window; the aux
-        gid-0 entry carries the per-token compressed slot mapping.
+        Uses ``page[blocks, offs] = comp`` (strided fp8 advanced-index scatter,
+        which compiles fine on HPU — same pattern as ``_write_paged_swa_cache``).
+        ``sel`` indexes the rows that completed a window.
         """
+        if comp.shape[0] == 0:
+            return
         from vllm.forward_context import get_forward_context
-
-        md = get_forward_context().attn_metadata
+        ctx = get_forward_context()
+        if ctx is None:
+            return
+        md = ctx.attn_metadata
         aux = getattr(md, "dsv4_aux_meta", None)
         if not aux:
             return
@@ -836,32 +840,28 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         slab2d = getattr(self, "_dsv4_slab2d", None)
         if slab2d is None:
             return
-        T = positions.numel()
-        slots = entry["slot_mapping"][:T]
+        slots = entry["slot_mapping"]
         if sel is not None:
-            slots = slots[sel]
+            # `sel` is the fixed-size aligned-row selection from
+            # `_comp_state_paged_vectorized`. Entries with row >= nreal are
+            # invalid (no window completed); clamp them to the last row of the
+            # padded slot_mapping, which is a pad-block slot, so their writes
+            # land harmlessly outside the request's real blocks.
+            sel_slot = sel.clamp(max=slots.shape[0] - 1)
+            slots = slots[sel_slot]
         sbs = entry["storage_block_size"]
         hd = self.head_dim
         page = slab2d[:, self._dsv4_page_off:self._dsv4_page_off +
                       self._dsv4_page_elems].view(-1, sbs, hd)
         blocks = torch.div(slots, sbs, rounding_mode="floor")
         offs = slots % sbs
-        # NOTE: this method runs in the graph-disabled (eager) compressor, and
-        # eager advanced-index scatter on the strided fp8 page view is a silent
-        # no-op on HPU (it works only inside a compiled graph, e.g. the SWA
-        # write). Write each new entry with a contiguous 1-D slice copy instead;
-        # the graph-safe fast path is the custom HPU slot op (PLAN C0).
-        comp_fp8 = comp.to(page.dtype)
-        off_elems = self._dsv4_page_off
-        for i in range(comp.shape[0]):
-            b = int(blocks[i].item())
-            o = int(offs[i].item())
-            col0 = off_elems + o * hd
-            slab2d[b, col0:col0 + hd].copy_(comp_fp8[i])
+        # Strided fp8 advanced-index scatter compiles fine (SWA cache gate).
+        page[blocks, offs] = comp.to(page.dtype)
         if _DSV4_R6_DEBUG and comp.shape[0] > 0:
+            _off_elems = self._dsv4_page_off
             _b0 = int(blocks[0].item())
             _o0 = int(offs[0].item())
-            _probe = slab2d[_b0, off_elems + _o0 * hd:off_elems + _o0 * hd + 3].to(
+            _probe = slab2d[_b0, _off_elems + _o0 * hd:_off_elems + _o0 * hd + 3].to(
                 torch.bfloat16).float().tolist()
             print(f"[R5-write] layer={getattr(self, '_layer_idx', '?')} n={comp.shape[0]} "
                   f"block={_b0} off={_o0} "
@@ -955,7 +955,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                                          torch.float8_e4m3fn)[0]
         return x, scale
 
-    def _write_paged_indexer(self, icomp, sel, positions):
+    def _write_paged_indexer(self, icomp, sel, positions, nw=None):
         """R7: write the indexer compressed keys into the paged indexer k_cache
         as fp8 + a per-token fp32 scale.
 
@@ -968,10 +968,13 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if layer is None or icomp.shape[0] == 0:
             return
         slab2d = layer._dsv4_slab2d
-        T = positions.numel()
-        slots = info["slot_mapping"][:T]
+        slots = info["slot_mapping"]
         if sel is not None:
-            slots = slots[sel]
+            # Fixed-size aligned-row selection; invalid rows (>= nreal) clamp to
+            # the last (pad-block) row of the padded slot_mapping so their writes
+            # land harmlessly outside the request's real blocks.
+            sel_slot = sel.clamp(max=slots.shape[0] - 1)
+            slots = slots[sel_slot]
         sbs = info["storage_block_size"]
         tok = self.indexer.head_dim  # 128 fp8 bytes/token
         off = layer._dsv4_page_off
@@ -979,22 +982,36 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         blocks = torch.div(slots, sbs, rounding_mode="floor")
         offs = slots % sbs
         x, scale = self._quant_indexer_key(icomp)
-        x_u8 = x.view(torch.uint8)
-        for i in range(icomp.shape[0]):
-            b = int(blocks[i].item())
-            o = int(offs[i].item())
-            col0 = off + o * tok
-            slab2d[b, col0:col0 + tok].copy_(x_u8[i])
-            scol0 = off + fp8_elems + o * 4
-            slab2d[b, scol0:scol0 + 4].copy_(scale[i:i + 1].view(torch.uint8))
+        # Keys (fp8) go into the paged k_cache: one strided-view mutation.
+        fp8_page = slab2d[:, off:off + fp8_elems].view(-1, sbs, tok)
+        fp8_page[blocks, offs] = x.to(slab2d.dtype)
+        # Scales go into the dedicated fp32 buffer, indexed by the compressed
+        # entry index ci = (pos+1)//rate - 1 (HPU cannot mutate two dtype-views
+        # of the same cache in one graph — see notes/hpu-clean.md §4).
+        rate = self.compress_ratio
+        pos_all = positions.reshape(-1)
+        if sel is not None:
+            if nw is not None:
+                # `nw` is the number of valid (window-end-aligned, real) rows;
+                # rows [nw, max_sel) are invalid and must not touch a live entry.
+                valid = (torch.arange(sel.shape[0], device=sel.device) < nw)
+                sel_ci = torch.where(valid, sel, torch.zeros_like(sel))
+                ci = ((pos_all[sel_ci] + 1) // rate - 1).clamp(min=0, max=self._cap - 1)
+                ci = torch.where(valid, ci, torch.full_like(ci, self._cap))
+            else:
+                sel_ci = sel.clamp(max=pos_all.numel() - 1)
+                ci = ((pos_all[sel_ci] + 1) // rate - 1).clamp(min=0, max=self._cap - 1)
+        else:
+            ci = torch.arange(icomp.shape[0], device=pos_all.device).clamp(max=self._cap - 1)
+        self._dsv4_indexer_scales[ci] = scale.to(torch.float32)
 
     def _read_paged_indexer(self, cap):
         """R7: gather indexer compressed keys ``[cap, 128]`` from the paged
         indexer k_cache and dequantize (fp8 * per-token scale) to bf16.
 
-        Entries beyond the live count stay zero and are masked by the caller.
-        The fp8 region is read with ``index_select`` on the strided page view
-        (fp8 strided reads work on HPU).
+        Keys come from the paged k_cache; scales come from the dedicated fp32
+        buffer (``_dsv4_indexer_scales``). Entries beyond the live count stay
+        zero and are masked by the caller.
         """
         layer, info = self._indexer_kcache_aux()
         if layer is None:
@@ -1012,10 +1029,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         logical = logical.clamp(max=bl.numel() - 1)
         phys = bl[logical].clamp(min=0)
         fp8_page = slab2d[:, off:off + fp8_elems].view(-1, sbs, tok)
-        sc_page = slab2d[:, off + fp8_elems:off + fp8_elems + sbs * 4].view(-1, sbs, 4)
         x = fp8_page.index_select(0, phys).view(torch.float8_e4m3fn)
         x = x.reshape(-1, tok)[:cap]
-        sc = sc_page.index_select(0, phys).view(torch.float32).reshape(-1)[:cap]
+        sc = self._dsv4_indexer_scales[:cap]
         out = torch.ops.hpu.cast_from_fp8(x, sc.reshape(-1, 1), torch.bfloat16)
         if _DSV4_R6_DEBUG:
             _live = min(int(self._c_n), cap)
@@ -1027,38 +1043,34 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                       f"c_n={int(self._c_n)} i_n={int(self._i_n)}", flush=True)
         return out
 
-    @torch.compiler.disable
-    def _compressor_compilable(self, hidden, qr, positions, is_prompt, real=None):
-        # FIXME(Step 5.5/6): this method uses data-dependent tensor slice bounds
-        # (`buf[n:total]` with tensor n/total), which miscompile inside the
-        # compiled layer region (RuntimeError: expanded size 0 vs 1024). Run it
-        # eagerly (graph break) until the paged-KV rework makes the compressor
-        # fully graph-safe with fixed shapes / slot_mapping.
-        T_full = hidden.shape[0]
-        if real is not None:
-            # Real-token selection (bool-mask indexing) must stay out of the
-            # compiled region; it is safe here (eager, graph-disabled).
-            hidden = hidden[real]
-            qr = qr[real]
-            positions = positions[real]
+    def _compressor_compilable(self, hidden, qr, positions, is_prompt):
+        """Graph-compilable compressor forward.
+
+        Computes KV/gate projections, writes per-token state via
+        ``_comp_state_paged_vectorized`` (bf16 ring buffer, no ``.item()``
+        loops), writes completed compressed entries to the paged compressed-MLA
+        cache (``page[blocks, offs] = comp``, fp8 strided scatter), and runs
+        the scorer / top-k / block_bias logic with pure tensor ops (no
+        data-dependent Python branches, static ``cap`` shape).
+
+        ``is_prompt`` is a scalar tensor (1 for prefill, 0 for decode). This
+        function runs over the FULL (possibly padded) batch; padding rows
+        (position < 0) are handled inside by masks (ring scratch slot +
+        all-invalid-row zeroing + ``nreal``-based aligned-row selection), so no
+        bool-mask indexing / dynamic shapes ever reach the graph.
+        """
         if self.compressor is None or self.compress_ratio <= 1:
             return None, None, None, None
         rate = self.compress_ratio
         D = self.head_dim
         dev = hidden.device
-        # Built once at load time (see _make_compress_cache); never build here.
         cache = self._compress_cache
+        T = hidden.shape[0]
 
-        # Live compressed-entry count from ABSOLUTE positions: an entry ci exists
-        # for every window end e with (e+1) % rate == 0 and e <= last_pos, so the
-        # count through the last real position is (last_pos + 1) // rate. This is
-        # stateless, hence correct for chunked prefill / prefix caching. (A
-        # per-step counter reset on every prefill step forgets the previous
-        # chunk's entries -- the R10.1 chunked-prefill bug.)
+        # Live compressed-entry count from absolute positions (stateless).
         _pos = positions.reshape(-1)
-        _last = _pos[-1] if _pos.numel() > 0 else torch.tensor(-1, dtype=torch.int64, device=dev)
-        self._c_n = ((_last + 1) // rate).to(torch.int64)
-        self._i_n = ((_last + 1) // 4).to(torch.int64)
+        _last = _pos.max() if _pos.numel() > 0 else torch.tensor(-1, dtype=torch.int64, device=dev)
+        live = ((_last + 1) // rate).to(torch.int64)
 
         c = self.compressor
         fused = self._comp_weight(c.fused_wkv_wgate, hidden.shape[-1])
@@ -1068,17 +1080,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         gate_w = fused[kv_out:]
         kv = hidden @ kv_w.t()
         gate = hidden @ gate_w.t()
-        # R4/R9: the paged compressor state is the only path (absolute positions;
-        # no leftover/overlap buffers, which also fixes the manual overlap-reset
-        # bug).
-        comp, _nw_p, sel_p = self._comp_state_paged(kv, gate, positions)
-        if comp is None:
-            comp = kv.new_zeros((0, D))
-            sel_p = None
+
+        # R4 vectorized state write + window compression
+        comp, _nw_p, sel_p = self._comp_state_paged_vectorized(kv, gate, positions)
         if comp.shape[0] > 0:
             self._write_paged_compressed(comp, sel_p, positions)
-        # R6: read the compressed entries back from the paged cache (the source
-        # of truth).
         compressed_kv_full = self._read_paged_compressed(self._cap)
         if compressed_kv_full is None:
             compressed_kv_full = kv.new_zeros((self._cap, D))
@@ -1093,15 +1099,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             igate_w = ifused[2 * idx_h:]
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
-            icomp, _nw_i, _sel_i = self._comp_state_paged(ikv, igate, positions,
-                                                          comp_module=idx.compressor,
-                                                          head_dim=idx_h)
-            if icomp is None:
-                icomp = kv.new_zeros((0, idx_h))
-                _sel_i = None
+            icomp, _nw_i, _sel_i = self._comp_state_paged_vectorized(
+                ikv, igate, positions, comp_module=idx.compressor, head_dim=idx_h,
+                state_buf=getattr(self, "_dsv4_indexer_state", None))
             if icomp.shape[0] > 0:
-                # R7: write the indexer keys into the paged k_cache (fp8+scale).
-                self._write_paged_indexer(icomp, _sel_i, positions)
+                self._write_paged_indexer(icomp, _sel_i, positions, _nw_i)
             idx_compressed = self._read_paged_indexer(self._cap)
             if idx_compressed is None:
                 idx_compressed = kv.new_zeros((self._cap, idx_h))
@@ -1109,21 +1111,21 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             idx_h = D
             idx_compressed = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
 
-        # ---- scorer / topk / block_bias ----
-        T = hidden.shape[0]
-        # clen is used as a python int (slice bounds, arange, min(), topk k,
-        # full_like fill). The underlying counter is a 0-dim tensor for the
-        # graph-compilable parts; materialize it here for the data-dependent
-        # topk logic, which is correct in eager (== correct everywhere).
-        clen = int(self._c_n)
+        # ---- scorer / topk / block_bias (tensor-only, no Python branches) ----
+        # Only the static `has_idx` (CSA vs HCA) selects a path; all
+        # data-dependent bounds (live-entry count) are expressed as tensor masks
+        # (the causal threshold subsumes the live count), so nothing here
+        # graph-breaks.
         cap = self._cap
-        if has_idx and clen > 0:
+        clen = live.to(torch.int64)
+        block_bias = compressed_kv_full.new_full((T, cap), float("-inf"))
+        topk = torch.empty(T, 0, dtype=torch.long, device=dev)
+
+        if has_idx:
+            # CSA: indexer top-k over the compressed entries.
             nhead = self.indexer.n_head
             qb_w = self.indexer.wq_b.weight.detach()
             if qb_w.dtype == torch.float8_e4m3fn:
-                # indexer.wq_b is block-fp8 that force-channel-fp8 converted to
-                # per-row fp8. Dequant correctly on HPU for the scale rank that
-                # is actually stored: per-row (1-D) or block (2-D).
                 from vllm_gaudi.extension.ops import dequant_block_fp8_weight_naive
                 wq_s = getattr(self.indexer.wq_b, "weight_scale", None)
                 if wq_s is None:
@@ -1143,57 +1145,102 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             ws = self.indexer.n_head ** -0.5
             q = (qr @ qb.t()).view(T, nhead, idx_h).to(torch.bfloat16)
             q = _apply_rope(q, positions, cache, self.rope_head_dim)
-            scores = torch.matmul(q.float(), idx_compressed[:clen].float().t())
+            # Score over ALL cap entries; the causal mask below zeroes the
+            # not-yet-live ones (entry >= causal_threshold), so no dynamic slice.
+            scores = torch.matmul(q.float(), idx_compressed.float().t())
             scores = torch.relu(scores) * ss
             w = (hidden @ wp.t()).float() * ws
             scores = (scores * w.unsqueeze(-1)).sum(dim=1)
             causal_threshold = (positions + 1) // rate
-            entry = torch.arange(clen, device=scores.device)
+            entry = torch.arange(cap, device=scores.device)
             future = entry.unsqueeze(0) >= causal_threshold.unsqueeze(-1)
             scores = scores.masked_fill(future, float("-inf"))
-            k = min(self.indexer.topk_tokens, clen)
-            topk = scores.topk(k, dim=-1).indices
-            invalid = topk >= causal_threshold.unsqueeze(-1)
-            topk = torch.where(invalid, torch.full_like(topk, -1), topk)
+            k_static = min(self.indexer.topk_tokens, cap)
+            topk = scores.topk(k_static, dim=-1).indices
+            valid_topk = topk < causal_threshold.unsqueeze(-1)
+            topk = torch.where(valid_topk, topk, torch.full_like(topk, -1))
             valid = topk >= 0
-            safe = torch.where(valid, topk, torch.full_like(topk, clen))
-            bb = compressed_kv_full.new_full((1, 1, T, cap + 1), float("-inf"))
             safe_cap = torch.where(valid, topk, torch.full_like(topk, cap))
+            bb = compressed_kv_full.new_full((1, 1, T, cap + 1), float("-inf"))
             bb.scatter_(-1, safe_cap.unsqueeze(0).unsqueeze(0), 0.0)
             block_bias = bb[..., :cap][0, 0]
-        elif clen > 0 and T > 1:
+        else:
+            # HCA: dense causal mask over the live compressed entries.
             causal = (positions + 1) // rate
             entry = torch.arange(cap, device=dev)
-            block_bias = compressed_kv_full.new_full((T, cap), float("-inf"))
             block_bias.masked_fill_(
                 (entry.unsqueeze(0) < causal.unsqueeze(-1)) & (entry.unsqueeze(0) < clen),
                 0.0)
-            topk = torch.empty(T, 0, dtype=torch.long, device=dev)
-        else:
-            block_bias = None
-            topk = torch.empty(T, 0, dtype=torch.long, device=dev)
-        if real is not None and block_bias is not None and T_full != T:
-            # The compressor ran on the real tokens only ([nreal, cap]); scatter
-            # the per-query block_bias back to the padded batch so the caller
-            # (compiled forward_prefill) gets a static [T, cap] mask without
-            # data-dependent slicing.
-            bb_full = block_bias.new_full((T_full, block_bias.shape[-1]), float("-inf"))
-            bb_full[real] = block_bias
-            block_bias = bb_full
-        return compressed_kv_full, self._c_n, block_bias, topk
 
-    def _run_compressor(self, hidden_states, q_residual, positions, is_prompt, real=None):
-        """Run the graph-compilable CSA compressor/indexer over real tokens.
-        Returns (compressed_kv_full [CAP,D], compressed_n, block_bias [T,CAP] or None, _).
-        ``real`` is the optional real-token mask (prefill); it is applied inside
-        the compiler-disabled compressor so no bool indexing hits the graph."""
+        return compressed_kv_full, live, block_bias, topk
+
+    def _get_compiled_compressor(self):
+        """Return a torch.compile'd ``_compressor_compilable`` (cached).
+
+        The vectorized paged writes only take effect inside a compiled graph
+        (eager strided fp8 scatters are silent no-ops on HPU). Both the prefill
+        (``_run_compressor``) and decode (``_run_compressor_decode``) boundaries
+        route through this one standalone compiled callable because inlining the
+        compressor's view mutations into the layer graph trips aot_autograd's
+        "non-differentiable view input mutations" assertion.
+        """
+        fn = getattr(self, "_compiled_compressor_fn", None)
+        if fn is None:
+            from vllm_gaudi.utils import HPUCompileConfig
+            # fullgraph=True: the compressor must be a single strict graph. Any
+            # dynamic shape / data-dependent branch would raise here rather than
+            # silently break, so this is the enforcement point for criterion B.
+            fn = torch.compile(self._compressor_compilable,
+                               **HPUCompileConfig(fullgraph=True).get_compile_args())
+            self._compiled_compressor_fn = fn
+        return fn
+
+    @torch.compiler.disable
+    def _run_compressor(self, hidden_states, q_residual, positions, is_prompt):
+        """Run the CSA compressor/indexer over the full (possibly padded) batch.
+
+        No bool-mask indexing: padding rows (position < 0) are handled by masks
+        inside ``_compressor_compilable`` (ring scratch slot + all-invalid-row
+        zeroing + ``nreal``-based aligned-row selection), so the compressor body
+        has no dynamic shapes and is a single clean graph.
+
+        The boundary itself is forced by a framework limitation, not a semantic
+        one: inlining the compressor's cache-buffer view mutations into the layer
+        graph trips ``aot_autograd() does not yet handle non-differentiable view
+        input mutations``. The compressor therefore runs as its own compiled
+        graph (all vectorized writes effective).
+        """
         if self.compressor is None or self.compress_ratio <= 1:
             D = self.head_dim
             dev = hidden_states.device
             return (torch.zeros(0, D, dtype=torch.bfloat16, device=dev),
                     torch.tensor(0, dtype=torch.int64, device=dev), None, None)
-        ckv_full, c_n, bb, _ = self._compressor_compilable(
-            hidden_states, q_residual, positions, is_prompt, real)
+        ckv_full, c_n, bb, _ = self._get_compiled_compressor()(
+            hidden_states, q_residual, positions, is_prompt)
+        if ckv_full is None:
+            cap = max(self._cap, 1)
+            dev = hidden_states.device
+            D = self.head_dim
+            return (torch.zeros(cap, D, dtype=torch.bfloat16, device=dev),
+                    torch.tensor(0, dtype=torch.int64, device=dev), None, None)
+        return ckv_full, c_n, bb, None
+
+    @torch.compiler.disable
+    def _run_compressor_decode(self, hidden_states, q_residual, positions, is_prompt):
+        """Decode compressor: no real-token mask.
+
+        Uses the standalone compiled compressor. The compressor mutates several
+        cache buffers through typed views; inlining it into the layer graph trips
+        aot_autograd's "non-differentiable view input mutations" assertion, so
+        this boundary is a planned graph break and the compressor runs as its own
+        compiled graph (0 internal breaks, all vectorized writes effective)."""
+        if self.compressor is None or self.compress_ratio <= 1:
+            D = self.head_dim
+            dev = hidden_states.device
+            return (torch.zeros(0, D, dtype=torch.bfloat16, device=dev),
+                    torch.tensor(0, dtype=torch.int64, device=dev), None, None)
+        ckv_full, c_n, bb, _ = self._get_compiled_compressor()(
+            hidden_states, q_residual, positions, is_prompt)
         if ckv_full is None:
             cap = max(self._cap, 1)
             dev = hidden_states.device
@@ -1444,16 +1491,16 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         vllm pads the prefill to a fixed length; only rows with position >= 0
         are real tokens and they are the leading ``[0:nreal)`` rows. The window
-        cache keeps the last ``min(nreal, window)`` real kv rows; the compressor
-        sees only real tokens. The query side (qr/kv/positions) stays the full
-        padded batch so the returned hidden has the shape vllm expects; padding
-        query rows are masked to attend every slot so their (discarded) output
-        stays finite.
+        cache keeps the last ``min(nreal, window)`` real kv rows. The whole
+        (padded) batch flows through the compressor; padding rows are handled by
+        masks inside ``_compressor_compilable``. The query side
+        (qr/kv/positions) stays the full padded batch so the returned hidden has
+        the shape vllm expects; padding query rows are masked to attend every
+        slot so their (discarded) output stays finite.
 
         Graph-safe: no ``int(tensor)`` host sync, no data-dependent Python
-        control flow, no bool-mask indexing in the compiled region. The real
-        token count is a tensor and the real-token selection happens inside the
-        compiler-disabled compressor.
+        control flow, no bool-mask indexing. The real token count is a tensor
+        (``nreal``), used only in tensor masks and static-size selection.
         """
         qr, kv = self._fused_qkv(hidden_states)
         kv_roped = _apply_rope(kv, positions, self.rotary_emb.cos_sin_cache, self.rope_head_dim)
@@ -1477,7 +1524,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         is_prompt = torch.tensor(1, dtype=torch.int64, device=dev)
         comp_full, comp_n, comp_bb, _topk = self._run_compressor(
-            hidden_states, qr, pos_flat, is_prompt, real)
+            hidden_states, qr, pos_flat, is_prompt)
 
         cap = self._cap
         past_kv = torch.cat([win_kv, comp_full], dim=0)
@@ -1517,7 +1564,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # No assert: it would be a dynamo graph break inside the compiled region.
         win_kv, win_n, _start, _valid = self._read_paged_swa_window(pos_flat[-1], self.window_size)
         is_prompt = torch.tensor(0, dtype=torch.int64, device=pos_flat.device)
-        comp_full, comp_n, comp_bb, _topk = self._run_compressor(hidden_states, qr, pos_flat, is_prompt)
+        comp_full, comp_n, comp_bb, _topk = self._run_compressor_decode(hidden_states, qr, pos_flat, is_prompt)
 
         cap = self._cap
         past_kv = torch.cat([win_kv, comp_full], dim=0)
