@@ -686,9 +686,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                                                    dtype=torch.bfloat16, device=dev)
 
     def _comp_rmsnorm(self, x, w):
+        # Match the reference DeepseekV4RMSNorm: normalize in fp32, round to the
+        # input dtype, then apply the weight (do not fuse the weight multiply in
+        # fp32 — the reference rounds before it).
         xf = x.float()
         out = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
-        return (out * w.float()).to(x.dtype)
+        return w * out.to(x.dtype)
 
     @staticmethod
     def _comp_weight(lin, in_features: int) -> torch.Tensor:
@@ -777,10 +780,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         ridx_win = safe_pos % ring
         states = buf[ridx_win]  # [T, win, state_dim] bf16
 
-        # APE by position-within-rate
+        # APE by each window slot's absolute position-within-rate (the reference
+        # adds position_bias[j] to the j-th token of the window, not one bias
+        # broadcast to the whole window).
         ape = comp_module.ape  # [rate, coff*D] fp32
-        ape_idx = pos % rate
-        ape_win = ape[ape_idx].view(T, 1, coff * D).expand(T, win, coff * D)  # [T, win, coff*D]
+        ape_idx = (safe_pos % rate).reshape(-1)          # [T*win]
+        ape_win = ape[ape_idx].view(T, win, coff * D)    # [T, win, coff*D]
 
         if coff == 2:
             # CSA: stream 0 in [0:rate], stream 1 in [rate:2*rate]
@@ -800,7 +805,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         all_invalid = ~valid.any(dim=1)  # [T]
         ng = torch.where(all_invalid.view(T, 1, 1), torch.zeros_like(ng), ng)
         soft = torch.softmax(ng.float(), dim=1)
-        comp_all = (nk * soft.to(torch.bfloat16)).sum(dim=1)  # [T, D]
+        # Match the reference's bf16 aggregation: round the products to bf16,
+        # accumulate in fp32, then round the result (torch.sum on bf16 uses fp32
+        # accumulation). Keeping the accumulation in fp32 keeps the compiled
+        # graph shape-independent (a plain bf16 .sum is not).
+        comp_all = (nk.to(torch.bfloat16) * soft.to(torch.bfloat16)).float().sum(dim=1).to(
+            torch.bfloat16)  # [T, D]
         comp_all = self._comp_rmsnorm(comp_all, comp_module.norm.weight)
         idx = torch.div(pos + 1, rate, rounding_mode="floor") - 1
         comp_all = _apply_rope(comp_all, (idx * rate).clamp(min=0),
