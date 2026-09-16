@@ -1121,6 +1121,15 @@ def _scatter_target_tokens(target_token_ids: torch.Tensor, logits_indices: torch
     return target_token_ids
 
 
+def _apply_grammar_bitmask_kernel(logits: torch.Tensor, bitmask: torch.Tensor) -> torch.Tensor:
+    """Apply the structured-output bitmask on the HPU (R4/B7).
+
+    Kept as a separate function so it can be torch.compiled into a single HPU
+    graph; run eager it would be a stray HPU kernel outside a graph (R4)."""
+    xgr_torch.apply_token_bitmask_inplace_torch(logits, bitmask)
+    return logits
+
+
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(HpuModelAdapter(
         *args, **kwargs), disable_tensor_cache=True) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
@@ -4139,7 +4148,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # removes the previous ``logits.cpu() -> xgr_cpu -> logits.copy_``
         # round-trip, which left the HPU (violating HPU residency) and added a
         # host sync per step.
-        xgr_torch.apply_token_bitmask_inplace_torch(logits, grammar_bitmask)
+        _kernel = getattr(self, '_apply_grammar_bitmask_kernel', None)
+        if _kernel is None:
+            xgr_torch.apply_token_bitmask_inplace_torch(logits, grammar_bitmask)
+        else:
+            _kernel(logits, grammar_bitmask)
 
     def _configure_lora(self, input, requests, req_ids, is_prompt):
         lora_mask = None
@@ -5128,9 +5141,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.compile_config = HPUCompileConfig()
 
             # Runner-side per-step ops that are not part of the model graph
-            # (R2 gather, R3 scatter) must also be single compiled graphs.
+            # (R2 gather, R3 scatter, R4 grammar bitmask) must also be single
+            # compiled graphs.
             self._gather_logits_rows = self._compile(_gather_logits_rows)
             self._scatter_target_tokens = self._compile(_scatter_target_tokens)
+            self._apply_grammar_bitmask_kernel = self._compile(_apply_grammar_bitmask_kernel)
 
             if self.compile_config.regional_compilation:
                 self._compile_methods()
@@ -6398,6 +6413,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
             multiplier = 5 if self.compile_config.regional_compilation else 1
+            # Each decoder layer is its own compiled region and specializes on
+            # its own cache prefix, so a run compiles ~num_layers graphs per
+            # shape. Make sure the recompile limit covers that (a buckets-only
+            # limit is too small for a small max_num_batched_tokens, which made
+            # chunked prefill hard-fail under fullgraph).
+            n_layers = getattr(getattr(self.model_config, "hf_config", None),
+                               "num_hidden_layers", 0) or 0
+            multiplier = max(multiplier, n_layers + 2)
             cache_size_limit = 1 + multiplier * (len(self.bucketing_manager.prompt_buckets) +
                                                  len(self.bucketing_manager.decode_buckets))
             torch._dynamo.config.cache_size_limit = max(cache_size_limit, torch._dynamo.config.cache_size_limit)
