@@ -59,29 +59,14 @@ _DSV4_SPARSE_CHUNK = int(os.environ.get("DSV4_SPARSE_CHUNK", "256"))
 # so each chunk stays ~256 MB fp32.
 _DSV4_INDEXER_CHUNK_ELEMS = int(os.environ.get("DSV4_INDEXER_CHUNK_ELEMS", str(1 << 26)))
 
-# P0.3: inline the compressor into the layer's compiled region (one bigger graph)
-# instead of a separate compiled compressor graph per layer.
-# Default 0 (split): P0.3 measured that inlining the compressor into the layer
-# graph OOMs at the production KV util (0.8) because the compiled workspace grows
-# ~8 GiB. Inlining is available (DSV4_INLINE_COMPRESSOR=1) and is the target once
-# the workspace is reduced. The int8-base refactor (P0.2) is unconditional.
-_DSV4_INLINE_COMPRESSOR = os.environ.get("DSV4_INLINE_COMPRESSOR", "0") == "1"
-
-
-def _dsv4_maybe_disable(fn):
-    """Keep the compressor as its own compiled region unless inlining is enabled.
-
-    The decorator and the body must agree: when disabled, the wrapper runs eagerly
-    and must call the separately-compiled compressor; when inlined, the wrapper is
-    traced into the layer graph and must call `_compressor_compilable` directly.
-    """
-    return fn if _DSV4_INLINE_COMPRESSOR else torch.compiler.disable(fn)
-
-# The routed fp4 readiness invariant is a load-time property; check it once in the
-# eager model forward (see `_check_v4_routed_ready`) rather than per-MoE inside the
-# compiled region, where the `.item()` host sync would graph-break.
-_V4_ROUTED_CHECKED = [False]
-
+# The compressor is isolated from the layer graph by a *controlled graph break*
+# (`torch._dynamo.graph_break()`), NOT by `torch.compiler.disable`. A disable runs
+# the wrapper eagerly (HPU compute outside a graph, forbidden); a graph break
+# partitions the layer region so the compressor body is traced into its own
+# compiled segment (own workspace), with no tensor work at the boundary. The break
+# is required because inlining the compressor into the layer graph trips
+# aot_autograd's non-differentiable view-mutation assertion and grows the combined
+# workspace ~8 GiB (OOM at the production KV util 0.8).
 
 def _diag(name: str, t: torch.Tensor, *, layer: int | None = None) -> None:
     """Print once (first forward) a NaN/abs-mean/variance diagnostic for t."""
@@ -1379,44 +1364,33 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
         return compressed_kv_full, live, block_bias, topk
 
-    def _get_compiled_compressor(self):
-        """Return a torch.compile'd ``_compressor_compilable`` (cached).
-
-        The vectorized paged writes only take effect inside a compiled graph
-        (eager strided fp8 scatters are silent no-ops on HPU). Both the prefill
-        (``_run_compressor``) and decode (``_run_compressor_decode``) boundaries
-        route through this one standalone compiled callable because inlining the
-        compressor's view mutations into the layer graph trips aot_autograd's
-        "non-differentiable view input mutations" assertion.
-        """
-        fn = getattr(self, "_compiled_compressor_fn", None)
-        if fn is None:
-            from vllm_gaudi.utils import HPUCompileConfig
-            # fullgraph=True: the compressor must be a single strict graph. Any
-            # dynamic shape / data-dependent branch would raise here rather than
-            # silently break, so this is the enforcement point for criterion B.
-            fn = torch.compile(self._compressor_compilable,
-                               **HPUCompileConfig(fullgraph=True).get_compile_args())
-            self._compiled_compressor_fn = fn
-        return fn
-
-    @_dsv4_maybe_disable
     def _run_compressor(self, hidden_states, q_residual, positions, is_prompt):
-        """Run the CSA compressor/indexer inline in the layer graph (P0.3).
+        """CSA compressor/indexer for prefill, isolated by a controlled graph break.
 
-        Inlined so the layer's compiled region is one bigger graph instead of two
-        (the layer + a separate compressor graph). The compressor body is already
-        a strict ``fullgraph=True`` single graph; the only reason it used to be a
-        separate region was the aot aliased-view assertion.
+        The compressor must be its own compiled graph: inlining it into the layer
+        graph trips ``aot_autograd``'s non-differentiable view-mutation assertion
+        and grows the combined workspace ~8 GiB (OOM at util 0.8). The
+        ``torch._dynamo.graph_break()`` calls partition the layer region so the
+        compressor body is traced into its own compiled segment with its own
+        workspace. The boundary carries no tensor work.
+
+        This is a real break, **not** ``torch.compiler.disable``: the body stays
+        compiled. ``compiler.disable`` would run the wrapper eagerly, i.e. HPU
+        compute outside a graph, which is forbidden.
         """
-        return self._run_compressor_impl(
+        torch._dynamo.graph_break()
+        out = self._run_compressor_impl(
             hidden_states, q_residual, positions, is_prompt)
+        torch._dynamo.graph_break()
+        return out
 
-    @_dsv4_maybe_disable
     def _run_compressor_decode(self, hidden_states, q_residual, positions, is_prompt):
-        """Decode compressor, inlined (P0.3). See ``_run_compressor``."""
-        return self._run_compressor_impl(
+        """Decode compressor; see ``_run_compressor`` for the controlled break."""
+        torch._dynamo.graph_break()
+        out = self._run_compressor_impl(
             hidden_states, q_residual, positions, is_prompt)
+        torch._dynamo.graph_break()
+        return out
 
     def _run_compressor_impl(self, hidden_states, q_residual, positions, is_prompt):
         if self.compressor is None or self.compress_ratio <= 1:
@@ -1424,12 +1398,8 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             dev = hidden_states.device
             return (torch.zeros(0, D, dtype=torch.bfloat16, device=dev),
                     torch.tensor(0, dtype=torch.int64, device=dev), None, None)
-        if _DSV4_INLINE_COMPRESSOR:
-            ckv_full, c_n, bb, topk = self._compressor_compilable(
-                hidden_states, q_residual, positions, is_prompt)
-        else:
-            ckv_full, c_n, bb, topk = self._get_compiled_compressor()(
-                hidden_states, q_residual, positions, is_prompt)
+        ckv_full, c_n, bb, topk = self._compressor_compilable(
+            hidden_states, q_residual, positions, is_prompt)
         if ckv_full is None:
             cap = max(self._cap, 1)
             dev = hidden_states.device
@@ -2200,15 +2170,6 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             hidden_states = hidden_states.view(-1, self.config.hidden_size)
             positions = positions.reshape(-1)
 
-        # One-time load invariant (eager, so it never graph-breaks the compiled MoE):
-        # every routed expert's packed fp4 buffers must be present.
-        if not _V4_ROUTED_CHECKED[0]:
-            _V4_ROUTED_CHECKED[0] = True
-            for _lyr in self.layers[self.start_layer:self.end_layer]:
-                _ffn = getattr(_lyr, "ffn", None)
-                if _ffn is not None and hasattr(_ffn, "_v4_fp8_ready"):
-                    _check_v4_routed_ready(_ffn)
-
         residual, post_mix, res_mix = None, None, None
         import os as _os
         _dbg = _os.environ.get("V4_DEBUG") == "1"
@@ -2330,6 +2291,16 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
                     n += 1
         print(f"[v4] built compress caches for {n} layers (rope cache shared: "
               f"{shared is not None})", flush=True)
+        self._check_v4_routed_all()
+
+    def _check_v4_routed_all(self) -> None:
+        """Load/restore-time invariant: every routed expert's packed fp4 buffers
+        must be present. Run here (called by both fresh load and snapshot restore)
+        so the ``.item()`` host sync never appears in the compiled forward."""
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            ffn = getattr(layer, "ffn", None)
+            if ffn is not None and hasattr(ffn, "_v4_fp8_ready"):
+                _check_v4_routed_ready(ffn)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Routed-expert weights (.experts.) are bypassed: the FusedMoE params
@@ -2700,9 +2671,8 @@ def _make_block_scales(
     return block_scales
 
 
-@torch.compiler.disable
 def _check_v4_routed_ready(moe) -> None:
-    """Load-time invariant check, kept out of the compiled MoE graph."""
+    """Load-time invariant check; never runs in the compiled forward."""
     if not bool(getattr(moe, "_v4_fp8_ready", torch.tensor(0)).item()):
         raise RuntimeError(
             "DeepSeek V4 routed fp4 buffers not ready (expected pre-registration "
