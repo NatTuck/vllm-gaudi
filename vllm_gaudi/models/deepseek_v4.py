@@ -2410,6 +2410,35 @@ def _fp4_nibble_bf16(n: torch.Tensor) -> torch.Tensor:
             | (sign.to(torch.int16) << 15)).view(torch.bfloat16)
 
 
+def _load_fp4_custom_op():
+    """Load the custom fp4->fp8 TPC-kernel op, or return None if unavailable.
+
+    The op extension (``hpu_custom_fp4_dequant*.so``) is loaded via
+    ``torch.ops.load_library``; the TPC kernel library
+    (``libfp4_dequant_kernels.so``) is loaded by the graph compiler via
+    ``GC_KERNEL_PATH``, which must point at it *before* process start. Override
+    the extension path with ``DSV4_FP4_OP_LIB``.
+    """
+    import glob
+    pat = os.environ.get("DSV4_FP4_OP_LIB")
+    if not pat:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        pat = os.path.join(root, "src", "custom_ops", "fp4_dequant",
+                           "hpu_custom_fp4_dequant*.so")
+    hits = glob.glob(pat)
+    if not hits:
+        return None
+    try:
+        torch.ops.load_library(hits[0])
+        return torch.ops.custom_op.fp4_dequant
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_FP4_CUSTOM_OP = (_load_fp4_custom_op()
+                   if os.environ.get("DSV4_FP4_CUSTOM", "0") == "1" else None)
+
+
 def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Dequantize MXFP4 packed expert weight to bf16.
 
@@ -2418,22 +2447,27 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     exponent bytes (real scale = 2^(b-127)) or float8_e8m0fnu (the value is
     already the scale). Returns [R, 2*C] bf16, matching the reference
     (transformers dequants fp4 -> bf16 and computes in bf16).
+
+    When the custom TPC kernel is available it decodes fp4 -> fp8 in one fused
+    pass (exact; ~4x faster than the pure-Python decode), then this function
+    casts to bf16 and applies the per-32 e8m0 scale.
     """
     G = scales.shape[-1]
     R, C = blocks.shape
     B = C // G  # bytes per group -> 32 values per group (B == 16)
-    # The checkpoint stores packed fp4 as int8; view as uint8 so the nibble
-    # shifts below are LOGICAL (0..15), not arithmetic (which sign-extends the
-    # MSB). A per-nibble gather (`lut[lo]`) is the obvious decode but is
-    # pathologically slow on HPU (measured ~12x slower than building the bf16
-    # bit pattern arithmetically), so the bit pattern is constructed directly.
-    ni = blocks.view(torch.uint8).reshape(R, G, B)
     if scales.dtype == torch.uint8:
         s = torch.pow(2.0, scales.float() - 127.0).to(torch.bfloat16).reshape(R, G, 1)
     else:
         s = scales.to(torch.bfloat16).reshape(R, G, 1)
-    # Scale each nibble's value before interleaving: broadcasting the scale over
-    # the already-stacked [R,G,B,2] is ~3x slower than over [R,G,B].
+    if _FP4_CUSTOM_OP is not None:
+        lo_f, hi_f = _FP4_CUSTOM_OP(blocks)
+        lo = lo_f.reshape(R, G, B).to(torch.bfloat16) * s
+        hi = hi_f.reshape(R, G, B).to(torch.bfloat16) * s
+        return torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
+    # Pure-Python fallback: build the bf16 bit pattern arithmetically. The
+    # checkpoint stores packed fp4 as int8; view as uint8 so the nibble shifts
+    # are LOGICAL (0..15), not arithmetic (which sign-extends the MSB).
+    ni = blocks.view(torch.uint8).reshape(R, G, B)
     lo = _fp4_nibble_bf16(ni & 0x0F) * s
     hi = _fp4_nibble_bf16(ni >> 4) * s
     return torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
