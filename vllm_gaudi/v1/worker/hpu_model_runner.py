@@ -7036,6 +7036,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # layer (which over-allocates and OOMs).
             packed_backing = None
             layer_packing: dict[str, tuple[int, int]] = {}
+            # P0.2: one shared int8 base view per block_stride. All packed caches
+            # (bf16 SWA + fp8 compressed) alias this single tensor; stashing the
+            # int8 base (same object for every layer) instead of per-dtype views
+            # lets the model build typed pages in-graph, avoiding aot_autograd's
+            # "non-differentiable view input mutations" (multiple aliased inputs).
+            _dsv4_i8_base: dict[int, torch.Tensor] = {}
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 if getattr(kv_cache_tensor, "block_stride", 0) and kv_cache_tensor.block_stride > 0:
                     if packed_backing is None:
@@ -7138,10 +7144,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # index ops fail when the *indexed dim* >= 2**31 and the
                         # slab is ~1.9e10 elements; the 2-D view indexes dim 0
                         # (num_blocks+1) which is small. See stepP1_probe4.py.
-                        if _layer is not None and page_bytes % elem == 0 and block_stride % elem == 0:
+                        if _layer is not None and page_bytes % elem == 0 and block_stride % elem == 0 \
+                                and offset % elem == 0:
                             _layer._dsv4_slab2d = packed_backing.view(dtype).view(-1, block_stride // elem)
                             _layer._dsv4_page_off = offset // elem
                             _layer._dsv4_page_elems = page_bytes // elem
+                            # P0.2/P0.4: stash the shared int8 base + byte
+                            # offset/page size/dtype so the typed page is built
+                            # in-graph. Verified correct and free (the page view
+                            # is a metadata-only view; see step_int8_page_gate.py)
+                            # and it removes the aot "view input mutation"
+                            # assertion, which is the prerequisite for inlining
+                            # the compressor. Default on; DSV4_INT8_BASE=0
+                            # restores the legacy typed-view inputs.
+                            if os.environ.get("DSV4_INT8_BASE", "1") == "1":
+                                base_i8 = _dsv4_i8_base.get(block_stride)
+                                if base_i8 is None:
+                                    base_i8 = packed_backing.view(-1, block_stride)
+                                    _dsv4_i8_base[block_stride] = base_i8
+                                _layer._dsv4_slab_i8 = base_i8
+                                _layer._dsv4_page_off_bytes = offset
+                                _layer._dsv4_page_bytes = page_bytes
+                                _layer._dsv4_page_dtype = dtype
                         continue
 
                     if isinstance(kv_cache_spec, FullAttentionSpec):
