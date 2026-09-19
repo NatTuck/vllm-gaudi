@@ -2455,15 +2455,24 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     G = scales.shape[-1]
     R, C = blocks.shape
     B = C // G  # bytes per group -> 32 values per group (B == 16)
+    if _FP4_CUSTOM_OP is not None:
+        # Fold the per-32 e8m0 scale (an exact power of two, 2^k) into the TPC
+        # kernel: it adds k to the e4m3fn exponent field, with the subnormal
+        # path exact for the checkpoint's scale range. Removes the separate
+        # bf16 scale multiply + broadcast.
+        if scales.dtype == torch.uint8:
+            kexp = scales.to(torch.int16) - 127
+        else:
+            kexp = ((scales.view(torch.int32) >> 23) & 0xFF) - 127
+        kexp = kexp.to(torch.int8).repeat_interleave(B, dim=1)  # [R, C]
+        lo_f, hi_f = _FP4_CUSTOM_OP(blocks, kexp)
+        lo = lo_f.to(torch.bfloat16)
+        hi = hi_f.to(torch.bfloat16)
+        return torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
     if scales.dtype == torch.uint8:
         s = torch.pow(2.0, scales.float() - 127.0).to(torch.bfloat16).reshape(R, G, 1)
     else:
         s = scales.to(torch.bfloat16).reshape(R, G, 1)
-    if _FP4_CUSTOM_OP is not None:
-        lo_f, hi_f = _FP4_CUSTOM_OP(blocks)
-        lo = lo_f.reshape(R, G, B).to(torch.bfloat16) * s
-        hi = hi_f.reshape(R, G, B).to(torch.bfloat16) * s
-        return torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
     # Pure-Python fallback: build the bf16 bit pattern arithmetically. The
     # checkpoint stores packed fp4 as int8; view as uint8 so the nibble shifts
     # are LOGICAL (0..15), not arithmetic (which sign-extends the MSB).
