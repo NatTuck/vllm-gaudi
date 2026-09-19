@@ -68,6 +68,17 @@ _DSV4_INDEXER_CHUNK_ELEMS = int(os.environ.get("DSV4_INDEXER_CHUNK_ELEMS", str(1
 # aot_autograd's non-differentiable view-mutation assertion and grows the combined
 # workspace ~8 GiB (OOM at the production KV util 0.8).
 
+# 2026-09-19 (L0c): ``torch._dynamo.graph_break()`` is a hard error under
+# ``fullgraph=True`` (it routes to ``unimplemented`` -> ``Unsupported``, and
+# ``should_compile_partial_graph()`` is False when ``one_graph``), and inlining
+# the compressor instead OOMs the layer region's arena (PT_DEVMEM OOM during the
+# profiling forward, ~8 GiB). So the partition stays **on** and the engine runs
+# with ``fullgraph=False`` until the partition has a fullgraph-compatible form.
+# ``DSV4_COMPRESSOR_BREAK=0`` disables the break (inline; needs fullgraph=False
+# and more HBM than is available today).
+_COMPRESSOR_BREAK = os.environ.get("DSV4_COMPRESSOR_BREAK", "1") != "0"
+
+
 def _diag(name: str, t: torch.Tensor, *, layer: int | None = None) -> None:
     """Print once (first forward) a NaN/abs-mean/variance diagnostic for t."""
     if _DIAG_DONE["v"]:
@@ -1377,19 +1388,26 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         This is a real break, **not** ``torch.compiler.disable``: the body stays
         compiled. ``compiler.disable`` would run the wrapper eagerly, i.e. HPU
         compute outside a graph, which is forbidden.
+
+        Default (``_COMPRESSOR_BREAK`` False): inlined, no break — required under
+        the engine's global ``fullgraph=True``.
         """
-        torch._dynamo.graph_break()
+        if _COMPRESSOR_BREAK:
+            torch._dynamo.graph_break()
         out = self._run_compressor_impl(
             hidden_states, q_residual, positions, is_prompt)
-        torch._dynamo.graph_break()
+        if _COMPRESSOR_BREAK:
+            torch._dynamo.graph_break()
         return out
 
     def _run_compressor_decode(self, hidden_states, q_residual, positions, is_prompt):
         """Decode compressor; see ``_run_compressor`` for the controlled break."""
-        torch._dynamo.graph_break()
+        if _COMPRESSOR_BREAK:
+            torch._dynamo.graph_break()
         out = self._run_compressor_impl(
             hidden_states, q_residual, positions, is_prompt)
-        torch._dynamo.graph_break()
+        if _COMPRESSOR_BREAK:
+            torch._dynamo.graph_break()
         return out
 
     def _run_compressor_impl(self, hidden_states, q_residual, positions, is_prompt):

@@ -5191,6 +5191,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self._regional_compilation(children_module, module, children_name)
 
     def _compile_region(self, model, name, module):
+        if os.environ.get("DSV4_REGION_DEBUG") == "1":
+            print(f"[region] {name} :: {type(module).__name__}", flush=True)
         module = self._compile(module)
         setattr_nested(model, name, module)
 
