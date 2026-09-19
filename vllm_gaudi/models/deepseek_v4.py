@@ -2461,6 +2461,27 @@ def _fp4_perm_blocks(x: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return x.reshape(*x.shape[:-1], d // _FP4_BLK, _FP4_BLK)[..., perm, :].reshape(*x.shape[:-1], d)
 
 
+def _fp8_expert_gemm(x: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
+    """Batched expert GEMM with scale-free fp8 weights.
+
+    ``x`` [G, T, K] bf16, ``wq`` [G, N, K] fp8 (the fp4 kernel's scale-folded
+    output, so no weight scale is needed). Returns [G, T, N] fp32. The activation
+    is dynamically quantised per expert. ``fp8_gemm_v2`` is 2D-only, so loop over
+    the (small) expert count.
+    """
+    outs = []
+    for g in range(x.shape[0]):
+        amax = x[g].abs().amax().clamp(min=1e-12)
+        scale = (amax / 448.0).to(torch.float32)
+        xq = torch.ops.hpu.cast_to_fp8_v2(
+            x[g], (1.0 / scale).to(torch.float32), False, False, torch.float8_e4m3fn)[0]
+        outs.append(torch.ops.hpu.fp8_gemm_v2(
+            A=xq, trans_A=False, B=wq[g], trans_B=True, D=None,
+            out_dtype=torch.bfloat16, A_scale_inv=scale, B_scale_inv=None,
+            bias=None, accumulate=False))
+    return torch.stack(outs, 0).float()
+
+
 def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Dequantize MXFP4 packed expert weight to bf16.
 
@@ -2490,8 +2511,11 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         o0, o1 = _FP4_CUSTOM_OP(blocks, kexp)
         # The kernel emits the interleave in its native [o0 || o1] block order
         # (o0 = even 64-element chunks, o1 = odd) to avoid a stack/DmaTranspose;
-        # the consumer permutes the much smaller activation to match.
-        return torch.cat([o0.to(torch.bfloat16), o1.to(torch.bfloat16)], dim=-1)
+        # the consumer permutes the much smaller activation to match. Stay in
+        # fp8: the per-32 e8m0 scale is already folded into the exponent, so the
+        # fp8 weights are scale-free and can feed the fp8 GEMM directly (no
+        # fp8->bf16 cast, half the weight bytes).
+        return torch.cat([o0, o1], dim=-1)
     if scales.dtype == torch.uint8:
         s = torch.pow(2.0, scales.float() - 127.0).to(torch.bfloat16).reshape(R, G, 1)
     else:
@@ -2818,7 +2842,9 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
         n = p.shape[0]
         R, C = p.shape[1], p.shape[-1]
         Gs = s.shape[-1]
-        return _dequant_v4_fp4(p.reshape(-1, C), s.reshape(-1, Gs)).view(n, R, C * 2).to(flat.dtype)
+        # Keep the natural dtype: fp8 (scale-free) from the custom kernel, bf16
+        # from the pure-Python fallback. _compute_v4_routed branches on it.
+        return _dequant_v4_fp4(p.reshape(-1, C), s.reshape(-1, Gs)).view(n, R, C * 2)
 
     # Keep w1/w3 separate: concatenating them along `inter` forces a transposed
     # DMA on HPU (the `ffn/cat` DmaTranspose); two bmms are cheaper than one
@@ -2833,13 +2859,22 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
     # unchanged) instead of un-permuting the large weight.
     perm_h = _fp4_blk_perm(H // _FP4_BLK, flat.device)
     xe = _fp4_perm_blocks(flat, perm_h).unsqueeze(0).expand(g, T, H)  # [G, T, H]
-    gate = torch.bmm(xe, w1_g.transpose(1, 2)).float()     # [G, T, inter] bf16 -> fp32
-    up = torch.bmm(xe, w3_g.transpose(1, 2)).float()       # [G, T, inter] bf16 -> fp32
-    gate = torch.clamp(gate, max=limit)
-    up = torch.clamp(up, min=-limit, max=limit)
-    h = (torch.nn.functional.silu(gate) * up).to(flat.dtype)  # [G, T, inter]
     perm_i = _fp4_blk_perm(inter // _FP4_BLK, flat.device)
-    y = torch.bmm(_fp4_perm_blocks(h, perm_i), w2_g.transpose(1, 2)).float()  # [G, T, H] fp32
+    if w1_g.dtype == torch.float8_e4m3fn:
+        # Scale-free fp8 weights -> fp8 expert GEMMs (no fp8->bf16 cast).
+        gate = _fp8_expert_gemm(xe, w1_g)                  # [G, T, inter] fp32
+        up = _fp8_expert_gemm(xe, w3_g)                    # [G, T, inter] fp32
+        gate = torch.clamp(gate, max=limit)
+        up = torch.clamp(up, min=-limit, max=limit)
+        h = (torch.nn.functional.silu(gate) * up).to(flat.dtype)  # [G, T, inter]
+        y = _fp8_expert_gemm(_fp4_perm_blocks(h, perm_i), w2_g)   # [G, T, H] fp32
+    else:
+        gate = torch.bmm(xe, w1_g.transpose(1, 2)).float()  # [G, T, inter] bf16 -> fp32
+        up = torch.bmm(xe, w3_g.transpose(1, 2)).float()    # [G, T, inter] bf16 -> fp32
+        gate = torch.clamp(gate, max=limit)
+        up = torch.clamp(up, min=-limit, max=limit)
+        h = (torch.nn.functional.silu(gate) * up).to(flat.dtype)  # [G, T, inter]
+        y = torch.bmm(_fp4_perm_blocks(h, perm_i), w2_g.transpose(1, 2)).float()  # [G, T, H]
     gate_wg = gate_w.index_select(1, gather_ids).t().unsqueeze(-1)  # [G, T, 1]
     out = (y * gate_wg).sum(0)                             # [T, H] fp32
     return out.to(flat.dtype)
