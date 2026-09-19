@@ -2784,16 +2784,17 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
         Gs = s.shape[-1]
         return _dequant_v4_fp4(p.reshape(-1, C), s.reshape(-1, Gs)).view(n, R, C * 2).to(flat.dtype)
 
-    w13_g = torch.cat([
-        _deq_gathered(moe.packed_w1_weight, moe.packed_w1_scale, gather_ids),
-        _deq_gathered(moe.packed_w3_weight, moe.packed_w3_scale, gather_ids),
-    ], dim=1)  # [G, 2*inter, H]
+    # Keep w1/w3 separate: concatenating them along `inter` forces a transposed
+    # DMA on HPU (the `ffn/cat` DmaTranspose); two bmms are cheaper than one
+    # cat + one bmm.
+    w1_g = _deq_gathered(moe.packed_w1_weight, moe.packed_w1_scale, gather_ids)  # [G, inter, H]
+    w3_g = _deq_gathered(moe.packed_w3_weight, moe.packed_w3_scale, gather_ids)  # [G, inter, H]
     w2_g = _deq_gathered(moe.packed_w2_weight, moe.packed_w2_scale, gather_ids)  # [G, H, inter]
 
     # Dense expert MLP over the gathered experts (static shapes).
     xe = flat.unsqueeze(0).expand(g, T, H)                 # [G, T, H] view
-    gu = torch.bmm(xe, w13_g.transpose(1, 2))              # [G, T, 2*inter] bf16
-    gate, up = gu[..., :inter].float(), gu[..., inter:].float()
+    gate = torch.bmm(xe, w1_g.transpose(1, 2)).float()     # [G, T, inter] bf16 -> fp32
+    up = torch.bmm(xe, w3_g.transpose(1, 2)).float()       # [G, T, inter] bf16 -> fp32
     gate = torch.clamp(gate, max=limit)
     up = torch.clamp(up, min=-limit, max=limit)
     h = (torch.nn.functional.silu(gate) * up).to(flat.dtype)  # [G, T, inter]
