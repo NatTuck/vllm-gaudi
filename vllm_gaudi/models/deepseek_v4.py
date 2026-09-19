@@ -2439,6 +2439,28 @@ _FP4_CUSTOM_OP = (_load_fp4_custom_op()
                    if os.environ.get("DSV4_FP4_CUSTOM", "0") == "1" else None)
 
 
+_FP4_BLK = 64  # fp8 bytes per interleave chunk (32 packed fp4 bytes -> 64 fp8)
+
+
+def _fp4_blk_perm(n_blk: int, device) -> torch.Tensor:
+    """Block permutation for the kernel's native [o0 || o1] fp8 layout.
+
+    The kernel emits o0 = even 64-byte chunks, o1 = odd chunks (avoiding a
+    stack/DmaTranspose). A consumer that needs the target element order can
+    un-permute the large weight, or permute the much smaller activation with
+    this same permutation -- the GEMM sum is unchanged because both contraction
+    operands are permuted identically.
+    """
+    p = torch.cat([torch.arange(0, n_blk, 2), torch.arange(1, n_blk, 2)])
+    return p.to(device)
+
+
+def _fp4_perm_blocks(x: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
+    """Apply the 64-element block permutation along the last dimension."""
+    d = x.shape[-1]
+    return x.reshape(*x.shape[:-1], d // _FP4_BLK, _FP4_BLK)[..., perm, :].reshape(*x.shape[:-1], d)
+
+
 def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Dequantize MXFP4 packed expert weight to bf16.
 
@@ -2465,10 +2487,11 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         else:
             kexp = ((scales.view(torch.int32) >> 23) & 0xFF) - 127
         kexp = kexp.to(torch.int8).repeat_interleave(B, dim=1)  # [R, C]
-        lo_f, hi_f = _FP4_CUSTOM_OP(blocks, kexp)
-        lo = lo_f.to(torch.bfloat16)
-        hi = hi_f.to(torch.bfloat16)
-        return torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
+        o0, o1 = _FP4_CUSTOM_OP(blocks, kexp)
+        # The kernel emits the interleave in its native [o0 || o1] block order
+        # (o0 = even 64-element chunks, o1 = odd) to avoid a stack/DmaTranspose;
+        # the consumer permutes the much smaller activation to match.
+        return torch.cat([o0.to(torch.bfloat16), o1.to(torch.bfloat16)], dim=-1)
     if scales.dtype == torch.uint8:
         s = torch.pow(2.0, scales.float() - 127.0).to(torch.bfloat16).reshape(R, G, 1)
     else:
@@ -2479,7 +2502,11 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     ni = blocks.view(torch.uint8).reshape(R, G, B)
     lo = _fp4_nibble_bf16(ni & 0x0F) * s
     hi = _fp4_nibble_bf16(ni >> 4) * s
-    return torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
+    tgt = torch.stack([lo, hi], dim=-1).reshape(R, C * 2).contiguous()
+    # Match the custom kernel's native [o0 || o1] block order.
+    n_blk = (C * 2) // _FP4_BLK
+    perm = _fp4_blk_perm(n_blk, tgt.device)
+    return tgt.reshape(R, n_blk, _FP4_BLK)[:, perm, :].reshape(R, C * 2)
 
 
 def _free_v4_fused_moe_routed(moe) -> None:
@@ -2800,14 +2827,19 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
     w3_g = _deq_gathered(moe.packed_w3_weight, moe.packed_w3_scale, gather_ids)  # [G, inter, H]
     w2_g = _deq_gathered(moe.packed_w2_weight, moe.packed_w2_scale, gather_ids)  # [G, H, inter]
 
-    # Dense expert MLP over the gathered experts (static shapes).
-    xe = flat.unsqueeze(0).expand(g, T, H)                 # [G, T, H] view
+    # Dense expert MLP over the gathered experts (static shapes). The weights
+    # arrive in the fp4 kernel's native [o0 || o1] 64-element block order, so
+    # permute the much smaller activation identically (the GEMM sum is
+    # unchanged) instead of un-permuting the large weight.
+    perm_h = _fp4_blk_perm(H // _FP4_BLK, flat.device)
+    xe = _fp4_perm_blocks(flat, perm_h).unsqueeze(0).expand(g, T, H)  # [G, T, H]
     gate = torch.bmm(xe, w1_g.transpose(1, 2)).float()     # [G, T, inter] bf16 -> fp32
     up = torch.bmm(xe, w3_g.transpose(1, 2)).float()       # [G, T, inter] bf16 -> fp32
     gate = torch.clamp(gate, max=limit)
     up = torch.clamp(up, min=-limit, max=limit)
     h = (torch.nn.functional.silu(gate) * up).to(flat.dtype)  # [G, T, inter]
-    y = torch.bmm(h, w2_g.transpose(1, 2)).float()         # [G, T, H] fp32
+    perm_i = _fp4_blk_perm(inter // _FP4_BLK, flat.device)
+    y = torch.bmm(_fp4_perm_blocks(h, perm_i), w2_g.transpose(1, 2)).float()  # [G, T, H] fp32
     gate_wg = gate_w.index_select(1, gather_ids).t().unsqueeze(-1)  # [G, T, 1]
     out = (y * gate_wg).sum(0)                             # [T, H] fp32
     return out.to(flat.dtype)
