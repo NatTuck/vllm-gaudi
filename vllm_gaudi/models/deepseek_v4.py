@@ -2132,6 +2132,28 @@ class DeepseekV4HPUDecoderLayer(_NvDeepseekV4DecoderLayer):
         return x, residual, post_mix, res_mix
 
 
+class _LayerStack(nn.Module):
+    """A run of consecutive decoder layers compiled as a single region.
+
+    L5 coalescing: the per-region host overhead (aot runtime wrapper, dynamo
+    guard/cache lookup, dispatch) is paid once per compiled region, so grouping
+    G layers into one region cuts it ~G-fold. The layers are held in a plain
+    list (not a ModuleList) so they stay registered under the model's own
+    ``layers`` ModuleList and the checkpoint parameter names are unchanged.
+    """
+
+    def __init__(self, layers) -> None:
+        super().__init__()
+        self._stack = list(layers)
+
+    def forward(self, x, positions, input_ids, post_mix, res_mix, residual):
+        for layer in self._stack:
+            x, residual, post_mix, res_mix = layer(
+                x, positions, input_ids, post_mix, res_mix, residual
+            )
+        return x, residual, post_mix, res_mix
+
+
 class DeepseekV4HPUModel(_NvDeepseekV4Model):
     """HPU DeepSeek V4 model.
 
@@ -2186,6 +2208,23 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             lambda prefix: DeepseekV4HPUDecoderLayer(vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+
+        # L5 coalescing: group G consecutive decoder layers into one compiled
+        # region (DSV4_LAYER_GROUP, default 1 = one region per layer). The
+        # stacks are a separate ModuleList; the plain ``layers`` ModuleList is
+        # flagged so the runner does not also compile each layer.
+        _lg = max(1, int(os.environ.get("DSV4_LAYER_GROUP", "1")))
+        self._layer_group = _lg
+        if _lg > 1:
+            _n = self.end_layer - self.start_layer
+            self._layer_stacks = nn.ModuleList([
+                _LayerStack(list(self.layers[self.start_layer + i:
+                                             self.start_layer + min(i + _lg, _n)]))
+                for i in range(0, _n, _lg)
+            ])
+            self.layers._skip_regional_compilation = True
+        else:
+            self._layer_stacks = None
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -2252,10 +2291,13 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         residual, post_mix, res_mix = None, None, None
         import os as _os
         _dbg = _os.environ.get("V4_DEBUG") == "1"
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer),
-            start=self.start_layer,
-        ):
+        if self._layer_stacks is not None:
+            _units = self._layer_stacks
+            _step = self._layer_group
+        else:
+            _units = islice(self.layers, self.start_layer, self.end_layer)
+            _step = 1
+        for idx, layer in enumerate(_units, start=self.start_layer):
             if _dbg:
                 print(f"[v4model] layer {idx} in", flush=True)
             hidden_states, residual, post_mix, res_mix = layer(
@@ -2263,7 +2305,7 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             )
             if _dbg:
                 print(f"[v4model] layer {idx} out", flush=True)
-            _diag(f"after_layer", hidden_states, layer=idx)
+            _diag(f"after_layer", hidden_states, layer=idx * _step)
         _DIAG_DONE["v"] = True
 
         import os as _hdump

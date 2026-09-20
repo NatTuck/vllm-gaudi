@@ -5178,6 +5178,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         2. Member of regional_compilation_layers_list
         """
         if isinstance(module, torch.nn.ModuleList):
+            # A model may coalesce a ModuleList's children into its own
+            # pre-built region stack (e.g. DSv4 L5 layer grouping) and flag the
+            # original list so it is not also compiled per child.
+            if getattr(module, "_skip_regional_compilation", False):
+                return
             for children_name, children_module in module.named_children():
                 self._compile_region(module, children_name, children_module)
         elif any(isinstance(module, layer) for layer in self.regional_compilation_layers_list):
