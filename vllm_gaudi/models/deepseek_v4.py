@@ -723,6 +723,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # Completed-window entry counters (R9: the paged caches hold the data).
         self._c_n = torch.tensor(0, dtype=torch.int64)
         self._i_n = torch.tensor(0, dtype=torch.int64)
+        # Pre-dequantized o_proj weights (filled once after weight load by
+        # _cache_o_proj_dequant). Dequantizing them per decode step put two
+        # fp8->fp32->bf16 weight casts inside the compiled region every layer;
+        # the weights are static, so the result is identical but computed once.
+        self._wo_a_deq = None
+        self._wo_b_deq = None
 
         # The indexer k_cache must advertise an HPU-friendly supported kernel
         # block size (see HPUDeepseekV4IndexerBackend).
@@ -784,6 +790,24 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if s.numel() == 1:
             return (wf * s).to(torch.bfloat16)
         return (wf * s.view(1, -1)).to(torch.bfloat16)
+
+    def _cache_o_proj_dequant(self) -> None:
+        """Dequantize the static o_proj weights once (after weight load).
+
+        ``_o_proj_compilable`` used to call ``_dequant_fp8_weight`` on wo_a and
+        wo_b on every decode step, which put an fp8->fp32->bf16 cast of each
+        weight inside the compiled layer region (2 ops/layer, measured at
+        ~0.9 ms each). The weights never change, so cache the bf16 dequant;
+        the numerics are byte-identical to the per-step path.
+        """
+        if os.environ.get("DSV4_O_PROJ_DEQ_CACHE", "1") != "1":
+            return
+        from vllm_gaudi.extension.ops import _dequant_fp8_weight
+        with torch.no_grad():
+            self._wo_a_deq = _dequant_fp8_weight(
+                self.wo_a.weight, self.wo_a.weight_scale_inv).contiguous()
+            self._wo_b_deq = _dequant_fp8_weight(
+                self.wo_b.weight, self.wo_b.weight_scale_inv).contiguous()
 
     def _copy_fused_compressor(self, src, dst, head_dim: int) -> None:
         """Copy the vLLM DeepseekCompressor (fused wkv|wgate + ape + norm) into a
@@ -1529,7 +1553,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         num_tokens = o.shape[0]
         heads_per_group = self.n_local_heads // self.n_local_groups
         o_g = o.view(num_tokens, self.n_local_groups, heads_per_group, self.head_dim)
-        wo_a_bf16 = _dequant_fp8_weight(self.wo_a.weight, self.wo_a.weight_scale_inv)
+        wo_a_bf16 = self._wo_a_deq
+        if wo_a_bf16 is None:
+            wo_a_bf16 = _dequant_fp8_weight(self.wo_a.weight, self.wo_a.weight_scale_inv)
         w = wo_a_bf16.view(
             self.n_local_groups, self.o_lora_rank, heads_per_group * self.head_dim
         )
@@ -1540,7 +1566,9 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         ).permute(1, 0, 2)
         z = z.reshape(num_tokens, self.n_local_groups * self.o_lora_rank)
         # fp32 wo_b matmul — dequant to bf16 then cast to fp32 for the product
-        wo_b_bf16 = _dequant_fp8_weight(self.wo_b.weight, self.wo_b.weight_scale_inv)
+        wo_b_bf16 = self._wo_b_deq
+        if wo_b_bf16 is None:
+            wo_b_bf16 = _dequant_fp8_weight(self.wo_b.weight, self.wo_b.weight_scale_inv)
         out = (z.float() @ wo_b_bf16.float().t()).to(torch.bfloat16)
         from vllm.distributed import tensor_model_parallel_all_reduce
         out = tensor_model_parallel_all_reduce(out)
@@ -2362,7 +2390,17 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
         loaded = super().load_weights(weights)
         self._prep_v4_routed_all()
         self._prep_compress_caches()
+        self._prep_o_proj_dequant()
         return loaded
+
+    def _prep_o_proj_dequant(self) -> None:
+        """Pre-dequantize every layer's o_proj weights (see
+        ``DeepseekV4HPUAttention._cache_o_proj_dequant``). Runs once after the
+        checkpoint is loaded, before any torch.compile region is traced."""
+        for layer in self.layers:
+            attn = getattr(layer, "attn", None)
+            if attn is not None and hasattr(attn, "_cache_o_proj_dequant"):
+                attn._cache_o_proj_dequant()
 
 
 class DeepseekV4ForCausalLM(_NvDeepseekV4ForCausalLM):

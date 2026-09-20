@@ -401,11 +401,15 @@ class HabanaMemoryProfiler:
 
 
 def setup_profiler(warmup, active):
+    import os
     schedule = torch.profiler.schedule(wait=0, warmup=warmup, active=active, repeat=1)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
+    # VLLM_PROFILER_RECORD_SHAPES=1 adds input shapes/dtypes to each op event
+    # (needed to attribute the per-region _to_copy calls).
+    record_shapes = os.environ.get("VLLM_PROFILER_RECORD_SHAPES") == "1"
     profiler = torch.profiler.profile(schedule=schedule,
                                       activities=activities,
                                       on_trace_ready=torch.profiler.tensorboard_trace_handler('.', use_gzip=True),
-                                      record_shapes=False,
+                                      record_shapes=record_shapes,
                                       with_stack=True)
     return profiler
