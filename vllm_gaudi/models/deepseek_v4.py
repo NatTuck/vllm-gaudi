@@ -78,6 +78,39 @@ _DSV4_INDEXER_CHUNK_ELEMS = int(os.environ.get("DSV4_INDEXER_CHUNK_ELEMS", str(1
 # and more HBM than is available today).
 _COMPRESSOR_BREAK = os.environ.get("DSV4_COMPRESSOR_BREAK", "1") != "0"
 
+# Temporary diagnostic (DSV4_SYNC_PROBE=1): count host-side synchronize calls and
+# print the first few stacks, to find who blocks the host between graph launches.
+if os.environ.get("DSV4_SYNC_PROBE") == "1":
+    import atexit as _atexit
+    import traceback as _tb
+
+    _SP = {"sync": 0, "evsync": 0, "shown": 0}
+
+    def _mk_probe(orig, tag):
+        def _probe(*a, **k):
+            _SP[tag] += 1
+            if _SP["shown"] < 4:
+                _SP["shown"] += 1
+                print(f"[syncprobe] {tag} call #{_SP[tag]}\n" + "".join(_tb.format_stack()[-7:]),
+                      flush=True)
+            return orig(*a, **k)
+        return _probe
+
+    try:
+        torch.hpu.synchronize = _mk_probe(torch.hpu.synchronize, "sync")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[syncprobe] cannot patch torch.hpu.synchronize: {_e}", flush=True)
+    try:
+        torch.hpu.Event.synchronize = _mk_probe(torch.hpu.Event.synchronize, "evsync")
+    except Exception as _e:  # noqa: BLE001
+        print(f"[syncprobe] cannot patch Event.synchronize: {_e}", flush=True)
+
+    def _report():
+        print(f"[syncprobe] totals: torch.hpu.synchronize={_SP['sync']} "
+              f"Event.synchronize={_SP['evsync']}", flush=True)
+
+    _atexit.register(_report)
+
 
 def _diag(name: str, t: torch.Tensor, *, layer: int | None = None) -> None:
     """Print once (first forward) a NaN/abs-mean/variance diagnostic for t."""
