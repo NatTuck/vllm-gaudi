@@ -44,6 +44,25 @@ if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
 
 
+def _compile_metric_handles() -> Optional[dict]:
+    """Backend metrics that expose level-2 (Synapse graph) compilation.
+
+    Returns ``{name: metric_or_None}`` or ``None`` if the metrics module is
+    unavailable. ``graph_compilation`` counts/times every Synapse graph
+    compilation and (with ``PT_HPU_METRICS_GC_DETAILS=1``) lists each
+    ``(recipe, duration)``; ``recipe_cache`` reports per-``recipe_id`` hit/miss
+    counts when ``PT_HPU_ENABLE_CACHE_METRICS=1``. These are the only way to see
+    the compilation that ``PostWarmupCompileGuard`` cannot (see
+    ``notes/continue.md``).
+    """
+    try:
+        from habana_frameworks.torch.hpu.metrics import metric_global
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logger.debug("backend compile metrics unavailable: %s", exc)
+        return None
+    return {name: metric_global(name) for name in ("graph_compilation", "recipe_cache")}
+
+
 def setup_step_profiler(steps):
     if steps is None:
         return None
@@ -613,6 +632,44 @@ class HPUWorker(WorkerBase):
             return "no-guard"
         guard.arm(warmup_ran=True)
         return f"armed(mode={guard.mode})"
+
+    def reset_compile_metrics(self) -> str:
+        """Reset the backend compile/cache metrics on this worker.
+
+        Companion to ``arm_compile_guard`` for measurement harnesses: call this
+        after the explicit warmup phase (via
+        ``LLMEngine.collective_rpc("reset_compile_metrics")``) so that what
+        ``compile_metrics`` reads back describes only the measured window.
+
+        ``PostWarmupCompileGuard`` only observes level 1 (dynamo/recipe); the
+        Synapse graph compilation that happens at launch is only visible through
+        these backend metrics. See ``notes/continue.md``.
+        """
+        mg = _compile_metric_handles()
+        if mg is None:
+            return "unavailable"
+        out = []
+        for name, metric in mg.items():
+            if metric is None:
+                out.append(f"{name}=absent")
+                continue
+            metric.reset()
+            out.append(f"{name}=reset")
+        return ",".join(out)
+
+    def compile_metrics(self) -> dict:
+        """Return the backend compile/cache metrics for the measured window.
+
+        ``graph_compilation`` carries the per-compilation ``(recipe, duration)``
+        list when ``PT_HPU_METRICS_GC_DETAILS=1``; ``recipe_cache`` carries
+        per-``recipe_id`` hit/miss counts when ``PT_HPU_ENABLE_CACHE_METRICS=1``
+        (which must be set before the metrics module is imported).
+        """
+        mg = _compile_metric_handles()
+        if mg is None:
+            return {"error": "metrics-unavailable"}
+        return {name: (None if metric is None else dict(metric.stats()))
+                for name, metric in mg.items()}
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
