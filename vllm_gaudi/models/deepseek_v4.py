@@ -2573,6 +2573,9 @@ _FP4_CUSTOM_OP = (_load_fp4_custom_op()
 _FP4_BLK = 64  # fp8 bytes per interleave chunk (32 packed fp4 bytes -> 64 fp8)
 
 
+_FP4_PERM_CACHE: dict = {}
+
+
 def _fp4_blk_perm(n_blk: int, device) -> torch.Tensor:
     """Block permutation for the kernel's native [o0 || o1] fp8 layout.
 
@@ -2581,15 +2584,30 @@ def _fp4_blk_perm(n_blk: int, device) -> torch.Tensor:
     un-permute the large weight, or permute the much smaller activation with
     this same permutation -- the GEMM sum is unchanged because both contraction
     operands are permuted identically.
+
+    The index is a pure function of ``(n_blk, device)`` and is needed every
+    layer every step, so it is cached here rather than rebuilt in the compiled
+    region (the rebuild emitted an ``arange``/``cat``/``.to(device)`` per call).
     """
-    p = torch.cat([torch.arange(0, n_blk, 2), torch.arange(1, n_blk, 2)])
-    return p.to(device)
+    key = (n_blk, str(device))
+    p = _FP4_PERM_CACHE.get(key)
+    if p is None:
+        p = torch.cat([torch.arange(0, n_blk, 2), torch.arange(1, n_blk, 2)]).to(device)
+        _FP4_PERM_CACHE[key] = p
+    return p
 
 
 def _fp4_perm_blocks(x: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
-    """Apply the 64-element block permutation along the last dimension."""
+    """Apply the 64-element block permutation along the last dimension.
+
+    Uses ``index_select`` on the block dim rather than advanced indexing
+    ``[..., perm, :]``: on HPU the latter lowers to a full
+    broadcast/tile/transpose + gather sequence (measured 155 device ops/iter vs
+    29 for ``index_select`` in src/moe_dma_probe.py), and it dominates the
+    per-step DmaMemcpy.
+    """
     d = x.shape[-1]
-    return x.reshape(*x.shape[:-1], d // _FP4_BLK, _FP4_BLK)[..., perm, :].reshape(*x.shape[:-1], d)
+    return x.reshape(*x.shape[:-1], d // _FP4_BLK, _FP4_BLK).index_select(-2, perm).reshape(*x.shape[:-1], d)
 
 
 def _fp8_expert_gemm(x: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
