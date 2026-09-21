@@ -600,6 +600,20 @@ class HPUWorker(WorkerBase):
             encoder=self.vllm_config.compilation_config.encoder_compilation_time,
         )
 
+    def arm_compile_guard(self) -> str:
+        """Arm the post-warmup compile guard on this worker's model runner.
+
+        Called by a measurement harness (via
+        ``LLMEngine.collective_rpc("arm_compile_guard")``) after its own explicit
+        warmup phase, so that any compilation in the measured window is a hard
+        failure. See ``PostWarmupCompileGuard`` in hpu_model_runner.py.
+        """
+        guard = getattr(self.model_runner, "compile_guard", None)
+        if guard is None:
+            return "no-guard"
+        guard.arm(warmup_ran=True)
+        return f"armed(mode={guard.mode})"
+
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
 

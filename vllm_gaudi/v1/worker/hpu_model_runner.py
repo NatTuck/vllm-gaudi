@@ -6552,8 +6552,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                     torch._dynamo.config.accumulated_cache_size_limit)
 
         if self.skip_warmup:
-            logger.info("Skipping warmup...")
-            self.compile_guard.arm(warmup_ran=False)
+            # Warmup is skipped (the harness owns an explicit warm phase). Leave
+            # the guard disarmed; the harness arms it via arm_compile_guard()
+            # once its warm phase is done. Until then, compiles are allowed and
+            # any measurement is unvalidated.
+            logger.info(
+                "Skipping warmup; PostWarmupCompileGuard left disarmed "
+                "(arm explicitly via collective_rpc('arm_compile_guard')).")
             return
 
         self.profiler.start('internal', 'warmup')
