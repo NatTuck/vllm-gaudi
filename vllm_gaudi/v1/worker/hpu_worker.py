@@ -96,7 +96,11 @@ class HPUWorker(WorkerBase):
         else:
             self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
 
-        self.gc_track_recompiles = get_config().track_graph_compilation and not get_config().high_level_profiler_enabled
+        # Per-step local graph-compile tracking is a diagnostic that drains the
+        # device on every step; it is opt-in and independent of the global
+        # metrics env (PT_HPU_METRICS_GC_DETAILS). See features.py.
+        self.gc_track_recompiles = (get_config().track_graph_compile_per_step
+                                    and not get_config().high_level_profiler_enabled)
         self.step = 0
         self.profile_steps = get_config().VLLM_PROFILE_STEPS
         self.step_profiler = setup_step_profiler(self.profile_steps)

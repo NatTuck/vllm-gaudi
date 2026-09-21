@@ -125,7 +125,20 @@ def get_features():
             Any(ModelType('qwen3_moe'), ModelType('qwen3_5'), ModelType('qwen3_5_text'), ModelType('granitemoe'),
                 ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'))),
         Value('high_level_profiler_enabled', False, env_var='VLLM_PROFILER_ENABLED', env_var_type=boolean),
+        # PT_HPU_METRICS_GC_DETAILS is a Synapse env: it enables the *global*
+        # per-recipe graph-compilation detail that the `compile_metrics` worker
+        # RPC reads. It must not also drag in the per-step local tracker below.
         Value('track_graph_compilation', False, env_var='PT_HPU_METRICS_GC_DETAILS', env_var_type=boolean),
+        # Per-step *local* graph-compile tracking: HPUWorker.execute_model wraps
+        # every step in habana's `metric_localcontext("graph_compilation")`,
+        # which calls `torch.hpu.synchronize()` on exit -- a full device drain
+        # per step (~87 ms/step at 128k), plus ~98 `os.environ` lookups/step via
+        # `hpu/metrics/metrics.py`. That is a diagnostic, not workload, so it is
+        # off by default and decoupled from PT_HPU_METRICS_GC_DETAILS (which
+        # only enables the global metric detail). See JOURNAL 2026-09-21
+        # (host-side) and notes/continue.md.
+        Value('track_graph_compile_per_step', False,
+              env_var='VLLM_HPU_TRACK_GRAPH_COMPILE_PER_STEP', env_var_type=boolean),
         Value('per_token_kv_scaling_support',
               All(VersionRange(">=1.24.0.350"), MinPackageVersion("neural_compressor_pt", "3.7")),
               env_var_type=boolean),

@@ -170,7 +170,9 @@ class HabanaHighLevelProfiler:
             file_writer.start()
         if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
             self.enabled = True  # don't save separate high-level traces
-        self.gc_track_recompiles = get_config().track_graph_compilation
+        # Opt-in per-step local graph-compile tracking (drains the device per
+        # step). Decoupled from the global metrics env; see features.py.
+        self.gc_track_recompiles = get_config().track_graph_compile_per_step
         self.num_graph_compilations = 0
 
     def _dump_with_sep(self, entry):
