@@ -533,6 +533,97 @@ def _dedup_moe_op_weights(model: torch.nn.Module) -> None:
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
 
 
+class PostWarmupCompileGuard:
+    """Enforce "zero compiles after warmup".
+
+    Compilation during warmup is expected. Compilation during steady state is a
+    hard failure, not a proxy: it means the shapes / Python-int specializations
+    (guards) / op set that the steady state uses were not fully covered by
+    warmup, so any timing measured over that window is invalid.
+
+    Modes (``VLLM_POST_WARMUP_COMPILE_GUARD``):
+
+      * ``off``  - no checking
+      * ``warn`` - log every post-warmup compile with its reason (default)
+      * ``fail`` - raise on the first post-warmup compile (measurement harnesses)
+
+    Detection layers:
+
+      1. dynamo/inductor: ``torch._dynamo.config.error_on_recompile`` (fail mode
+         raises ``RecompileError`` with the guard-failure reason) and a diff of
+         ``torch._dynamo.utils.counters`` (warn mode).
+      2. HPU backend: ``PT_HPU_DISALLOW_TORCH_COMPILE`` (fail mode raises for any
+         new ``torch.compile``, including first-time compiles that
+         ``error_on_recompile`` cannot see).
+      3. Synapse runtime recipe compiles are reported post-hoc by
+         ``PT_COMPILATION_STATS_PATH`` and can be counted per step from a
+         profile trace; they are not covered by layers 1-2.
+    """
+
+    def __init__(self, mode: str, logger_):
+        self.mode = mode if mode in ('off', 'warn', 'fail') else 'warn'
+        self._logger = logger_
+        self.armed = False
+        self.warmup_skipped = False
+        self._base = None
+        self._reported = 0
+
+    # -- arming ------------------------------------------------------------
+    def arm(self, warmup_ran: bool) -> None:
+        if self.mode == 'off':
+            return
+        self.armed = True
+        self.warmup_skipped = not warmup_ran
+        if not warmup_ran:
+            self._logger.warning(
+                "PostWarmupCompileGuard: warmup did not run; steady-state "
+                "compiles cannot be attributed. Treat measurements as unvalidated.")
+        if self.mode == 'fail':
+            # Layer 1: raise on any guard-failure recompile, with the reason.
+            torch._dynamo.config.error_on_recompile = True
+            # Layer 2: raise on any new torch.compile reaching the HPU backend.
+            try:
+                bc.set_pt_hpu_disallow_torch_compile(True)
+            except Exception as e:  # pragma: no cover - older bridge
+                self._logger.warning(
+                    "PostWarmupCompileGuard: cannot set "
+                    "PT_HPU_DISALLOW_TORCH_COMPILE (%s); layer 2 disabled", e)
+        self._base = self._snapshot()
+        self._logger.info("PostWarmupCompileGuard armed (mode=%s)", self.mode)
+
+    # -- detection ---------------------------------------------------------
+    @staticmethod
+    def _snapshot() -> dict:
+        """Flatten the dynamo/inductor compile counters into a plain dict."""
+        out = {}
+        try:
+            import torch._dynamo.utils as du
+            for table, entries in du.counters.items():
+                for k, v in entries.items():
+                    if isinstance(v, int):
+                        out[f"{table}.{k}"] = v
+        except Exception:
+            pass
+        return out
+
+    def check(self, where: str = "") -> int:
+        """Diff the compile counters; warn/fail if anything compiled."""
+        if not self.armed or self._base is None:
+            return 0
+        now = self._snapshot()
+        new = {k: v for k, v in now.items() if v > self._base.get(k, 0)}
+        if not new:
+            return 0
+        self._reported += 1
+        msg = (f"PostWarmupCompileGuard: {sum(new.values())} compile counter "
+               f"increase(s) after warmup{(' at ' + where) if where else ''}: {new}")
+        if self.mode == 'fail':
+            raise RuntimeError(msg)
+        self._logger.warning(msg)
+        self._base = now
+        return sum(new.values())
+
+
 class BucketingFailedException(Exception):
     pass
 
@@ -1303,6 +1394,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.enable_bucketing = get_config().use_bucketing
         self.use_contiguous_pa = get_config().use_contiguous_pa
         self.skip_warmup = get_config().skip_warmup
+        self.compile_guard = PostWarmupCompileGuard(
+            getattr(get_config(), 'post_warmup_compile_guard', 'warn'), logger)
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -4341,6 +4434,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         warmup_mode: bool = False,
     ) -> ModelRunnerOutput | None:
 
+        if not warmup_mode:
+            # Zero compiles after warmup is a requirement; a counter increase
+            # here means the previous step compiled something (warn), and fail
+            # mode has already raised at the compile itself.
+            self.compile_guard.check("execute_model")
+
         self.run_defragmenter(scheduler_output, warmup_mode)
 
         batch_changed = self._update_states(scheduler_output)
@@ -5724,12 +5823,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         prompt_token_ids = list(range(total_tokens))
         num_blocks = round_up(total_tokens_for_blocks, self.block_size) // self.block_size
+        if os.environ.get("DSV4_WARMUP_DEBUG") == "1":
+            logger.warning(
+                "[warmupdbg] total_tokens=%s total_for_blocks=%s block_size=%s "
+                "attn_block_size=%s num_blocks=%s group_bs=%s max_model_len=%s",
+                total_tokens, total_tokens_for_blocks, self.block_size,
+                getattr(self, "attn_block_size", None), num_blocks,
+                [g.kv_cache_spec.block_size for g in self.kv_cache_config.kv_cache_groups],
+                self.max_model_len)
 
         req_id = f'{len(requests)}'
-        block_ids = [[block_id] *
-                     (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_like_layers > 0 else [[block_id] *
-                                                                                                            num_blocks]
+        # block_ids must have one entry per KV cache group: the block table is a
+        # MultiGroupBlockTable sized per group. DSv4 is a hybrid with several
+        # groups of different block sizes (e.g. [256, 64, 64, 4, 8]) but no
+        # mamba-like layers, so keying the per-group form on
+        # num_mamba_like_layers alone produced a single group and blew up in
+        # add_row.
+        if len(self.kv_cache_config.kv_cache_groups) > 1 or self.num_mamba_like_layers > 0:
+            block_ids = [[block_id] *
+                         (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
+                         for g in self.kv_cache_config.kv_cache_groups]
+        else:
+            block_ids = [[block_id] * num_blocks]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -6438,6 +6553,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         if self.skip_warmup:
             logger.info("Skipping warmup...")
+            self.compile_guard.arm(warmup_ran=False)
             return
 
         self.profiler.start('internal', 'warmup')
@@ -6537,6 +6653,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # and re-initialize it.
         if not self.is_pooling_model and self.kv_caches:
             self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
+
+        # Warmup is over: from here on, any compilation invalidates the run.
+        self.compile_guard.arm(warmup_ran=True)
 
     def shutdown_inc(self, suppress=suppress, finalize_calibration=finalize_calibration):
         global shutdown_inc_called
