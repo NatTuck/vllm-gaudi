@@ -151,10 +151,10 @@ class HPUWorker(WorkerBase):
             else:
                 fn = torch.profiler.tensorboard_trace_handler
                 with_stack = True
-            self.profiler = torch.profiler.profile(activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.HPU,
-            ],
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if os.environ.get("VLLM_HPU_PROFILER_ACTIVITY", "1") == "1":
+                activities.append(torch.profiler.ProfilerActivity.HPU)
+            self.profiler = torch.profiler.profile(activities=activities,
                                                    with_stack=with_stack,
                                                    on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
 
@@ -674,6 +674,35 @@ class HPUWorker(WorkerBase):
             return {"error": "metrics-unavailable"}
         return {name: (None if metric is None else dict(metric.stats()))
                 for name, metric in mg.items()}
+
+    def mem_stats(self) -> dict:
+        """Device-memory accounting for the measurement harness (one rank).
+
+        Read inside the worker on purpose: with multiprocessing the parent has        no HPU context, and initialising one there reserves the device and breaks
+        worker init. See `lad_torch_profile.py:_mem`.
+        """
+        out: dict = {}
+        for name in ("memory_allocated", "max_memory_allocated", "memory_reserved",
+                     "max_memory_reserved"):
+            fn = getattr(torch.hpu, name, None)
+            if fn is None:
+                continue
+            try:
+                out[name] = int(fn())
+            except Exception:
+                pass
+        try:
+            free, total = torch.hpu.mem_get_info()
+            out["free"] = int(free)
+            out["total"] = int(total)
+        except Exception:
+            pass
+        cc = getattr(self, "cache_config", None)
+        for attr in ("num_gpu_blocks", "block_size", "gpu_memory_utilization"):
+            v = getattr(cc, attr, None) if cc is not None else None
+            if v is not None:
+                out[attr] = v
+        return out
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
