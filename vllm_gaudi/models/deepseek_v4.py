@@ -59,6 +59,81 @@ _DSV4_SPARSE_CHUNK = int(os.environ.get("DSV4_SPARSE_CHUNK", "256"))
 # so each chunk stays ~256 MB fp32.
 _DSV4_INDEXER_CHUNK_ELEMS = int(os.environ.get("DSV4_INDEXER_CHUNK_ELEMS", str(1 << 26)))
 
+# A2/D7 (2026-10-05): indexer k_cache quantisation scale format.
+#
+# The vLLM/NVIDIA reference quantises the Lightning-Indexer keys with
+# ``scale_fmt = "ue8m0"`` (``vllm/models/deepseek_v4/attention.py:767-768``,
+# ``quant_block_size = 128`` == ``index_head_dim``): a **power-of-two**
+# per-token scale ``s_ref = 2 ** ceil(log2(amax / 448))`` over e4m3fn codes,
+# so its dequantised keys live on the grid ``{e4m3fn values} * s_ref``.
+#
+# HPU's ``cast_to_fp8_v2``/``cast_from_fp8`` implement **e4m3fn code semantics**
+# with a saturation ceiling of 240 -- measured, see
+# ``src/gates/stepR7_indexer_scale_gate.py`` (FMT checks): encode(1.0) == 0x38,
+# decode(0x38) == 1.0, encode(0.5) == 0x30, encode(0.001) == 0x01 == 2**-9,
+# encode(448) == 0x77 == 240. So with scale ``s`` the reachable grid is
+# ``{e4m3fn} * s`` clipped at 240, and ``s = 2 * s_ref`` gives
+# ``2*{e4m3fn} * s_ref``, a subset of the reference's grid that coincides with
+# it everywhere except the reference's subnormal codes (where our scaled code
+# is a subnormal, ``|k| / s_hpu < 2**-6``, the reference has 2x the resolution).
+# The largest code is then ``amax / (2 * s_ref) <= 224 <= 240``, so nothing is
+# clipped -- with ``s = s_ref`` the codes would have to reach 448 and clip.
+# On Gaudi3 (e4m3fn, 448 ceiling) the reference's own scale is used unchanged.
+#
+# This is not a Gaudi-only adaptation: the reference's own kernel uses
+# ``kFp8ScaleDivisor = 224.f`` on ``__gfx942__`` (an fnuz platform) and ``448.f``
+# otherwise (``cache_kernels.cu:27-31``), so ``2 * s_ref`` is literally the
+# reference's fnuz-platform variant.
+_REF_INDEXER_FP8_MAX = 448.0
+
+# A6/D8: the compress-RoPE parameters (inv_freq, attention_scaling) read from the
+# transformers config on first use and reused afterwards -- see
+# ``_build_compress_rope_cache`` for why a second read can fail.
+_COMP_ROPE_PARAMS = None
+
+
+def _indexer_ue8m0_scale(amax):
+    """Reference-faithful ue8m0 (power-of-two) indexer quantisation scale.
+
+    ``amax`` is the per-token ``max|key|`` (fp32, shape ``[n]``). Returns the
+    fp32 dequantisation multiplier, a power of two, so that
+    ``cast_from_fp8(x, scale)`` lands on the same key grid as the reference's
+    ``ue8m0`` quantiser. See the comment block above for the format argument.
+
+    Transcribed from the reference's **DSv4 indexer** k_cache insert,
+    ``_fused_kv_compress_norm_rope_insert_indexer_attn`` -- the ``head_dim == 128``
+    branch of the triton ``fused_compress_quant_cache`` module
+    (``vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py:658``,
+    body ``:810-828``), which the compressor runs to write the indexer cache
+    (``compressor.py:445-450`` "Indexer path (head_dim == 128)", ``:397``;
+    ``attention.py:883`` -- "compressor ... writes K to the indexer KV cache")::
+
+        # one program per token; :806-809 static_assert(TRITON_BLOCK_SIZE == QUANT_BLOCK)
+        INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX              # 448.0
+        result_bf16 = result.to(tl.bfloat16).to(tl.float32)    # round to bf16 first
+        absmax      = tl.max(tl.abs(result_bf16), axis=0)      # scalar = per token
+        absmax      = tl.maximum(absmax, 1e-4)
+        raw_scale   = absmax * INV_FP8_MAX
+        exponent    = tl.ceil(tl.log2(raw_scale))
+        inv_scale   = tl.exp2(-exponent)                       # dequant = exp2(exponent)
+        scale_val   = tl.exp2(exponent)   # stored as ONE float32 (:690 SCALE_DIM 4)
+
+    Note what the reference asserts about itself: ``TRITON_BLOCK_SIZE == QUANT_BLOCK``
+    with one program per token means **exactly one quant block per token** -- i.e.
+    the per-token amax over all 128 index dims this function computes, and a single
+    float32 scale per token (132 B/token: 128 fp8 + 4 scale), which is exactly the
+    layout we write. The eps is ``1e-4``, *not* the ``1e-10`` of the unrelated
+    triton ``per_token_group_quant_fp8`` activation helper; the same ``1e-4`` floor
+    appears in both CUDA insert kernels (``cache_kernels.cu:590``,
+    ``fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu:326``). Those CUDA kernels
+    divide by the divisor where this triton path multiplies by its reciprocal --
+    the two agree on every input tested (``stepR7_indexer_scale_gate.py`` checks it).
+    """
+    from vllm_gaudi.extension.ops import is_hpu_gaudi2
+    scale_raw = amax.clamp(min=1e-4) * (1.0 / _REF_INDEXER_FP8_MAX)
+    scale = torch.exp2(torch.ceil(torch.log2(scale_raw)))
+    return scale * 2.0 if is_hpu_gaudi2 else scale
+
 # The compressor is isolated from the layer graph by a *controlled graph break*
 # (`torch._dynamo.graph_break()`), NOT by `torch.compiler.disable`. A disable runs
 # the wrapper eagerly (HPU compute outside a graph, forbidden); a graph break
@@ -77,6 +152,41 @@ _DSV4_INDEXER_CHUNK_ELEMS = int(os.environ.get("DSV4_INDEXER_CHUNK_ELEMS", str(1
 # ``DSV4_COMPRESSOR_BREAK=0`` disables the break (inline; needs fullgraph=False
 # and more HBM than is available today).
 _COMPRESSOR_BREAK = os.environ.get("DSV4_COMPRESSOR_BREAK", "1") != "0"
+
+# T4/T5 step 1 / E3a (2026-10-02): replace the compressor's break-partitioned
+# body with ONE opaque, HPU-lowerable TPC node at the paged-state-write boundary
+# (`src/custom_ops/dsv4_comp_stub`, identity over uint8), and skip the
+# `graph_break()` pair on that path. Structural test only: the op's numerics are
+# meaningless by construction, so E3a gates launches/syncs/segments, never
+# correctness. Default 0 -> the break path is byte-for-byte unchanged.
+_COMPRESSOR_OP = os.environ.get("DSV4_COMPRESSOR_OP", "0") == "1"
+
+# E3b scoping (2026-10-03): split the E3a stub into a write half and a read half
+# so an ablation can name *which* of the compressor's paged-I/O ops produces E4's
+# >= 50 us DMA copies (44,230 of them, 84 % of E4's DMA time, from exactly the 41
+# layer recipes; S2 and E3a have zero). Both default to 1, so with
+# DSV4_COMPRESSOR_OP=1 the behaviour is byte-for-byte E3a.
+#   DSV4_COMP_STUB_WRITE=0 -> run the real R5 paged write (+ R7 indexer write)
+#   DSV4_COMP_STUB_READ=0  -> run the real R6/R7 paged reads
+_COMP_STUB_WRITE = os.environ.get("DSV4_COMP_STUB_WRITE", "1") != "0"
+_COMP_STUB_READ = os.environ.get("DSV4_COMP_STUB_READ", "1") != "0"
+
+# E3b step 1 (2026-10-03): re-express the compressor's paged **writes** as a
+# scatter on the *flattened* page (`flat[block*sbs + off] = row`) instead of
+# advanced indexing on the 3-D strided view (`page[blocks, offs] = rows`).
+# The read side already does exactly this and its docstring says why:
+# "advanced indexing on the strided page view ... would make the compiler
+# materialise a full slab copy inside the model's large graph". Measured with
+# the compressor inlined (DSV4_COMPRESSOR_BREAK=0): the 3-D form produces a
+# ~41 GB `[mem] max` transient (ablW 91.81 GB vs ablR 50.61 GB) and 55,833
+# `DmaMemcpy` copies >= 50 us (84 % of DMA time, ~97 %/stream DMA occupancy)
+# where the stubbed write produces zero.
+#
+# DEFAULT FLIPPED TO 1 on 2026-10-08: the flat view is measured at **0.083 s/step vs the
+# 0.0932 s baseline (-11 %)** with **3/3 MATCH (11627 / 6397 / 11111)** on the margin probe.
+# It is one line of indexing -- no new kernel, no stub. Defaulting it ON is what stops the
+# regression silently coming back; `DSV4_COMP_FLAT_WRITE=0` restores the 3-D scatter.
+_COMP_FLAT_WRITE = os.environ.get("DSV4_COMP_FLAT_WRITE", "1") == "1"
 
 # Temporary diagnostic (DSV4_SYNC_PROBE=1): count host-side synchronize calls and
 # print the first few stacks, to find who blocks the host between graph launches.
@@ -831,18 +941,33 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         region; the result is identical for every compressor layer (same
         ``compress_rope_theta`` / partial-rotary factor), so it is built once
         and shared instead of duplicated per layer (at 1M that is ~268 MB each).
+
+        A6/D8 hardening (2026-10-05): ``AutoConfig.from_pretrained`` stops
+        returning ``compress_rates`` once vLLM's engine config has been built
+        (measured: ``hasattr(cfg, 'compress_rates')`` is True before
+        ``EngineArgs(...).create_engine_config()`` and False after), so
+        ``DeepseekV4CSACompressor(pub_cfg)`` raises ``AttributeError`` on any
+        later call -- the harness builds several engines per process, so this
+        was a live ordering hazard. The two numbers are therefore read once and
+        memoized, making every later call order-independent.
         """
+        global _COMP_ROPE_PARAMS
         from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4CSACompressor,
         )
         from transformers import AutoConfig
-        ckpt = _v4_resolve_ckpt_dir(
-            getattr(hf_config, "_name_or_path", "") or ""
-        )
-        pub_cfg = AutoConfig.from_pretrained(ckpt)
-        pub = DeepseekV4CSACompressor(pub_cfg)
-        inv = pub.rotary_emb.compress_inv_freq.float().to(dev)
-        scale = pub.rotary_emb.compress_attention_scaling
+        if _COMP_ROPE_PARAMS is None:
+            ckpt = _v4_resolve_ckpt_dir(
+                getattr(hf_config, "_name_or_path", "") or ""
+            )
+            pub_cfg = AutoConfig.from_pretrained(ckpt)
+            pub = DeepseekV4CSACompressor(pub_cfg)
+            _COMP_ROPE_PARAMS = (
+                pub.rotary_emb.compress_inv_freq.detach().float().cpu().clone(),
+                float(pub.rotary_emb.compress_attention_scaling),
+            )
+        inv, scale = _COMP_ROPE_PARAMS
+        inv = inv.to(dev)
         # Entries are RoPE'd at position ``ci * rate``; ci < cap = max_model_len // rate.
         p = torch.arange(max_model_len + rate + 1, dtype=torch.float32, device=dev)
         freqs = p.unsqueeze(1) * inv.unsqueeze(0)
@@ -1094,7 +1219,14 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         blocks = torch.div(slots, sbs, rounding_mode="floor")
         offs = slots % sbs
         # Strided fp8 advanced-index scatter compiles fine (SWA cache gate).
-        page[blocks, offs] = comp.to(page.dtype)
+        _val = comp.to(page.dtype)
+        if _COMP_FLAT_WRITE:
+            # E3b step 1: scatter on the flat page so only the [n, hd] rows are
+            # touched (the 3-D form materialises a full slab copy -- see the
+            # `_COMP_FLAT_WRITE` note at the top of the file).
+            page.reshape(-1, hd).index_copy_(0, blocks * sbs + offs, _val)
+        else:
+            page[blocks, offs] = _val
         if _DSV4_R6_DEBUG and comp.shape[0] > 0:
             _off_elems = self._dsv4_page_off
             _b0 = int(blocks[0].item())
@@ -1176,17 +1308,21 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
     def _quant_indexer_key(self, k):
         """Quantize indexer keys to the paged k_cache format: fp8 + a per-token
-        fp32 scale, using the standard HPU fp8 path.
+        fp32 scale.
 
         ``k`` is ``[n, 128]`` bf16. Returns ``(x_fp8 [n,128], scale [n] fp32)``
-        where ``dequant = cast_from_fp8(x_fp8, scale)``. ``FP8_MAX`` is the HPU
-        native max (240 = e4m3fnuz on Gaudi2, 448 on Gaudi3), so the quantized
-        values stay in the hardware's representable range.
+        where ``dequant = cast_from_fp8(x_fp8, scale)``.
+
+        The scale is the reference's power-of-two (``ue8m0``) block scale,
+        expressed in Gaudi's fp8 format -- see ``_indexer_ue8m0_scale``. Before
+        2026-10-05 this used an arbitrary fp32 scale ``amax / FP8_MAX``, which
+        put the keys on a *different* grid from the reference: up to 7.2 %
+        per-element deviation and 16.7 % top-k selection flips vs the reference
+        (see ``src/gates/stepR7_indexer_scale_gate.py``).
         """
-        from vllm_gaudi.extension.ops import FP8_MAX
         kf = k.to(torch.bfloat16)
-        amax = kf.float().abs().amax(dim=-1).clamp(min=1e-4)
-        scale = (amax / FP8_MAX).to(torch.float32)  # dequant multiplier
+        amax = kf.float().abs().amax(dim=-1)
+        scale = _indexer_ue8m0_scale(amax)
         inv = (1.0 / scale).reshape(-1, 1)
         x = torch.ops.hpu.cast_to_fp8_v2(kf, inv, False, False,
                                          torch.float8_e4m3fn)[0]
@@ -1221,7 +1357,12 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         x, scale = self._quant_indexer_key(icomp)
         # Keys (fp8) go into the paged k_cache: one strided-view mutation.
         fp8_page = slab2d[:, off:off + fp8_elems].view(-1, sbs, tok)
-        fp8_page[blocks, offs] = x.to(slab2d.dtype)
+        _x8 = x.to(slab2d.dtype)
+        if _COMP_FLAT_WRITE:
+            # E3b step 1: same flat-scatter treatment as R5 above.
+            fp8_page.reshape(-1, tok).index_copy_(0, blocks * sbs + offs, _x8)
+        else:
+            fp8_page[blocks, offs] = _x8
         # Scales go into the dedicated fp32 buffer, indexed by the compressed
         # entry index ci = (pos+1)//rate - 1 (HPU cannot mutate two dtype-views
         # of the same cache in one graph — see notes/hpu-clean.md §4).
@@ -1319,19 +1460,32 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         gate = hidden @ gate_w.t()
 
         # R4 vectorized state write + window compression
-        comp, _nw_p, sel_p = self._comp_state_paged_vectorized(kv, gate, positions)
-        if comp.shape[0] > 0:
-            self._write_paged_compressed(comp, sel_p, positions)
+        # E3a (DSV4_COMPRESSOR_OP=1): the paged state write and the compressed /
+        # indexer cache reads are replaced by ONE opaque TPC node on a
+        # preallocated static buffer. Numerics are meaningless by construction;
+        # E3a gates structure only (see worker-report.md section 8).
+        stub = self._comp_stub() if _COMPRESSOR_OP else None
+        # E3b scoping: the stub's write half and read half are ablatable
+        # independently; both set (the default) is exactly E3a's behaviour.
+        stub_w = stub if _COMP_STUB_WRITE else None
+        stub_r = stub if _COMP_STUB_READ else None
+        if stub_w is None:
+            comp, _nw_p, sel_p = self._comp_state_paged_vectorized(kv, gate, positions)
+            if comp.shape[0] > 0:
+                self._write_paged_compressed(comp, sel_p, positions)
         # ---- indexer (only CSA, ratio 4) ----
         has_idx = rate == 4 and self.indexer is not None
         if has_idx:
             # CSA gathers its top-k entries in the attention (D5d), so the
             # dense compressed read ([cap, D]; ~268 MB at 1M) is not needed.
-            compressed_kv_full = kv.new_zeros((0, D))
+            compressed_kv_full = stub_r[:0] if stub_r is not None else kv.new_zeros((0, D))
         else:
-            compressed_kv_full = self._read_paged_compressed(self._cap)
-            if compressed_kv_full is None:
-                compressed_kv_full = kv.new_zeros((self._cap, D))
+            if stub_r is not None:
+                compressed_kv_full = stub_r
+            else:
+                compressed_kv_full = self._read_paged_compressed(self._cap)
+                if compressed_kv_full is None:
+                    compressed_kv_full = kv.new_zeros((self._cap, D))
 
         if has_idx:
             idx = self.indexer
@@ -1341,14 +1495,20 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             igate_w = ifused[2 * idx_h:]
             ikv = hidden @ ikv_w.t()
             igate = hidden @ igate_w.t()
-            icomp, _nw_i, _sel_i = self._comp_state_paged_vectorized(
-                ikv, igate, positions, comp_module=idx.compressor, head_dim=idx_h,
-                state_buf=getattr(self, "_dsv4_indexer_state", None))
-            if icomp.shape[0] > 0:
-                self._write_paged_indexer(icomp, _sel_i, positions, _nw_i)
-            idx_compressed = self._read_paged_indexer(self._cap)
-            if idx_compressed is None:
-                idx_compressed = kv.new_zeros((self._cap, idx_h))
+            if stub_w is not None and stub_r is not None:
+                idx_compressed = stub_r[:, :idx_h]
+            else:
+                icomp, _nw_i, _sel_i = self._comp_state_paged_vectorized(
+                    ikv, igate, positions, comp_module=idx.compressor, head_dim=idx_h,
+                    state_buf=getattr(self, "_dsv4_indexer_state", None))
+                if icomp.shape[0] > 0:
+                    self._write_paged_indexer(icomp, _sel_i, positions, _nw_i)
+                if stub_r is not None:
+                    idx_compressed = stub_r[:, :idx_h]
+                else:
+                    idx_compressed = self._read_paged_indexer(self._cap)
+                    if idx_compressed is None:
+                        idx_compressed = kv.new_zeros((self._cap, idx_h))
         else:
             idx_h = D
             idx_compressed = torch.zeros(0, D, dtype=torch.bfloat16, device=dev)
@@ -1449,6 +1609,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         Default (``_COMPRESSOR_BREAK`` False): inlined, no break — required under
         the engine's global ``fullgraph=True``.
         """
+        if _COMPRESSOR_OP:
+            # E3a: no break -- the mutation-heavy part of the body is one opaque
+            # TPC node, so it can stay inside the layer region.
+            return self._run_compressor_impl(
+                hidden_states, q_residual, positions, is_prompt)
         if _COMPRESSOR_BREAK:
             torch._dynamo.graph_break()
         out = self._run_compressor_impl(
@@ -1459,6 +1624,11 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
 
     def _run_compressor_decode(self, hidden_states, q_residual, positions, is_prompt):
         """Decode compressor; see ``_run_compressor`` for the controlled break."""
+        if _COMPRESSOR_OP:
+            # E3a: no break -- the mutation-heavy part of the body is one opaque
+            # TPC node, so it can stay inside the layer region.
+            return self._run_compressor_impl(
+                hidden_states, q_residual, positions, is_prompt)
         if _COMPRESSOR_BREAK:
             torch._dynamo.graph_break()
         out = self._run_compressor_impl(
@@ -1466,6 +1636,38 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         if _COMPRESSOR_BREAK:
             torch._dynamo.graph_break()
         return out
+
+    def _comp_stub(self):
+        """E3a: one opaque TPC node on a preallocated static buffer.
+
+        Returns a bf16 ``[cap, D]`` tensor whose bytes were copied by the
+        ``dsv4_comp_ident`` kernel. Deliberately meaningless numerically.
+        """
+        blk = getattr(self, "_comp_stub_blk", None)
+        if blk is None:
+            # Never allocate here: this runs inside the traced region, and a
+            # device allocation + attribute mutation during the trace stalls it
+            # (E3a run 1). The buffer is preallocated at load time by
+            # ``_make_comp_stub_buffer`` (called from _prep_compress_caches).
+            raise RuntimeError(
+                "DSV4_COMPRESSOR_OP=1 but the stub buffer was not preallocated; "
+                "expected _prep_compress_caches -> _make_comp_stub_buffer")
+        if _DSV4_COMP_STUB_OP is None:
+            raise RuntimeError(
+                "DSV4_COMPRESSOR_OP=1 but hpu_custom_dsv4_comp_stub*.so was not "
+                "loaded (build it with src/custom_ops/dsv4_comp_stub/setup.py)")
+        return _DSV4_COMP_STUB_OP(blk).view(torch.bfloat16)
+
+    def _make_comp_stub_buffer(self) -> None:
+        """E3a: allocate the opaque-op buffer at load time, outside any trace."""
+        if getattr(self, "_comp_stub_blk", None) is not None:
+            return
+        if self.compressor is None or self.compress_ratio <= 1:
+            return
+        cap = max(self._cap, 1)
+        D = self.head_dim
+        self._comp_stub_blk = torch.zeros((cap, 2 * D), dtype=torch.uint8,
+                                          device=self.compressor.ape.device)
 
     def _run_compressor_impl(self, hidden_states, q_residual, positions, is_prompt):
         if self.compressor is None or self.compress_ratio <= 1:
@@ -2410,6 +2612,8 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
                     shared = getattr(attn, "_compress_cache", None)
                 if getattr(attn, "_compress_cache", None) is not None:
                     n += 1
+                if _COMPRESSOR_OP:
+                    attn._make_comp_stub_buffer()
         print(f"[v4] built compress caches for {n} layers (rope cache shared: "
               f"{shared is not None})", flush=True)
         self._check_v4_routed_all()
@@ -2569,6 +2773,46 @@ def _load_fp4_custom_op():
 _FP4_CUSTOM_OP = (_load_fp4_custom_op()
                    if os.environ.get("DSV4_FP4_CUSTOM", "0") == "1" else None)
 
+# CONTROL PATH, NOT PRODUCTION (2026-10-06). The "default (bf16 experts)" control was
+# produced by unsetting DSV4_FP4_CUSTOM, which falls back to the pure-Python dequant --
+# ~240x slower (measured: L~262 prefill 0.731 s -> 174.9 s), i.e. ~11 h at L512, so a
+# SAME-LENGTH control at L512 is infeasible that way. But F12 established the custom
+# TPC dequant is bit-exact, so casting its scale-free fp8 output to bf16 reproduces the
+# default control's numbers while keeping the fast dequant: the e8m0 scale is already
+# folded into the fp8 exponent, so the bf16 cast IS the real weight. This exists only so
+# a control can be taken at the SAME LENGTH as the capture it is compared with -- F17
+# (2026-10-06) proved the CPU reference is itself length-dependent, so cross-length
+# comparison of the engine-vs-reference profile is invalid. Default "0": production is
+# unchanged.
+_EXPERT_GEMM_BF16 = os.environ.get("DSV4_EXPERT_GEMM_BF16", "0") == "1"
+
+
+def _load_dsv4_comp_stub_op():
+    """Load the E3a identity TPC op (``torch.ops.custom_op.dsv4_comp_ident``).
+
+    The kernel library itself (``libfp4_dequant_kernels.so``, which now carries
+    both GUIDs) is loaded by the graph compiler via ``GC_KERNEL_PATH``. Override
+    the extension path with ``DSV4_COMP_STUB_OP_LIB``.
+    """
+    import glob
+    pat = os.environ.get("DSV4_COMP_STUB_OP_LIB")
+    if not pat:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        pat = os.path.join(root, "src", "custom_ops", "dsv4_comp_stub",
+                           "hpu_custom_dsv4_comp_stub*.so")
+    hits = glob.glob(pat)
+    if not hits:
+        return None
+    try:
+        torch.ops.load_library(hits[0])
+        return torch.ops.custom_op.dsv4_comp_ident
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_DSV4_COMP_STUB_OP = (_load_dsv4_comp_stub_op()
+                      if os.environ.get("DSV4_COMPRESSOR_OP", "0") == "1" else None)
+
 
 _FP4_BLK = 64  # fp8 bytes per interleave chunk (32 packed fp4 bytes -> 64 fp8)
 
@@ -2610,6 +2854,27 @@ def _fp4_perm_blocks(x: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return x.reshape(*x.shape[:-1], d // _FP4_BLK, _FP4_BLK).index_select(-2, perm).reshape(*x.shape[:-1], d)
 
 
+def _fp8_act_ceiling() -> float:
+    """The saturation ceiling of HPU's fp8 activation cast on THIS device.
+
+    HPU's ``cast_to_fp8_v2`` implements e4m3fn **code** semantics with a saturation ceiling of
+    **240** on Gaudi 2, not the e4m3fn max of 448 -- measured and asserted in
+    ``src/gates/stepR7_indexer_scale_gate.py`` (``encode(448) == 0x77 == 240``). vllm-gaudi's own
+    activation quantiser already selects on this: ``extension/ops.py:28-30`` sets
+    ``FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max`` when ``is_hpu_gaudi2``, and
+    ``dynamic_quant`` (``:1081``) uses ``amax / FP8_MAX``.
+
+    ``_fp8_expert_gemm`` previously hardcoded 448 here, i.e. the Gaudi-3/NVIDIA ceiling on a
+    Gaudi-2 device: the largest activation element of every expert mapped to code 448 and
+    saturated to 240, a **46 % distortion of it** (it is always exactly ``amax``, so it is always
+    clipped). Measured on a real activation + real weights, GEMM max-rel-err vs the bf16 class:
+    ``amax/448`` 0.026912 -> ``amax/240`` 0.015024
+    (``Archive/by-date/2026-10-06/fp8_activation_ceiling_probe.py``).
+    """
+    from vllm_gaudi.extension.ops import is_hpu_gaudi2
+    return 240.0 if is_hpu_gaudi2 else 448.0
+
+
 def _fp8_expert_gemm(x: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
     """Batched expert GEMM with scale-free fp8 weights.
 
@@ -2618,10 +2883,11 @@ def _fp8_expert_gemm(x: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
     is dynamically quantised per expert. ``fp8_gemm_v2`` is 2D-only, so loop over
     the (small) expert count.
     """
+    ceiling = _fp8_act_ceiling()
     outs = []
     for g in range(x.shape[0]):
         amax = x[g].abs().amax().clamp(min=1e-12)
-        scale = (amax / 448.0).to(torch.float32)
+        scale = (amax / ceiling).to(torch.float32)
         xq = torch.ops.hpu.cast_to_fp8_v2(
             x[g], (1.0 / scale).to(torch.float32), False, False, torch.float8_e4m3fn)[0]
         outs.append(torch.ops.hpu.fp8_gemm_v2(
@@ -2993,7 +3259,13 @@ def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch
         Gs = s.shape[-1]
         # Keep the natural dtype: fp8 (scale-free) from the custom kernel, bf16
         # from the pure-Python fallback. _compute_v4_routed branches on it.
-        return _dequant_v4_fp4(p.reshape(-1, C), s.reshape(-1, Gs)).view(n, R, C * 2)
+        out = _dequant_v4_fp4(p.reshape(-1, C), s.reshape(-1, Gs)).view(n, R, C * 2)
+        if _EXPERT_GEMM_BF16 and out.dtype == torch.float8_e4m3fn:
+            # CONTROL: force the bf16 expert GEMM while keeping the fast custom dequant
+            # (see _EXPERT_GEMM_BF16). Value-preserving: the scale-free fp8 already holds
+            # the real weight, so the cast is the same number in bf16.
+            out = out.to(torch.bfloat16)
+        return out
 
     # Keep w1/w3 separate: concatenating them along `inter` forces a transposed
     # DMA on HPU (the `ffn/cat` DmaTranspose); two bmms are cheaper than one

@@ -5251,6 +5251,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.regional_compilation_layers_list = [RMSNorm, VocabParallelEmbedding]
                 self._regional_compilation(self.model)
                 self.sampler = self._compile(self.sampler)
+                # Mission step 3: opt-in per-region capture for the chain gate. Unset by
+                # default, so the serving path is unchanged. A `forward_hook` on a region
+                # module runs outside its compiled `forward`, so it cannot add a graph break
+                # or a specialization; it is only ever installed on a labelled VALIDATION run.
+                if os.environ.get("DSV4_REGION_CAPTURE"):
+                    from vllm_gaudi.validation.region_capture import install as _rc_install
+                    _rc_install(self.model)
+                # L1: the engine-side `step_logits` producer (raw logits, [S, V]). Same proven
+                # mechanism as region_capture -- a forward_hook on a region module, which runs
+                # outside its compiled forward. Env-gated; unset by default.
+                if os.environ.get("DSV4_LOGITS_CAPTURE"):
+                    from vllm_gaudi.validation.logits_capture import install as _lc_install
+                    _lc_install(self.model)
+                # gap-B production-regime capture (PLAN.md F28). Hook the REGION modules only
+                # -- nn.ModuleList children and the `regional_compilation_layers_list` members
+                # (RMSNorm / VocabParallelEmbedding), whose forward_hooks run OUTSIDE their
+                # compiled forward. Monkeypatching the compiled model's inner callables does
+                # not work (measured: TypeError at load_model). Env-gated; unset by default.
+                if os.environ.get("DSV4_PROD_REGIME"):
+                    try:
+                        import importlib.util as _ilu
+
+                        _sp = _ilu.spec_from_file_location(
+                            "prod_regime_capture", os.environ["DSV4_PROD_REGIME_SCRIPT"])
+                        _m = _ilu.module_from_spec(_sp)
+                        _sp.loader.exec_module(_m)
+                        _m.install_module_recorder(self.model, os.environ["DSV4_PROD_REGIME"])
+                    except Exception as _e:  # pragma: no cover
+                        print(f"[regime] module-hook install failed: {_e!r}", flush=True)
             else:
                 self.model = self._compile(self.model)
 
