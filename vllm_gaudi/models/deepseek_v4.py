@@ -36,6 +36,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
     _use_sequence_parallel,
 )
 from vllm.sequence import IntermediateTensors
+from vllm_gaudi.models import dsv4_fp4_variant  # noqa: E402
 
 
 
@@ -2593,6 +2594,9 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
                 _register_v4_routed_packed(ffn, "cpu")
                 n += 1
         print(f"[v4] prepped {n} layers' routed fp4 buffers in {_t.time() - t0:.1f}s", flush=True)
+        # The routed fp4 buffers now exist, so the checkpoint's scale bounds are
+        # known -- select the fp4_dequant kernel variant once, for all layers.
+        _select_fp4_variant_all(self, where="fresh load")
 
     def _prep_compress_caches(self) -> None:
         """Build every layer's compressor buffers at load time.
@@ -2626,6 +2630,19 @@ class DeepseekV4HPUModel(_NvDeepseekV4Model):
             ffn = getattr(layer, "ffn", None)
             if ffn is not None and hasattr(ffn, "_v4_fp8_ready"):
                 _check_v4_routed_ready(ffn)
+        # Kernel-variant selection, RESTORE path. `_register_v4_routed_packed`
+        # returns early once `_v4_fp8_ready` is set, so a snapshot restore never
+        # ran the load-time selection (nor the two range guards -- pre-existing,
+        # deliberately unchanged here). A guard that one path skips is not a
+        # guard, so the selection is repeated from the RESTORED buffers. That
+        # needs one min/max reduction over the routed scale tensors, which is a
+        # NEW reduction (the reason it is stated rather than hidden): it is not a
+        # new read of the checkpoint -- the tensors are already resident, and
+        # `_check_v4_routed_ready` above has just materialised them with
+        # `~isfinite(s)` -- but it is not free, and it is the price of covering
+        # the restore path at all. `_select_fp4_variant_all` is a no-op when the
+        # fresh load already selected in this process.
+        _select_fp4_variant_all(self, where="snapshot restore")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Routed-expert weights (.experts.) are bypassed: the FusedMoE params
@@ -2773,6 +2790,169 @@ def _load_fp4_custom_op():
 _FP4_CUSTOM_OP = (_load_fp4_custom_op()
                    if os.environ.get("DSV4_FP4_CUSTOM", "0") == "1" else None)
 
+
+# ---------------------------------------------------------------------------
+# THE PROMOTED LUT PATH
+# ---------------------------------------------------------------------------
+# `custom_op::fp4_dequant_lut(blocks, kexp, lut)` is the table-lookup decode of
+# the SAME numerical contract, registered in the EXISTING `custom_op` namespace
+# (so the backend's `namespace == "custom_op"` short-circuit still places it
+# `hpu_cluster` and it joins the surrounding submission) and bound to the kernel
+# `fp4_dequant_lutptr_rc_gaudi2`, which is carried by the PROMOTED kernel library
+# `src/custom_ops/fp4_dequant/libfp4_dequant_lut_kernels.so` alongside the two
+# GUIDs the shipped library has (`fp4_dequant_fwd_gaudi2` + `dsv4_comp_ident`).
+#
+# WHY PROMOTION RATHER THAN A RUNTIME GC_KERNEL_PATH WRITE.  The variant-selection
+# wiring writes `GC_KERNEL_PATH` at load time, and that CANNOT work: the worker
+# fixes its kernel database at its FIRST HPU op, ~40 s before the load path has
+# the scales (MEASURED, Archive/by-date/2026-10-12/fp4-e2e-variant/REPORT.md §1).
+# Promotion puts the kernel's NAME in the ACTIVE library's `GetKernelGuids` table
+# instead, so there is nothing to write at run time: the launch names the promoted
+# library and the op is callable from the first compile.  The promoted library is
+# put into `GC_KERNEL_PATH` by
+# `dsv4_fp4_variant.install_promoted_kernel_path()`, called from
+# `vllm_gaudi.register_utils()` (the general-plugin hook, before `init_device`);
+# with the promotion in effect the load path writes nothing at all.
+_FP4_LUT_REQUESTED = os.environ.get("DSV4_FP4_LUT", "0") == "1"
+_FP4_LUT_OP = None          # custom_op::fp4_dequant_lut, when the extension has it
+_FP4_LUT_TABLE = None       # the 240-byte table on the HPU, or None
+_FP4_LUT_VARIANT = None     # which variant's decode the table holds
+
+
+def _load_fp4_lut_op():
+    """Load the fp4 extension and return `custom_op::fp4_dequant_lut`, or None.
+
+    Same extension file as `_load_fp4_custom_op`; the op only exists once the
+    extension has been rebuilt from the promoted source (build_lut.sh).  A
+    missing op is reported, never silent.
+    """
+    import glob
+    pat = os.environ.get("DSV4_FP4_OP_LIB")
+    if not pat:
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        pat = os.path.join(root, "src", "custom_ops", "fp4_dequant",
+                           "hpu_custom_fp4_dequant*.so")
+    hits = glob.glob(pat)
+    if not hits:
+        return None
+    try:
+        torch.ops.load_library(hits[0])
+        return torch.ops.custom_op.fp4_dequant_lut
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _active_kernel_lib() -> str:
+    """The kernel library the graph compiler will use: `GC_KERNEL_PATH`.
+
+    Empty/absent means the image default, which the PT bridge resolves to
+    `/usr/lib/habanalabs/libtpc_kernels.so` -- a library with none of our
+    kernels in it, so the promotion is NOT in effect there and this returns that
+    path so the check says so.
+    """
+    p = os.environ.get("GC_KERNEL_PATH", "").strip()
+    if p and os.path.isfile(p):
+        return p
+    return "/usr/lib/habanalabs/libtpc_kernels.so"
+
+
+def _install_fp4_lut(variant: str) -> bool:
+    """Build the SELECTED VARIANT's table and put it on the HPU.  Returns ok.
+
+    The table is a function of the variant, not of the kernel: the promoted LUT
+    carries whatever decode the selector picked (on this checkpoint
+    `noguard_floor`), which is the whole point of promoting it rather than a
+    fixed table.  Three gates, each reported:
+      1. `DSV4_FP4_LUT=1`;
+      2. the extension exposes `custom_op::fp4_dequant_lut`;
+      3. the ACTIVE kernel library's `GetKernelGuids` lists
+         `fp4_dequant_lutptr_rc_gaudi2` for DEVICE_ID_GAUDI2.
+    Gate 3 is read from the artifact (the library's own entry point), not
+    inferred from a successful build.
+    """
+    global _FP4_LUT_OP, _FP4_LUT_TABLE, _FP4_LUT_VARIANT
+    if not _FP4_LUT_REQUESTED:
+        return False
+    if variant is None:
+        print("[v4-fp4-lut] no variant selected -> LUT path NOT installed",
+              flush=True)
+        return False
+    if _FP4_LUT_OP is None:
+        _FP4_LUT_OP = _load_fp4_lut_op()
+    if _FP4_LUT_OP is None:
+        print("[v4-fp4-lut] the fp4 extension does not expose "
+              "custom_op::fp4_dequant_lut -> LUT path NOT installed "
+              "(rebuild it with src/custom_ops/fp4_dequant/build_lut.sh)",
+              flush=True)
+        return False
+    lib = _active_kernel_lib()
+    present = dsv4_fp4_variant.lut_kernel_present(lib)
+    if present is not True:
+        print(f"[v4-fp4-lut] the ACTIVE kernel library {lib!r} does "
+              f"{'not list' if present is False else 'COULD NOT BE CONSULTED for'} "
+              f"{dsv4_fp4_variant.LUT_KERNEL_NAME} -> LUT path NOT installed; "
+              f"point GC_KERNEL_PATH at the promoted "
+              f"libfp4_dequant_lut_kernels.so", flush=True)
+        return False
+    # TEST SEAM (env-gated, DEFAULT OFF -- production behaviour byte-identical):
+    # `DSV4_FP4_LUT_TABLE_VARIANT` installs a table other than the one the
+    # selector picked, so an A/B/C/D model-level comparison is possible from one
+    # build.  The special value `zeros` is NOT any variant's decode: it is the
+    # ACTIVITY FALSIFIER (an all-zero table must move the output if the table
+    # really reaches the kernel, and must NOT if it was folded in at trace time).
+    _forced_tab = os.environ.get("DSV4_FP4_LUT_TABLE_VARIANT", "").strip()
+    _tab_file = os.environ.get("DSV4_FP4_LUT_TABLE_FILE", "").strip()
+    if _tab_file:
+        # A 240-byte table read from a file. This is the REACHABILITY probe: a
+        # table that differs from `guard` ONLY at the 2 k=-9 tie cells but with an
+        # exaggerated magnitude, so that if those cells' experts are ROUTED the
+        # output moves by far more than the model's bf16 output resolution --
+        # which the real 2**-9 -> 0 difference is not. A bit-exact result here
+        # means the tie positions were not reached at all.
+        with open(_tab_file, "rb") as _fh:
+            table = _fh.read()
+        if len(table) != 240:
+            raise ValueError(f"{_tab_file}: expected 240 bytes, got {len(table)}")
+        variant = "file:" + os.path.basename(_tab_file)
+    elif _forced_tab == "zeros":
+        table = bytes(240)
+        variant = "zeros"
+    elif _forced_tab:
+        table = _lut_tables().build_table_for_variant(_forced_tab)
+        variant = _forced_tab
+    else:
+        table = _lut_tables().build_table_for_variant(variant)
+    _FP4_LUT_TABLE = torch.tensor(list(table), dtype=torch.uint8, device="hpu")
+    _FP4_LUT_VARIANT = variant
+    import hashlib as _hl
+    print(f"[v4-fp4-lut] LUT path ACTIVE: variant={variant} table={len(table)}B "
+          f"md5={_hl.md5(table).hexdigest()} "
+          f"kernel={dsv4_fp4_variant.LUT_KERNEL_NAME} lib={lib}",
+          flush=True)
+    return True
+
+
+def _lut_tables():
+    """`src/custom_ops/fp4_dequant/lut_tables.py`, loaded by path.
+
+    `src/custom_ops` is not a package on `sys.path` in the engine's workers, and
+    the table builder must be THE one that ships with the kernel (a second copy
+    could drift), so it is loaded from its file rather than re-implemented here.
+    """
+    global _LUT_TABLES_MOD
+    if _LUT_TABLES_MOD is None:
+        import importlib.util
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+        path = os.path.join(root, "src", "custom_ops", "fp4_dequant", "lut_tables.py")
+        spec = importlib.util.spec_from_file_location("dsv4_lut_tables", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _LUT_TABLES_MOD = mod
+    return _LUT_TABLES_MOD
+
+
+_LUT_TABLES_MOD = None
+
 # CONTROL PATH, NOT PRODUCTION (2026-10-06). The "default (bf16 experts)" control was
 # produced by unsetting DSV4_FP4_CUSTOM, which falls back to the pure-Python dequant --
 # ~240x slower (measured: L~262 prefill 0.731 s -> 174.9 s), i.e. ~11 h at L512, so a
@@ -2915,15 +3095,29 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     B = C // G  # bytes per group -> 32 values per group (B == 16)
     if _FP4_CUSTOM_OP is not None:
         # Fold the per-32 e8m0 scale (an exact power of two, 2^k) into the TPC
-        # kernel: it adds k to the e4m3fn exponent field, with the subnormal
-        # path exact for the checkpoint's scale range. Removes the separate
-        # bf16 scale multiply + broadcast.
+        # kernel: it adds k to the e4m3fn exponent field.  The subnormal path is
+        # exact only for k >= -8 (exponent byte >= 119); THIS checkpoint reaches
+        # k = -9 (byte 118) and below t = -2 the kernel FLOORS the magnitude
+        # (1399 real weights on this checkpoint decode to +-2^-9 instead of +-0,
+        # and the load-time lower-bound guard in _v4_fp4_scale_lower_bound draws
+        # the line at k = -9).  See
+        # Archive/by-date/2026-10-12/fp4-op-contract/REPORT.md. Removes the
+        # separate bf16 scale multiply + broadcast.
         if scales.dtype == torch.uint8:
             kexp = scales.to(torch.int16) - 127
         else:
             kexp = ((scales.view(torch.int32) >> 23) & 0xFF) - 127
         kexp = kexp.to(torch.int8).repeat_interleave(B, dim=1)  # [R, C]
-        o0, o1 = _FP4_CUSTOM_OP(blocks, kexp)
+        if _FP4_LUT_TABLE is not None:
+            # THE PROMOTED LUT PATH: the same contract, decoded from a 240-byte
+            # table whose cells are the SELECTED VARIANT's decode.  Selected by
+            # a module-level global (a trace-time constant, so this is one
+            # compiled graph, not two); `_install_fp4_lut` is what sets it, and
+            # it only sets it when the active kernel library's own
+            # GetKernelGuids table lists the kernel.
+            o0, o1 = _FP4_LUT_OP(blocks, kexp, _FP4_LUT_TABLE)
+        else:
+            o0, o1 = _FP4_CUSTOM_OP(blocks, kexp)
         # The kernel emits the interleave in its native [o0 || o1] block order
         # (o0 = even 64-element chunks, o1 = odd) to avoid a stack/DmaTranspose;
         # the consumer permutes the much smaller activation to match. Stay in
@@ -3011,6 +3205,156 @@ def _register_v4_fp8_placeholders(moe, config) -> None:
     moe.register_buffer("_v4_fp8_ready", torch.zeros((), dtype=torch.int8))
 
 
+# --- load-time LOWER-bound guard for the fp4 dequant kernel -----------------
+# The pair of this is the UPPER-bound guard inside `_register_v4_routed_packed`.
+# Both exist because the kernel folds the e8m0 exponent into the fp8 exponent
+# field (`t = exp + k`) and neither end of that fold was bounded.  This one was
+# added 2026-10-12; its scope statement is deliberately explicit -- see the
+# docstring.
+def _v4_fp4_scale_bounds(scale_tensors):
+    """``(min, max)`` over the routed-expert e8m0 scales, as decoded fp32 values.
+
+    ``min`` is the signed minimum over every element of every non-empty tensor: a
+    decoded e8m0 scale is never zero, so nothing is skipped, and an all-zero
+    buffer (an unfilled one) is a real fault this should surface rather than hide.
+    Returns ``(None, None)`` when no tensor has elements.
+    """
+    lo = hi = None
+    for b in scale_tensors:
+        if not b.numel():
+            continue
+        f = b.float()
+        bmin, bmax = float(f.min()), float(f.abs().max())
+        lo = bmin if lo is None else min(lo, bmin)
+        hi = bmax if hi is None else max(hi, bmax)
+    return lo, hi
+
+
+def _v4_fp4_scale_lower_bound(scale_tensors):
+    """RAISE if a routed-expert e8m0 scale is below ``2**-9`` (exponent byte < 118).
+
+    WHY (measured 2026-10-12; instruments, logs and the full report in
+    ``Archive/by-date/2026-10-12/fp4-op-contract/``).  The kernel's subnormal
+    branch clamps its two terms to >= 1 SEPARATELY --
+    ``2^max(t+2,0) + (mant ? 2^max(t+1,0) : 0)`` -- where their SUM should be
+    rounded, so for ``t <= -3`` it FLOORS the magnitude to ``2^-9`` (mant = 0) or
+    ``2^-8`` (mant != 0) instead of the correctly-rounded value.  Measured over
+    the full 16 x 256 ``(code, k)`` grid against the correctly-rounded e4m3fn
+    fold: **0** deviations for ``t >= -2``; **2** cells at ``t == -3`` (both exact
+    ties -- the true value is ``2^-10``, half the fp8 minimum subnormal, which RNE
+    rounds to 0 and this kernel rounds away from zero) and 14 cells at every
+    ``k <= -12``.  ``|error|`` grows ``2^-10 -> 2^-8`` as ``k`` falls while the
+    RELATIVE error is unbounded (1.3e36 at ``k = -128``).  Finite,
+    sign-preserving, strictly per-cell (0 of 4080 neighbouring cells perturbed),
+    and SILENT -- which is why this is a guard and not a comment.
+
+    THRESHOLD DERIVATION.  The floor engages for ``t <= -3 <=> k <= -3 - exp``;
+    with the smallest ``exp = 6`` that is ``k <= -9``.  At ``k == -9`` the ONLY
+    engaged cells are the two exact ties (codes 1 and 9); ``k <= -10`` admits
+    unambiguous over-shoots (6 cells at ``k = -10``, up to 14 for ``k <= -12``).
+    So *"never worse than a tie"* ``<=> k >= -9 <=> scale >= 2**-9 <=> byte >= 118``
+    -- the tightest threshold that still loads the current checkpoint, whose
+    minimum routed-expert scale byte is exactly 118, i.e. **zero margin**.
+
+    WHAT THIS DOES **NOT** CATCH (stated so the raise cannot imply more than it
+    delivers -- an over-stated guard is the same defect one level up):
+      * The two tie cells at byte 118 are **permitted** and are still computed by
+        the flooring branch: the kernel emits ``+-2^-9`` where the correctly
+        rounded answer is ``+-0``.  On this checkpoint that is **1399 real
+        weights** (measured by scanning the packed bytes of every byte-118 group;
+        layer 35's ``w1`` alone accounts for 261).  Removing those needs the
+        KERNEL changed, not a guard -- coordinate before touching the shipped
+        kernel.
+      * It asserts on THIS checkpoint's loaded data, at ONE caller.  A future
+        quantiser, a different checkpoint path, or a runtime-computed scale
+        bypasses it.
+      * It says nothing about the top end (that is the upper-bound guard) and
+        nothing about any scale tensor that is not routed-expert data -- in
+        particular the non-expert fp8 block scales, which on this checkpoint DO
+        reach byte 114 (``k = -13``) but never enter this kernel.
+
+    Returns the measured minimum scale (or ``None`` if nothing was checked).
+    """
+    lo, _hi = _v4_fp4_scale_bounds(scale_tensors)
+    if lo is None:
+        return None
+    if not (lo >= 2.0 ** -9):
+        raise ValueError(
+            f"fp4 dequant scale LOWER bound violated: min e8m0 scale {lo!r} < "
+            f"2**-9 (scale exponent k < -9, exponent byte < 118). "
+            f"fp4_dequant_fwd_gaudi2 folds k into the fp8 exponent field "
+            f"t = exp + k, and its subnormal branch clamps its two terms to >= 1 "
+            f"SEPARATELY where their sum should be rounded, so for t <= -3 the "
+            f"magnitude floors to 2^-9 / 2^-8 instead of the correctly-rounded "
+            f"value: finite and sign-preserving, but silent, and the relative "
+            f"error is unbounded. At k == -9 the only engaged cells are exact "
+            f"ties; k <= -10 admits unambiguous over-shoots. This checkpoint is "
+            f"outside the range the kernel was validated for - re-derive the fp8 "
+            f"subnormal budget, or fix the kernel's subnormal rounding (the "
+            f"latter needs the shipped kernel rebuilt; coordinate first).")
+    return lo
+
+
+def _select_fp4_variant_all(model, *, where: str) -> None:
+    """Select the fp4_dequant kernel variant from this rank's routed scale bounds.
+
+    THE AGGREGATION IS NOT OPTIONAL.  The variant must hold for EVERY layer, so
+    the decision takes ``max`` of the per-layer maxima and ``min`` of the
+    per-layer minima.  Deciding from the first layer alone would be wrong for a
+    checkpoint whose extremes live in different layers -- layer 1 at byte 119 and
+    layer 40 at byte 118 would select ``noguard`` and drop the floor fix exactly
+    where it is needed.  (The upper end is already global: the per-layer
+    assertion raises on ANY layer above byte 132, so reaching the selection at
+    all means every layer is safe there.)
+
+    The per-layer bounds are the ones `_register_v4_routed_packed` already
+    computed (the upper-bound assertion's max and the lower-bound guard's return
+    value), parked on each `ffn` as ``_v4_fp4_scale_max``/``_v4_fp4_scale_min``,
+    so the fresh-load path adds no pass.  On the snapshot-restore path those
+    attributes do not exist (that function returns early), so they are recomputed
+    here from the restored buffers -- see the cost note in `_check_v4_routed_all`.
+
+    The bounds are per-RANK: each rank loads only its own experts, so a rank
+    decides from the scales it will actually feed the kernel, which is the sound
+    scope for a per-process kernel choice.
+
+    Skipped entirely when the custom TPC op is not loaded: without
+    ``DSV4_FP4_CUSTOM=1`` the fp4 dequant is the pure-Python path and no TPC
+    kernel runs, so there is no variant to select.
+    """
+    if _FP4_CUSTOM_OP is None:
+        return
+    if dsv4_fp4_variant.selection_state().get("variant") is not None:
+        return                      # already selected in this process
+    hi = lo = None
+    n = 0
+    for layer in model.layers[model.start_layer:model.end_layer]:
+        ffn = getattr(layer, "ffn", None)
+        if ffn is None or not hasattr(ffn, "_v4_fp8_ready"):
+            continue
+        h = getattr(ffn, "_v4_fp4_scale_max", None)
+        l = getattr(ffn, "_v4_fp4_scale_min", None)
+        if h is None or l is None:
+            l, h = _v4_fp4_scale_bounds((ffn.packed_w1_scale,
+                                         ffn.packed_w3_scale,
+                                         ffn.packed_w2_scale))
+        if l is None:
+            continue
+        n += 1
+        hi = h if hi is None else max(hi, h)
+        lo = l if lo is None else min(lo, l)
+    if n == 0:
+        # Nothing to bound -> nothing is selected, and the wiring says so
+        # instead of guessing (`apply_selection` reports STATE_NO_DATA).
+        dsv4_fp4_variant.decide_and_apply_from_bounds(None, None, where=where)
+        _install_fp4_lut(None)
+        return
+    out = dsv4_fp4_variant.decide_and_apply_from_bounds(hi, lo, where=where)
+    # Promotion, not a GC_KERNEL_PATH write: the promoted LUT carries the decode
+    # of the variant this decision just selected.
+    _install_fp4_lut(out["decision"].variant)
+
+
 def _register_v4_routed_packed(moe, dev) -> None:
     """Load packed fp4 routed experts into registered buffers at load time.
 
@@ -3079,6 +3423,58 @@ def _register_v4_routed_packed(moe, dev) -> None:
     moe.register_buffer("packed_w3_scale", torch.stack(s3_list, dim=0))
     moe.register_buffer("packed_w2_weight", torch.stack(w2_list, dim=0))
     moe.register_buffer("packed_w2_scale", torch.stack(s2_list, dim=0))
+
+    # --- load-time upper-bound guard for the fp4 dequant kernel ---------------
+    # The kernel folds the e8m0 scale exponent k into the output fp8 byte's
+    # exponent field: t = exp + k with exp <= 9 (fp4_dequant_fwd_gaudi2.c).
+    # t >= 15 reaches the RESERVED bin E=15, which the HPU decodes as +-inf
+    # (M==0) or NaN (M!=0); t >= 16 overflows the 4-bit field into bit 7 and
+    # clobbers the SIGN (t=16,mant=0 -> 0x80, i.e. -0.0).  Both are silent.
+    # The kernel now saturates the magnitude to 0x77 (the HPU's largest finite
+    # code); this assertion makes the condition LOUD at load time rather than
+    # latent, and costs nothing at run time.
+    #
+    #   t <= 14  <=>  k <= 5  <=>  exponent byte <= 132  <=>  scale <= 2**5 = 32
+    #
+    # Measured on this checkpoint (3,840 expert scale tensors over 6 shards):
+    # max scale = 0.125 = 2**-3 (k = -3) -> a 256x margin.
+    _max_scale = max(float(b.float().abs().max()) if b.numel() else 0.0
+                     for b in (moe.packed_w1_scale, moe.packed_w3_scale,
+                               moe.packed_w2_scale))
+    if not (_max_scale <= 32.0):
+        raise ValueError(
+            f"fp4 dequant scale upper bound violated: max e8m0 scale "
+            f"{_max_scale} > 32.0 (2**5), i.e. scale exponent k > 5. "
+            f"fp4_dequant_fwd_gaudi2 folds k into the fp8 exponent field "
+            f"t = exp + k (exp <= 9); t >= 15 is the reserved bin E=15 "
+            f"(+-inf/NaN on the HPU) and t >= 16 clobbers the sign bit. "
+            f"The kernel saturates to 0x77 so the result is safe, but this "
+            f"checkpoint is outside the range the kernel was validated for - "
+            f"re-derive the fp8 exponent budget before proceeding.")
+
+    # --- load-time LOWER-bound guard (the pair of the upper-bound guard above).
+    # Bounds everything DEEPER than this checkpoint; it does NOT fix the t == -3
+    # tie cells at byte 118, which are permitted and still floored (1399 weights
+    # on this checkpoint).  Threshold derivation and scope: see the docstring.
+    _min_scale = _v4_fp4_scale_lower_bound((moe.packed_w1_scale,
+                                            moe.packed_w3_scale,
+                                            moe.packed_w2_scale))
+
+    # --- kernel-variant SELECTION: hand the two bounds to the aggregator ------
+    # `decide()` needs exactly `max(scale)` (the upper-bound assertion above) and
+    # `min(scale)` (the lower-bound guard's return value), so this consumes
+    # already-computed numbers and adds NO pass over the scale tensors.  It turns
+    # the assertion's boolean into a kernel selection: this checkpoint's bytes
+    # are [118, 126], so the upper guard cannot fire (dropping it is bit-exact,
+    # -4 instructions/iteration) and the floor fix is live -> `noguard_floor`.
+    # The two bounds are PARKED here, not applied, because the variant must hold
+    # for EVERY layer: the aggregation over this rank's layers happens once, in
+    # `_select_fp4_variant_all` (called at the end of `_prep_v4_routed_all`),
+    # which reuses exactly these numbers.  A per-layer decision taken here would
+    # be wrong for a checkpoint whose extremes live in different layers.
+    moe._v4_fp4_scale_max = _max_scale
+    moe._v4_fp4_scale_min = _min_scale
+
     moe._v4_fp8_filled = True
     if hasattr(moe, "_v4_fp8_ready"):
         moe._v4_fp8_ready.fill_(1)

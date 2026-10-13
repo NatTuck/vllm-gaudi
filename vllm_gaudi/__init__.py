@@ -78,6 +78,48 @@ def register():
 
 def register_utils():
     """Register utility functions for the HPU platform."""
+    # --- fp4 LUT PROMOTION: install GC_KERNEL_PATH before the first HPU op ---
+    # `GC_KERNEL_PATH` is read when the graph compiler builds its kernel database
+    # at the process's FIRST HPU op; this hook runs before `init_device` and
+    # before any torch.compile, so it is the one place in the process where the
+    # write is early enough by construction rather than by luck.  The load-path
+    # write in `dsv4_fp4_variant.apply_selection` is ~40 s too late and is
+    # reported as such (that late write is what made the promotion appear to
+    # work and then die with synStatus 26).
+    #
+    # ENV-GATED, DEFAULT OFF: with `DSV4_FP4_LUT` unset this is a no-op, so
+    # production behaviour is unchanged.  Imported by path (this package's
+    # `__init__` must stay light) and never fatal: a failure here is reported and
+    # the run continues exactly as before this hook existed.
+    import os
+
+    if os.environ.get("DSV4_FP4_LUT", "0").strip() == "1":
+        try:
+            import importlib.util
+            import sys as _sys
+
+            _p = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "models", "dsv4_fp4_variant.py")
+            _spec = importlib.util.spec_from_file_location(
+                "vllm_gaudi.models.dsv4_fp4_variant", _p)
+            _mod = importlib.util.module_from_spec(_spec)
+            # Register BEFORE exec: the module's `@dataclasses.dataclass` needs
+            # `sys.modules[cls.__module__]` to exist, and registering it also
+            # makes it the ONE instance the model's own `import` will get -- a
+            # second copy would hold a second copy of the recorded state.
+            _sys.modules["vllm_gaudi.models.dsv4_fp4_variant"] = _mod
+            try:
+                _spec.loader.exec_module(_mod)
+            except Exception:
+                _sys.modules.pop("vllm_gaudi.models.dsv4_fp4_variant", None)
+                raise
+            _mod.install_promoted_kernel_path(where="register_utils (pre-device)")
+        except Exception as _e:  # noqa: BLE001
+            print(f"[v4-fp4-variant] WARNING: promotion install at plugin load "
+                  f"failed ({type(_e).__name__}: {_e}); GC_KERNEL_PATH is left "
+                  f"exactly as configured", flush=True)
+
     import vllm_gaudi.utils  # noqa: F401
 
     vllm_gaudi.utils.patch_nixl_utils_for_hpu()
