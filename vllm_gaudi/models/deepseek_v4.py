@@ -36,8 +36,8 @@ from vllm.models.deepseek_v4.nvidia.model import (
     _use_sequence_parallel,
 )
 from vllm.sequence import IntermediateTensors
-# Module-level binding, NOT a local import: the three call sites below (:2936 the
-# custom-op path, :3061 _scale_float, :3125 _dequant_v4_fp4_to_fp8) are module-level
+# Module-level binding, NOT a local import: the three call sites below (:3111 the
+# custom-op path, :3407 _scale_float, :3523 _dequant_v4_fp4_to_fp8) are module-level
 # functions, so a function-local import left them with no binding at all and every
 # uint8 input raised NameError -- a regression that broke the decode path outright.
 from vllm_gaudi.extension.ops import decode_e8m0_exponent, decode_e8m0_scale  # noqa: E402
