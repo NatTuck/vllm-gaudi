@@ -2818,7 +2818,7 @@ _FP4_CUSTOM_OP = (_load_fp4_custom_op()
 # `dsv4_fp4_variant.install_promoted_kernel_path()`, called from
 # `vllm_gaudi.register_utils()` (the general-plugin hook, before `init_device`);
 # with the promotion in effect the load path writes nothing at all.
-_FP4_LUT_REQUESTED = os.environ.get("DSV4_FP4_LUT", "0") == "1"
+_FP4_LUT_REQUESTED = os.environ.get("DSV4_FP4_LUT", "0").strip() == "1"
 _FP4_LUT_OP = None          # custom_op::fp4_dequant_lut, when the extension has it
 _FP4_LUT_TABLE = None       # the 240-byte table on the HPU, or None
 _FP4_LUT_VARIANT = None     # which variant's decode the table holds
