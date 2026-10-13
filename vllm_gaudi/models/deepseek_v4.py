@@ -36,6 +36,11 @@ from vllm.models.deepseek_v4.nvidia.model import (
     _use_sequence_parallel,
 )
 from vllm.sequence import IntermediateTensors
+# Module-level binding, NOT a local import: the three call sites below (:2936 the
+# custom-op path, :3061 _scale_float, :3125 _dequant_v4_fp4_to_fp8) are module-level
+# functions, so a function-local import left them with no binding at all and every
+# uint8 input raised NameError -- a regression that broke the decode path outright.
+from vllm_gaudi.extension.ops import decode_e8m0_exponent, decode_e8m0_scale  # noqa: E402
 from vllm_gaudi.models import dsv4_fp4_variant  # noqa: E402
 
 
@@ -3103,10 +3108,7 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         # the line at k = -9).  See
         # Archive/by-date/2026-10-12/fp4-op-contract/REPORT.md. Removes the
         # separate bf16 scale multiply + broadcast.
-        if scales.dtype == torch.uint8:
-            kexp = scales.to(torch.int16) - 127
-        else:
-            kexp = ((scales.view(torch.int32) >> 23) & 0xFF) - 127
+        kexp = decode_e8m0_exponent(scales)
         kexp = kexp.to(torch.int8).repeat_interleave(B, dim=1)  # [R, C]
         if _FP4_LUT_TABLE is not None:
             # THE PROMOTED LUT PATH: the same contract, decoded from a 240-byte
@@ -3126,7 +3128,7 @@ def _dequant_v4_fp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         # fp8->bf16 cast, half the weight bytes).
         return torch.cat([o0, o1], dim=-1)
     if scales.dtype == torch.uint8:
-        s = torch.pow(2.0, scales.float() - 127.0).to(torch.bfloat16).reshape(R, G, 1)
+        s = decode_e8m0_scale(scales).to(torch.bfloat16).reshape(R, G, 1)
     else:
         s = scales.to(torch.bfloat16).reshape(R, G, 1)
     # Pure-Python fallback: build the bf16 bit pattern arithmetically. The
@@ -3398,10 +3400,11 @@ def _register_v4_routed_packed(moe, dev) -> None:
     # e8m0 scales decode to their real float32 value (float8_e8m0fnu's .float()
     # IS the scale; raw uint8 bytes decode as 2^(b-127)).
     def _scale_float(t):
-        if t.dtype == torch.float8_e8m0fnu:
-            return t.float()
-        if t.dtype == torch.uint8:
-            return torch.pow(2.0, t.float() - 127.0)
+        # BOTH e8m0 representations go through the guard. Routing only the uint8 form (as
+        # this did) left the representation the checkpoint actually ships -- F8_E8M0 --
+        # unvalidated, so a 0xFF byte became NaN here and then -128 in the kernel's kexp.
+        if t.dtype in (torch.float8_e8m0fnu, torch.uint8):
+            return decode_e8m0_scale(t)
         return t.float()
 
     start, end = moe.experts_start_idx, moe.experts_end_idx
@@ -3517,7 +3520,7 @@ def _dequant_v4_fp4_to_fp8(
 
     # Decode e8m0 scales: real_scale = 2^(byte - 127)
     if s_raw.dtype == torch.uint8:
-        s_val = torch.pow(2.0, s_raw.float() - 127.0).to(torch.bfloat16)
+        s_val = decode_e8m0_scale(s_raw).to(torch.bfloat16)
     else:
         s_val = s_raw.to(torch.bfloat16)
 
@@ -3576,13 +3579,45 @@ def _make_block_scales(
     return block_scales
 
 
+class Dsv4InvariantError(RuntimeError):
+    """A correctness invariant failed. NOT a recoverable finalisation error.
+
+    Distinct type so `worker_restore.py`'s blanket `except Exception` (which exists to survive
+    a recoverable finalisation failure) can let THIS through instead of printing and
+    continuing -- otherwise the restore path, which is the path the check was added for,
+    discards its own verdict.
+    """
+
+
 def _check_v4_routed_ready(moe) -> None:
-    """Load-time invariant check; never runs in the compiled forward."""
+    """Load/restore-time invariant check; never runs in the compiled forward.
+
+    Called by BOTH the fresh-load path and the snapshot-restore path (`_check_v4_routed_all`
+    is invoked from `_prep_compress_caches`, which both go through). The NaN check lives here,
+    not only in `_register_v4_routed_packed`, because that function RETURNS EARLY when
+    `_v4_fp8_ready` is already set -- so a restore never re-read the checkpoint and never ran
+    any scale validation. A guard that one path skips is not a guard.
+    """
     if not bool(getattr(moe, "_v4_fp8_ready", torch.tensor(0)).item()):
-        raise RuntimeError(
+        raise Dsv4InvariantError(
             "DeepSeek V4 routed fp4 buffers not ready (expected pre-registration "
             "at load or snapshot restore); refusing to load from checkpoint at runtime."
         )
+    # The routed scale buffers are fp32 by this point (decoded at load), so a NaN scale is
+    # detectable as a NaN here -- and an inf is equally fatal (inf * 0 == NaN downstream).
+    for _name in ("packed_w1_scale", "packed_w3_scale", "packed_w2_scale"):
+        _s = getattr(moe, _name, None)
+        if _s is None:
+            continue
+        _bad = ~torch.isfinite(_s)
+        if bool(_bad.any()):
+            _flat = _bad.reshape(-1).nonzero().reshape(-1)
+            raise Dsv4InvariantError(
+                f"{_name} holds {int(_flat.numel())} non-finite scale value(s) -- an e8m0 "
+                f"0xFF/NaN survived the load (shape {tuple(_s.shape)}). First offending flat "
+                f"indices: {[int(i) for i in _flat[:8].tolist()]}. Refusing to run: a "
+                f"non-finite scale poisons a whole 32-value group and is not a format error "
+                f"anything downstream can detect.")
 
 
 def _compute_v4_routed(moe, flat: torch.Tensor, topk_ids, topk_weights) -> torch.Tensor:

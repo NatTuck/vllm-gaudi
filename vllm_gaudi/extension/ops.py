@@ -1095,6 +1095,99 @@ def get_dequant_weights_func(self, ) -> Optional[Callable[[torch.nn.Module], tor
     return None
 
 
+# OCP MX specification 5.4.1: the e8m0 byte -> value mapping `value = 2**(byte-127)`
+# holds for `byte in [0, 254]`; **0xFF is reserved for NaN**. Every hand decode in
+# this port used `torch.pow(2.0, b.float() - 127.0)` unconditionally, which maps
+# 0xFF to 2**128 -> +inf (float32 overflow) where the format says NaN. Fixed
+# 2026-10-11; all four sites now route through `decode_e8m0_scale` below.
+E8M0_NAN_BYTE = 0xFF
+
+
+def _e8m0_guard(w: torch.Tensor) -> None:
+    """Reject the NaN code point in EITHER representation. Single policy for every site.
+
+    There are two ways the same 0xFF reaches us, and validating only one leaves the defect
+    live on the other -- which is exactly what happened: every scale tensor in this checkpoint
+    is `F8_E8M0`, and a uint8-only guard let `F8_E8M0` through, so 0xFF became `nan` here,
+    then `128` in `decode_e8m0_exponent`, then `-128` after `.to(int8)`, and the fp4 kernel
+    took its *subnormal* branch and emitted a silently wrong **finite** magnitude.
+
+      * `uint8`     -- the raw byte. 0xFF is the NaN code point.
+      * `F8_E8M0`   -- the dtype itself decodes 0xFF to NaN, so `isnan` is the test.
+    """
+    # SCOPE: only the two e8m0 *storage* representations are validated here. An already-decoded
+    # fp32 scale tensor must skip the guard entirely -- `_compute_v4_routed` reaches this via
+    # `_deq_gathered` x3 per layer (129 calls per forward) INSIDE the compiled region, and
+    # `isnan` + `bool(bad.any())` is a `Tensor.item()` -> a dynamo GRAPH BREAK there. That is
+    # precisely what this port forbids ("No assert: it would be a dynamo graph break inside the
+    # compiled region"). fp32 NaN is covered where it belongs: the load/restore-time
+    # `isfinite` check in `_check_v4_routed_ready`, which runs once. Cheap dtype test on the hot
+    # path, expensive validation on the load path.
+    if w.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        return
+    if w.numel() == 0:
+        return
+    if w.dtype == torch.uint8:
+        if int(w.max()) != E8M0_NAN_BYTE:
+            return
+        bad_mask = (w == E8M0_NAN_BYTE)
+        what = f"byte(s) of 0x{E8M0_NAN_BYTE:02X}"
+    else:
+        bad_mask = torch.isnan(w.float())
+        if not bool(bad_mask.any()):
+            return
+        what = f"NaN element(s) (the 0x{E8M0_NAN_BYTE:02X} code point)"
+    flat = bad_mask.reshape(-1).nonzero().reshape(-1)
+    n_bad = int(flat.numel())
+    first = [int(i) for i in flat[:8].tolist()]
+    raise ValueError(
+        f"e8m0 scale tensor ({w.dtype}) has {n_bad} {what}, which OCP MX 5.4.1 reserves for "
+        f"NaN: the checkpoint is corrupt. Refusing to load (shape {tuple(w.shape)}). First "
+        f"offending flat indices: {first}{' ...' if n_bad > len(first) else ''}. Substituting "
+        f"a finite value would convert a detectable data error into a wrong number.")
+
+
+def decode_e8m0_scale(w: torch.Tensor) -> torch.Tensor:
+    """Decode e8m0 scale bytes to float32, faithful to the format. THE single entry point.
+
+    The e8m0 dtype is **not allocatable on HPU** (`is_supported_type` rejects it, and
+    `e4m3fnuz` with it -- `g2-opt-manual/03-porting.md` 3.4.1), which is why this decode is
+    hand-rolled. The dtype conversion is still used, but **only on CPU**: this path loads every
+    fp8 model's scales and a CPU-verified cast has no business running on HPU. Because the guard
+    admits only bytes in [0, 254], where `2**(b-127)` is exact, the two paths are **provably
+    equivalent** -- so preferring the dtype on CPU is a verification aid, not a behaviour change.
+
+    Byte 0xFF is reserved for NaN. A NaN scale means a corrupt checkpoint (no MX quantiser emits
+    one), so we refuse it rather than propagate: an `inf`/NaN *scale* is just a number, so nothing
+    downstream can flag it as a format error, and it would poison a whole 32-value group
+    (`inf * 0 == NaN`) with the symptom surfacing as NaN logits far from the cause.
+    """
+    _e8m0_guard(w)          # validates uint8 AND F8_E8M0
+    if w.dtype != torch.uint8:
+        return w.float()
+    if w.device.type == "cpu":
+        try:
+            return w.view(torch.float8_e8m0fnu).float()
+        except (RuntimeError, TypeError):
+            pass
+    return torch.pow(2.0, w.float() - 127.0)
+
+
+def decode_e8m0_exponent(w: torch.Tensor) -> torch.Tensor:
+    """The same policy, in the *exponent* representation (byte - 127).
+
+    Used where the value is folded into an fp8 exponent rather than multiplied. Validation is
+    shared with `decode_e8m0_scale` so both representations refuse 0xFF identically.
+    """
+    _e8m0_guard(w)
+    if w.dtype == torch.uint8:
+        return w.to(torch.int16) - 127
+    # `.float()` first: an F8_E8M0 tensor is 1 byte/element and `view(torch.int32)` needs the
+    # last dim divisible by 4. float32 has the same numel, so the view is always legal, and
+    # after the guard there is no NaN to propagate.
+    return ((w.float().view(torch.int32) >> 23) & 0xFF) - 127
+
+
 def gaudi_weight_wrapper(weight_loader):
     """Wrapper for Gaudi weight conversion."""
 
@@ -1112,7 +1205,9 @@ def gaudi_weight_wrapper(weight_loader):
             # Decode e8m0 byte to float32, then fall through to
             # scale_adjustment *2.0 below (weights are *0.5'd, so
             # scales must *2.0 to keep the real dequant value).
-            loaded_weight = loaded_weight.float()
+            # Routed through the helper, NOT `.float()` directly: this is the generic fp8
+            # loader for EVERY fp8 model, and `.float()` skipped the NaN guard entirely.
+            loaded_weight = decode_e8m0_scale(loaded_weight)
             if in_kwargs:
                 kwargs["loaded_weight"] = loaded_weight
             else:
@@ -1124,7 +1219,7 @@ def gaudi_weight_wrapper(weight_loader):
             # preserve the bytes for its NVIDIA path). Decode byte -> power-of-2
             # so the scale is a real value; scale_adjustment's *2.0 below then
             # applies correctly (weights were *0.5'd, so scales must *2.0).
-            loaded_weight = torch.pow(2.0, loaded_weight.float() - 127.0)
+            loaded_weight = decode_e8m0_scale(loaded_weight)
         if get_config().scale_adjustment:
             # loaded_weight may be passed positionally (args[1]) or as a
             # keyword. Upstream FusedMoE (vllm#47197) now calls

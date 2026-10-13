@@ -85,7 +85,11 @@ def convert_moe_packed_tensors(
     # MxFP4 stores the scale as an unsigned 8-bit exponent with a bias of 127
     # (i.e. values 0–255 represent exponents in the range -127…128). Subtract 127
     # to recover the signed exponent that torch.ldexp expects.
-    scales = scales.to(torch.int32) - 127
+    # Route through the shared decoder: byte 0xFF is reserved for NaN by OCP MX 5.4.1, and
+    # the old `scales - 127` gave exp=128, so torch.ldexp(1.0, 128) -> inf -- the same defect
+    # as the pow(2.0, ...) sites. The exponent is what ldexp wants, so take it directly.
+    from vllm_gaudi.extension.ops import decode_e8m0_exponent
+    scales = decode_e8m0_exponent(scales).to(torch.int32)
 
     assert blocks.shape[:-1] == scales.shape, f"{blocks.shape[:-1]=} does not match {scales.shape=}"
 
