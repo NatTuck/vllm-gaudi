@@ -124,6 +124,23 @@ def register_utils():
 
     vllm_gaudi.utils.patch_nixl_utils_for_hpu()
 
+    # --- DSV4 engine-dump placement instrumentation (env-gated, no-op unset) ---
+    # Registers the recipe-boundary passes (placement sequence, fused_* partition
+    # count, per-node reason) inside EVERY process, parent and workers, at
+    # load_general_plugins time -- i.e. before any torch.compile.  Also rewrites
+    # DUMP_POST_GRAPHS/DUMP_PRE_GRAPHS to a RANK-SCOPED directory, because TP>1
+    # means several workers compile concurrently and a shared dump dir makes them
+    # race and fail the compile (synStatus 26; recipe_dump run r2).  A missing
+    # rank env var is a HARD ABORT, never a silent rank-0 fallback.
+    if os.environ.get("DSV4_RB_PLACEMENT"):
+        import importlib.util
+
+        _spec = importlib.util.spec_from_file_location(
+            "dsv4_rb_engine", os.environ["DSV4_RB_MODULE"])
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _mod.register()
+
     # Install the load_and_decode per-rank snapshot capture/restore hook into
     # the worker load_model when the FASTQWEN_* env vars are set (fast
     # model-load iteration tool). Idempotent; no-op when unset.
