@@ -188,11 +188,20 @@ _COMP_STUB_READ = os.environ.get("DSV4_COMP_STUB_READ", "1") != "0"
 # `DmaMemcpy` copies >= 50 us (84 % of DMA time, ~97 %/stream DMA occupancy)
 # where the stubbed write produces zero.
 #
-# DEFAULT FLIPPED TO 1 on 2026-10-08: the flat view is measured at **0.083 s/step vs the
-# 0.0932 s baseline (-11 %)** with **3/3 MATCH (11627 / 6397 / 11111)** on the margin probe.
-# It is one line of indexing -- no new kernel, no stub. Defaulting it ON is what stops the
-# regression silently coming back; `DSV4_COMP_FLAT_WRITE=0` restores the 3-D scatter.
-_COMP_FLAT_WRITE = os.environ.get("DSV4_COMP_FLAT_WRITE", "1") == "1"
+# DEFAULT REVERTED TO 0 on 2026-10-14: the flat form is a SILENT NO-OP on the
+# production page geometry. A page is a strict slice of the packed slab, so
+# `stride(0) = block_stride // elem != sbs * hd` and `page.reshape(-1, hd)`
+# COPIES -- `index_copy_` then mutates the temporary and the slab is never
+# written. Measured 2026-10-14: with the flag on, BOTH paged writes (R5
+# compressed-MLA below and R7 indexer k_cache) write nothing, so the
+# compressed-MLA cache and the indexer k_cache are never populated. The
+# 2026-10-08 default-on was justified by a -11 % step measured in the
+# break-OFF config (`DSV4_COMPRESSOR_BREAK=0`), which is not shipped and cannot
+# complete a forward; the later "flat is 5.6 ms faster with the break on" is
+# exactly what a no-op predicts. Correctness outweighs it.
+# `DSV4_COMP_FLAT_WRITE=1` restores the flat scatter -- it is valid ONLY where
+# the page is contiguous (`stride(0) == sbs * hd`), e.g. a dedicated backing.
+_COMP_FLAT_WRITE = os.environ.get("DSV4_COMP_FLAT_WRITE", "0") == "1"
 
 # Temporary diagnostic (DSV4_SYNC_PROBE=1): count host-side synchronize calls and
 # print the first few stacks, to find who blocks the host between graph launches.
