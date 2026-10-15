@@ -51,8 +51,38 @@ _DIAG_DONE = {"v": True}  # diag disabled: the per-layer device-sync prints thro
 # ``__import__("os").environ`` is a dynamo graph break (the debug bodies also host-sync),
 # so they must be constants at trace time.
 _DSV4_R6_DEBUG = os.environ.get("DSV4_R6_DEBUG") == "1"
+# PROBE EDIT 2026-10-14: the R5 write-side probe has its own flag (see
+# `_write_paged_compressed`). It used to be gated on DSV4_R6_DEBUG, which made it
+# impossible to take the read-side probe without also taking a probe that
+# specializes every compiled graph on a concrete block id.
+_DSV4_R5_DEBUG = os.environ.get("DSV4_R5_DEBUG") == "1"
 _DSV4_R4B_NOSWA = os.environ.get("DSV4_R4B_NOSWA") == "1"
 _HPU_DUMP_ON = os.environ.get("HPU_DUMP") == "1"
+# DIAGNOSTIC 2026-10-14 (agent advanced-ape, ordinal-dependence-continue): neutralise
+# the OVER-READ REGION's content -- entries [live, cap) of the compressed / indexer
+# cache reads -- WITHOUT touching the block ids and WITHOUT changing the read width
+# (so every shape stays static). This is the decisive test of the "stale cache
+# CONTENT in the over-read region" hypothesis: if zeroing that region changes ANY
+# answer, the content reaches the output and the masking is broken; if it changes
+# nothing anywhere, the region is exonerated and the mask does its job.
+# READOUT IS "DID ANY ORDINAL CHANGE", not "did the flip disappear" -- zeroing
+# substitutes one wrong value for another, so a flip that merely MOVES is still
+# evidence that the region reaches the output.
+_DSV4_BOUND_LIVE = os.environ.get("DSV4_BOUND_LIVE") == "1"
+# POSITIVE CONTROL for the above (default 0). The mask is `idx < live - BIAS`, so BIAS=1
+# zeroes the LAST LIVE entry as well as the over-read region -- an entry that is NOT
+# masked and IS reachable by top-k. The output MUST therefore change. If it does not,
+# the flag is not reaching the code and the zero-difference result above is void.
+# This exists because the same investigation already banked one negative on an INFERRED
+# premise (the tail-clear's application) and had to add a witness afterwards.
+_DSV4_BOUND_LIVE_BIAS = int(os.environ.get("DSV4_BOUND_LIVE_BIAS", "0"))
+# FILL MODE -- this is the DECISIVE form of the test, and it exists because ZEROING
+# cannot distinguish "the region is masked" from "the region is read but never wins
+# the top-k". A zeroed key scores 0 and loses to any real key, so a null result is
+# uninformative. Filling the region with a LARGE value instead makes it *win* every
+# selection it is visible to: if the mask is correct nothing changes, and if the
+# region is visible the answer MUST move. `zero` (default) keeps the original form.
+_DSV4_BOUND_LIVE_MODE = os.environ.get("DSV4_BOUND_LIVE_MODE", "zero")
 
 # D5d: number of queries per sparse compressed-attention chunk. Each query gets
 # its OWN window+top-k keys, so the attention is optimal in FLOPs regardless of
@@ -202,6 +232,23 @@ _COMP_STUB_READ = os.environ.get("DSV4_COMP_STUB_READ", "1") != "0"
 # `DSV4_COMP_FLAT_WRITE=1` restores the flat scatter -- it is valid ONLY where
 # the page is contiguous (`stride(0) == sbs * hd`), e.g. a dedicated backing.
 _COMP_FLAT_WRITE = os.environ.get("DSV4_COMP_FLAT_WRITE", "0") == "1"
+
+# Diagnostic (default 0): force the R7 indexer write to the flat form even when
+# `_COMP_FLAT_WRITE` is 0, so R7's own effect can be measured apart from R5's.
+# At `max_model_len <= index_topk * compress_ratio` the CSA top-k is dense and R7
+# is inert; it becomes live above that (production runs max_model_len=20480).
+_COMP_FLAT_WRITE_R7 = os.environ.get("DSV4_COMP_FLAT_WRITE_R7", "0") == "1"
+
+# Artifacts must carry which arm ran: print the DSv4 behaviour flags once at
+# import (module scope -> one line per process, not per layer). `COMP_MLA_PAGED`
+# was dropped from this line on 2026-10-14 with the dedicated compressed-MLA
+# backing it reported: no code reads `DSV4_COMP_MLA_PAGED` any more, and a flag
+# line naming a reverted feature is a lying record.
+print(f"[DSV4-FLAGS] COMP_FLAT_WRITE={int(_COMP_FLAT_WRITE)} "
+      f"COMP_FLAT_WRITE_R7={int(_COMP_FLAT_WRITE_R7)} "
+      f"COMPRESSOR_BREAK={int(_COMPRESSOR_BREAK)} "
+      f"INDEXER_PAGED={os.environ.get('DSV4_INDEXER_PAGED', '1')} "
+      f"INT8_BASE={os.environ.get('DSV4_INT8_BASE', '1')}", flush=True)
 
 # Temporary diagnostic (DSV4_SYNC_PROBE=1): count host-side synchronize calls and
 # print the first few stacks, to find who blocks the host between graph launches.
@@ -1031,6 +1078,15 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         state_dim = 2 * coff * D
         self._dsv4_comp_state = torch.zeros(ring + 1, state_dim, dtype=torch.bfloat16,
                                             device=dev)
+        # PROBE EDIT 2026-10-14 (load-time, outside any trace, print-only): the
+        # ring sizing is the load-bearing fact for the "ring is per-request or
+        # per-batch" question, so it is printed from the device rather than
+        # derived from the config.
+        print(f"[RINGSZ] layer={getattr(self, '_layer_idx', '?')} rate={rate} win={win} "
+              f"tokens={tokens} ring={ring} buf_rows={ring + 1} cap={cap} "
+              f"max_model_len={max_model_len} "
+              f"max_num_batched_tokens={self._max_num_batched_tokens} "
+              f"state_dim={state_dim}", flush=True)
         # Dedicated fp32 scale buffer for the indexer k_cache. HPU cannot mutate
         # two dtype-views (fp8 keys + fp32 scales) of the same cache in one
         # graph, so the scales live here, indexed by compressed-entry index.
@@ -1242,19 +1298,30 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             page.reshape(-1, hd).index_copy_(0, blocks * sbs + offs, _val)
         else:
             page[blocks, offs] = _val
-        if _DSV4_R6_DEBUG and comp.shape[0] > 0:
+        # PROBE EDIT 2026-10-14 (agent ordinal-state-leak; DSV4_R5_DEBUG only, no
+        # behaviour change): the original R5 probe was gated on DSV4_R6_DEBUG and
+        # indexed the slab with a CONCRETE block id, which (a) specialized the
+        # compiled graph on every distinct id and (b) aborted the whole graph
+        # compile when the id exceeded the slab's row count (observed: block
+        # 2532 against a 2367-row packed slab). It is now behind its own flag and
+        # reports the in-range test instead of indexing out of range.
+        if _DSV4_R5_DEBUG and comp.shape[0] > 0:
             _off_elems = self._dsv4_page_off
             _b0 = int(blocks[0].item())
             _o0 = int(offs[0].item())
-            _probe = slab2d[_b0, _off_elems + _o0 * hd:_off_elems + _o0 * hd + 3].to(
-                torch.bfloat16).float().tolist()
+            _nrows = int(slab2d.shape[0])
+            _inr = _b0 < _nrows
+            _probe = None
+            if _inr:
+                _probe = slab2d[_b0, _off_elems + _o0 * hd:_off_elems + _o0 * hd + 3].to(
+                    torch.bfloat16).float().tolist()
             print(f"[R5-write] layer={getattr(self, '_layer_idx', '?')} n={comp.shape[0]} "
-                  f"block={_b0} off={_o0} "
+                  f"block={_b0} off={_o0} slab_rows={_nrows} in_range={_inr} "
                   f"val0={comp[0, :3].float().tolist()} probe={_probe} "
                   f"page_off={self._dsv4_page_off} "
                   f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
 
-    def _read_paged_compressed(self, cap):
+    def _read_paged_compressed(self, cap, live=None):
         """R6: gather the compressed entries ``[cap, head_dim]`` from the paged
         compressed-MLA cache (written by R5) by global block/slot id.
 
@@ -1301,14 +1368,33 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         phys = bl[logical].clamp(min=0)
         pages = page.index_select(0, phys).to(torch.bfloat16)  # [nblocks, sbs, hd]
         comp = pages.reshape(-1, hd)[:cap]
+        # DIAGNOSTIC (DSV4_BOUND_LIVE only; default OFF = no behaviour change). Zero
+        # the over-read region [live, cap): static shape, ids and width untouched.
+        if _DSV4_BOUND_LIVE and live is not None:
+            _cidx = torch.arange(comp.shape[0], device=comp.device, dtype=torch.int64)
+            _ckeep = (_cidx < (live.reshape(()) - _DSV4_BOUND_LIVE_BIAS)).unsqueeze(-1)
+            if _DSV4_BOUND_LIVE_MODE == "huge":
+                comp = torch.where(_ckeep, comp, torch.full_like(comp, 1e4))
+            else:
+                comp = comp * _ckeep.to(comp.dtype)
         if _DSV4_R6_DEBUG:
+            print(f"[LIVE] read=compressed cap={cap} live="
+                  f"{int(live) if live is not None else -1} "
+                  f"nblocks={nblocks} row_len={int(bl.numel())} "
+                  f"bound={int(_DSV4_BOUND_LIVE)} bias={_DSV4_BOUND_LIVE_BIAS} "
+                  f"mode={_DSV4_BOUND_LIVE_MODE}", flush=True)
+        # PROBE EDIT 2026-10-14 (agent ordinal-state-leak; DSV4_R6_DEBUG only, no
+        # behaviour change): `_c_n`/`_i_n` are never updated (see :866), so the
+        # original `if live > 0:` guard made this print dead code. The guard is
+        # removed and the print is gated to two probe layers instead, so the
+        # read side can be observed at all.
+        if _DSV4_R6_DEBUG and getattr(self, "_layer_idx", -1) in (2, 3):
             live = int(self._c_n)
-            if live > 0:
-                print(f"[R6] layer={getattr(self, '_layer_idx', '?')} live={live} "
-                      f"cache_dtype={page.dtype} bl0={int(bl[0])} phys0={int(phys[0])} "
-                      f"got0={comp[0, :3].float().tolist()} "
-                      f"page_off={self._dsv4_page_off} "
-                      f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
+            print(f"[R6] layer={getattr(self, '_layer_idx', '?')} live={live} "
+                  f"cache_dtype={page.dtype} bl0={int(bl[0])} phys0={int(phys[0])} "
+                  f"got0={comp[0, :3].float().tolist()} "
+                  f"page_off={self._dsv4_page_off} "
+                  f"page_elems={self._dsv4_page_elems} slab_cols={slab2d.shape[1]}", flush=True)
         return comp
 
     def _indexer_kcache_aux(self):
@@ -1373,7 +1459,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         # Keys (fp8) go into the paged k_cache: one strided-view mutation.
         fp8_page = slab2d[:, off:off + fp8_elems].view(-1, sbs, tok)
         _x8 = x.to(slab2d.dtype)
-        if _COMP_FLAT_WRITE:
+        if _COMP_FLAT_WRITE or _COMP_FLAT_WRITE_R7:
             # E3b step 1: same flat-scatter treatment as R5 above.
             fp8_page.reshape(-1, tok).index_copy_(0, blocks * sbs + offs, _x8)
         else:
@@ -1398,7 +1484,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             ci = torch.arange(icomp.shape[0], device=pos_all.device).clamp(max=self._cap - 1)
         self._dsv4_indexer_scales[ci] = scale.to(torch.float32)
 
-    def _read_paged_indexer(self, cap):
+    def _read_paged_indexer(self, cap, live=None):
         """R7: gather indexer compressed keys ``[cap, 128]`` from the paged
         indexer k_cache and dequantize (fp8 * per-token scale) to bf16.
 
@@ -1426,14 +1512,28 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
         x = x.reshape(-1, tok)[:cap]
         sc = self._dsv4_indexer_scales[:cap]
         out = torch.ops.hpu.cast_from_fp8(x, sc.reshape(-1, 1), torch.bfloat16)
+        # DIAGNOSTIC (see _read_paged_compressed): zero the over-read region [live, cap).
+        if _DSV4_BOUND_LIVE and live is not None:
+            _iidx = torch.arange(out.shape[0], device=out.device, dtype=torch.int64)
+            _ikeep = (_iidx < (live.reshape(()) - _DSV4_BOUND_LIVE_BIAS)).unsqueeze(-1)
+            if _DSV4_BOUND_LIVE_MODE == "huge":
+                out = torch.where(_ikeep, out, torch.full_like(out, 1e4))
+            else:
+                out = out * _ikeep.to(out.dtype)
         if _DSV4_R6_DEBUG:
+            print(f"[LIVE] read=indexer cap={cap} live="
+                  f"{int(live) if live is not None else -1} "
+                  f"nblocks={nblocks} row_len={int(bl.numel())} "
+                  f"bound={int(_DSV4_BOUND_LIVE)} bias={_DSV4_BOUND_LIVE_BIAS} "
+                  f"mode={_DSV4_BOUND_LIVE_MODE}", flush=True)
+        # PROBE EDIT 2026-10-14 (see the R6 note above): un-dead the read probe.
+        if _DSV4_R6_DEBUG and getattr(self, "_layer_idx", -1) in (2, 3):
             _live = min(int(self._c_n), cap)
-            if _live > 0:
-                print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={_live} "
-                      f"tok={tok} off={off} pe={layer._dsv4_page_elems} "
-                      f"bl0={int(bl[0])} phys0={int(phys[0])} "
-                      f"got0={out[0, :3].float().tolist()} "
-                      f"c_n={int(self._c_n)} i_n={int(self._i_n)}", flush=True)
+            print(f"[R7] layer={getattr(self, '_layer_idx', '?')} live={_live} "
+                  f"tok={tok} off={off} pe={layer._dsv4_page_elems} "
+                  f"bl0={int(bl[0])} phys0={int(phys[0])} "
+                  f"got0={out[0, :3].float().tolist()} "
+                  f"c_n={int(self._c_n)} i_n={int(self._i_n)}", flush=True)
         return out
 
     def _compressor_compilable(self, hidden, qr, positions, is_prompt):
@@ -1498,7 +1598,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
             if stub_r is not None:
                 compressed_kv_full = stub_r
             else:
-                compressed_kv_full = self._read_paged_compressed(self._cap)
+                compressed_kv_full = self._read_paged_compressed(self._cap, live)
                 if compressed_kv_full is None:
                     compressed_kv_full = kv.new_zeros((self._cap, D))
 
@@ -1521,7 +1621,7 @@ class DeepseekV4HPUAttention(DeepseekV4Attention):
                 if stub_r is not None:
                     idx_compressed = stub_r[:, :idx_h]
                 else:
-                    idx_compressed = self._read_paged_indexer(self._cap)
+                    idx_compressed = self._read_paged_indexer(self._cap, live)
                     if idx_compressed is None:
                         idx_compressed = kv.new_zeros((self._cap, idx_h))
         else:
